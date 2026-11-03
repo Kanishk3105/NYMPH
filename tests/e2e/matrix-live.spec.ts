@@ -48,7 +48,7 @@ async function waitForValue<T>(
 }
 
 async function call<T>(page: Page, method: string, ...args: unknown[]): Promise<T> {
-  return page.evaluate(
+  const result = page.evaluate(
     async ({ methodName, parameters }) => {
       const harness = (window as Window & {
         nymphMatrixHarness: Record<string, (...values: unknown[]) => unknown>;
@@ -57,6 +57,17 @@ async function call<T>(page: Page, method: string, ...args: unknown[]): Promise<
     },
     { methodName: method, parameters: args },
   ) as Promise<T>;
+  let timeoutId: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([
+      result,
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`Matrix test operation timed out: ${method}.`)), 60_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeoutId!);
+  }
 }
 
 async function openProfile(userDataDir: string, recoveryKey?: string): Promise<{ context: BrowserContext; page: Page }> {
@@ -71,7 +82,7 @@ async function openProfile(userDataDir: string, recoveryKey?: string): Promise<{
     }, recoveryKey);
   }
   const page = await context.newPage();
-  await page.goto('http://localhost:5173/tests/e2e/matrix-harness.html');
+  await page.goto('http://localhost:5173/matrix-harness.html');
   await page.getByText('Isolated Matrix test client ready').waitFor();
   return { context, page };
 }
@@ -101,6 +112,7 @@ test('independent Partner A/B sessions pair, verify and exchange real encrypted 
     sessionA.roomId = status.room_id;
 
     const invitation = await call<Invitation>(pageA, 'createInvitation', sessionA);
+    console.info('[matrix-e2e] pairing invitation created');
     expect(Object.keys(invitation).sort()).toEqual([
       'expires_at',
       'homeserver',
@@ -114,15 +126,19 @@ test('independent Partner A/B sessions pair, verify and exchange real encrypted 
     expect(invitation.token.length).toBeGreaterThanOrEqual(40);
     expect(invitation.expires_at).toBeGreaterThan(Date.now());
     const sessionB = await call<Session>(pageB, 'redeemInvitation', invitation);
+    console.info('[matrix-e2e] Partner B redeemed the one-time token');
     expect(sessionB.userId).toBe('@partner2:localhost');
     expect(sessionB.roomId).toBe(status.room_id);
     expect(sessionB.deviceId).not.toBe(sessionA.deviceId);
     expect(await call<number>(pageB, 'replayInvitation', invitation)).toBe(403);
 
     await call(pageA, 'connect', sessionA);
+    console.info('[matrix-e2e] Partner A completed encrypted sync');
     await call(pageB, 'connect', sessionB);
+    console.info('[matrix-e2e] Partner B completed encrypted sync');
     const recoveryA = await call<string>(pageA, 'bootstrapSecurity', partnerAPassword);
     const recoveryB = await call<string>(pageB, 'bootstrapSecurity', partnerBPassword);
+    console.info('[matrix-e2e] cross-signing bootstrap completed');
     expect(await waitForValue<boolean>(pageA, 'h => h.getSecurity()?.crossSigningReady')).toBe(true);
     expect(await waitForValue<boolean>(pageB, 'h => h.getSecurity()?.crossSigningReady')).toBe(true);
 
@@ -161,6 +177,7 @@ test('independent Partner A/B sessions pair, verify and exchange real encrypted 
     expect(Boolean(sasA.emoji?.length || sasA.decimal?.length)).toBeTruthy();
     await call(pageA, 'confirmSas', outgoing.id);
     await call(pageB, 'confirmSas', incoming.id);
+    console.info('[matrix-e2e] matching SAS confirmed on both independent clients');
     await waitForValue<boolean>(pageA, 'h => h.getSecurity()?.partnerVerified');
     await waitForValue<boolean>(pageB, 'h => h.getSecurity()?.partnerVerified');
 
