@@ -20,10 +20,12 @@ if (build.status !== 0) process.exit(build.status ?? 1);
 const server = spawn(process.execPath, [
   viteCli,
   'preview',
+  '--config',
+  'vite.matrix-e2e.config.ts',
   '--host',
   '127.0.0.1',
   '--port',
-  '5173',
+  '5174',
   '--strictPort',
 ], {
   cwd: root,

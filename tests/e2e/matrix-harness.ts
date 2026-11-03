@@ -1,4 +1,3 @@
-import { createClient } from 'matrix-js-sdk';
 import {
   connectMatrix,
   type MatrixConnection,
@@ -16,15 +15,19 @@ type HarnessState = {
   security: unknown;
   typing: boolean;
   readEventIds: string[];
-  connect(connection: HarnessSession): Promise<void>;
+  connect(connection: HarnessSession, storageKey?: number[]): Promise<void>;
   disconnect(): void;
-  passwordLogin(userId: string, password: string, deviceName: string): Promise<HarnessSession>;
+  passwordLogin(userId: string, password: string, deviceName: string, deviceId?: string): Promise<HarnessSession>;
   roomStatus(connection: HarnessSession): Promise<{ room_id: string }>;
   createInvitation(connection: HarnessSession): Promise<unknown>;
-  redeemInvitation(invite: unknown): Promise<HarnessSession>;
+  redeemInvitation(invite: unknown, deviceId?: string): Promise<HarnessSession>;
   replayInvitation(invite: unknown): Promise<number>;
-  bootstrapSecurity(password: string): Promise<string>;
-  requestPartnerVerification(): Promise<void>;
+  unlockExistingSecretStorage(recoveryKey: string, password: string): Promise<string>;
+  prepareSecretStorageSetup(): Promise<string>;
+  commitSecretStorageSetup(confirmation: string): Promise<string>;
+  discardPendingSecretStorageKey(): void;
+  bootstrapSecurity(password: string): Promise<void>;
+  requestPartnerVerification(deviceId: string): Promise<void>;
   acceptVerification(id: string): Promise<void>;
   startSasVerification(id: string): Promise<void>;
   confirmSas(id: string): Promise<void>;
@@ -48,7 +51,7 @@ const state: HarnessState = {
   security: null,
   typing: false,
   readEventIds: [],
-  async connect(connection) {
+  async connect(connection, storageKey) {
     this.disconnect();
     this.events = [];
     this.verifications = [];
@@ -56,7 +59,7 @@ const state: HarnessState = {
     this.typing = false;
     this.readEventIds = [];
     this.client = await connectMatrix(
-      connection,
+      storageKey ? { ...connection, storageKey: Uint8Array.from(storageKey) } : connection,
       (event) => this.events.push(event),
       () => undefined,
       (verification) => {
@@ -74,13 +77,15 @@ const state: HarnessState = {
     this.client?.close();
     this.client = null;
   },
-  async passwordLogin(userId, password, deviceName) {
+  async passwordLogin(userId, password, deviceName, deviceId) {
+    const { createClient } = await import('matrix-js-sdk');
     const loginClient = createClient({ baseUrl: apiBase });
     try {
       const session = await loginClient.login('m.login.password', {
         identifier: { type: 'm.id.user', user: userId },
         password,
         initial_device_display_name: deviceName,
+        ...(deviceId ? { device_id: deviceId } : {}),
       });
       return {
         homeserver: apiBase,
@@ -109,7 +114,7 @@ const state: HarnessState = {
   async createInvitation(connection) {
     return postJson('/_synapse/client/nymph/pairing/create', { room_id: connection.roomId }, connection.accessToken);
   },
-  async redeemInvitation(invite) {
+  async redeemInvitation(invite, deviceId) {
     const invitation = invite as { token: string; room_id: string };
     const redeemed = await postJson<{
       partner_user_id: string;
@@ -119,11 +124,13 @@ const state: HarnessState = {
     if (redeemed.partner_user_id !== '@partner2:localhost' || redeemed.room_id !== invitation.room_id) {
       throw new Error('Pairing returned an unexpected partner identity or room.');
     }
+    const { createClient } = await import('matrix-js-sdk');
     const loginClient = createClient({ baseUrl: apiBase });
     try {
       const session = await loginClient.login('m.login.token', {
         token: redeemed.login_token,
         initial_device_display_name: 'NYMPH automated Partner 2',
+        ...(deviceId ? { device_id: deviceId } : {}),
       });
       if (session.user_id !== '@partner2:localhost') throw new Error('Pairing did not authenticate Partner 2.');
       return {
@@ -148,13 +155,28 @@ const state: HarnessState = {
     });
     return response.status;
   },
+  async unlockExistingSecretStorage(recoveryKey, password) {
+    if (!this.client) throw new Error('Connect a Matrix client before unlocking Secret Storage.');
+    return this.client.unlockExistingSecretStorage(recoveryKey, password);
+  },
+  async prepareSecretStorageSetup() {
+    if (!this.client) throw new Error('Connect a Matrix client before preparing Secret Storage.');
+    return this.client.prepareSecretStorageSetup();
+  },
+  async commitSecretStorageSetup(confirmation) {
+    if (!this.client) throw new Error('Connect a Matrix client before confirming Secret Storage.');
+    return this.client.commitSecretStorageSetup(confirmation);
+  },
+  discardPendingSecretStorageKey() {
+    this.client?.discardPendingSecretStorageKey();
+  },
   async bootstrapSecurity(password) {
     if (!this.client) throw new Error('Connect a Matrix client before bootstrapping security.');
     return this.client.bootstrapSecurity(password);
   },
-  async requestPartnerVerification() {
+  async requestPartnerVerification(deviceId) {
     if (!this.client) throw new Error('Connect a Matrix client before requesting verification.');
-    await this.client.requestPartnerVerification();
+    await this.client.requestPartnerVerification(deviceId);
   },
   async acceptVerification(id) {
     if (!this.client) throw new Error('Connect a Matrix client before accepting verification.');

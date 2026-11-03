@@ -6,7 +6,8 @@ import type {
 } from 'matrix-js-sdk';
 import { Capacitor } from '@capacitor/core';
 import { CryptoEvent } from 'matrix-js-sdk/lib/crypto-api/CryptoEvent.js';
-import { OnlySignedDevicesIsolationMode } from 'matrix-js-sdk/lib/crypto-api/index.js';
+import { CrossSigningKey, OnlySignedDevicesIsolationMode } from 'matrix-js-sdk/lib/crypto-api/index.js';
+import type { GeneratedSecretStorageKey } from 'matrix-js-sdk/lib/crypto-api/index.js';
 import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/recovery-key.js';
 import {
   VerificationPhase,
@@ -76,11 +77,17 @@ export interface MatrixVerification {
 }
 
 export interface MatrixSecurityState {
+  userId: string;
   ownDeviceId: string;
   partnerVerified: boolean;
   identityChanged: boolean;
   crossSigningReady: boolean;
   secretStorageReady: boolean;
+  defaultSecretStorageKeyId: string | null;
+  publicCrossSigningKeysPresent: boolean;
+  privateCrossSigningSecretsStored: boolean;
+  privateCrossSigningKeysCachedLocally: boolean;
+  keyBackupVersion: string | null;
   partnerDevices: MatrixDeviceSummary[];
   ownDevices: MatrixDeviceSummary[];
 }
@@ -92,8 +99,12 @@ export interface MatrixMessagingClient {
   markRead(eventId: string): Promise<void>;
   setTyping(isTyping: boolean): Promise<void>;
   getSecurityState(): Promise<MatrixSecurityState>;
-  bootstrapSecurity(password: string): Promise<string>;
-  requestPartnerVerification(): Promise<void>;
+  unlockExistingSecretStorage(recoveryKey: string, password: string): Promise<string>;
+  prepareSecretStorageSetup(): Promise<string>;
+  commitSecretStorageSetup(confirmation: string): Promise<string>;
+  discardPendingSecretStorageKey(): void;
+  bootstrapSecurity(password: string): Promise<void>;
+  requestPartnerVerification(deviceId: string): Promise<void>;
   acceptVerification(id: string): Promise<void>;
   startSasVerification(id: string): Promise<void>;
   startQrVerification(id: string): Promise<Uint8Array>;
@@ -210,6 +221,15 @@ function waitForInitialSync(
   });
 }
 
+async function waitForRoomEncryption(checkEncryption: () => Promise<boolean>): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (await checkEncryption()) return;
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+  }
+  throw new Error('The configured Matrix room is not end-to-end encrypted. Refusing to send messages.');
+}
+
 async function assertPairMembership(client: MatrixClient, credentials: MatrixConnection): Promise<void> {
   const joinedIds = Object.keys((await client.getJoinedRoomMembers(credentials.roomId)).joined);
   const room = client.getRoom(credentials.roomId);
@@ -259,6 +279,13 @@ export async function connectMatrix(
   }
 
   const secretStorageKeys = new Map<string, Uint8Array<ArrayBuffer>>();
+  let pendingSecretStorageKey: GeneratedSecretStorageKey | undefined;
+  const clearSecretStorageKeyMaterial = () => {
+    for (const key of secretStorageKeys.values()) key.fill(0);
+    secretStorageKeys.clear();
+    pendingSecretStorageKey?.privateKey.fill(0);
+    pendingSecretStorageKey = undefined;
+  };
   const client = sdk.createClient({
     baseUrl: homeserver.origin,
     accessToken: credentials.accessToken,
@@ -267,26 +294,17 @@ export async function connectMatrix(
     timelineSupport: true,
     cryptoCallbacks: {
       cacheSecretStorageKey: (keyId, _keyInfo, key) => {
-        secretStorageKeys.set(keyId, key);
+        secretStorageKeys.get(keyId)?.fill(0);
+        secretStorageKeys.set(keyId, new Uint8Array(key));
       },
       getSecretStorageKey: async ({ keys }) => {
-        for (const [keyId] of Object.entries(keys)) {
-          const cached = secretStorageKeys.get(keyId);
-          if (cached) return [keyId, cached];
+        const keyId = await client.secretStorage.getDefaultKeyId();
+        if (!keyId || !Object.hasOwn(keys, keyId)) return null;
+        if (keys[keyId].algorithm !== 'm.secret_storage.v1.aes-hmac-sha2') {
+          throw new Error('The account default Secret Storage key uses an unsupported algorithm.');
         }
-        const keyIds = Object.keys(keys);
-        const recoveryKey = window.prompt('Enter your Matrix recovery key to unlock encrypted account secrets.');
-        if (recoveryKey) {
-          for (const keyId of keyIds) {
-            try {
-              const decoded = decodeRecoveryKey(recoveryKey);
-              secretStorageKeys.set(keyId, decoded);
-              return [keyId, decoded];
-            } catch {
-              break;
-            }
-          }
-        }
+        const cached = secretStorageKeys.get(keyId);
+        if (cached) return [keyId, cached];
         return null;
       },
     },
@@ -360,17 +378,33 @@ export async function connectMatrix(
       verified: (await cryptoApi.getDeviceVerificationStatus(credentials.userId, device.device_id))?.isVerified() ?? false,
       current: device.device_id === client.getDeviceId(),
     })));
-    const [partnerIdentity, crossSigningReady, secretStorageReady] = await Promise.all([
+    const [
+      partnerIdentity,
+      crossSigningReady,
+      secretStorageStatus,
+      crossSigningStatus,
+      publicCrossSigningKeysPresent,
+      keyBackupInfo,
+    ] = await Promise.all([
       cryptoApi.getUserVerificationStatus(credentials.partnerUserId),
       cryptoApi.isCrossSigningReady(),
-      cryptoApi.isSecretStorageReady(),
+      cryptoApi.getSecretStorageStatus(),
+      cryptoApi.getCrossSigningStatus(),
+      cryptoApi.userHasCrossSigningKeys(credentials.userId, true),
+      cryptoApi.getKeyBackupInfo(),
     ]);
     const state: MatrixSecurityState = {
+      userId: credentials.userId,
       ownDeviceId: client.getDeviceId() ?? '',
       partnerVerified: partnerIdentity.isCrossSigningVerified(),
       identityChanged: partnerIdentity.needsUserApproval,
       crossSigningReady,
-      secretStorageReady,
+      secretStorageReady: secretStorageStatus.ready,
+      defaultSecretStorageKeyId: secretStorageStatus.defaultKeyId,
+      publicCrossSigningKeysPresent,
+      privateCrossSigningSecretsStored: crossSigningStatus.privateKeysInSecretStorage,
+      privateCrossSigningKeysCachedLocally: Object.values(crossSigningStatus.privateKeysCachedLocally).every(Boolean),
+      keyBackupVersion: keyBackupInfo?.version ?? null,
       partnerDevices,
       ownDevices,
     };
@@ -421,9 +455,7 @@ export async function connectMatrix(
     }
     if (!room) throw new Error('Could not open the configured private room.');
     await assertPairMembership(client, credentials);
-    if (!(await cryptoApi.isEncryptionEnabledInRoom(credentials.roomId))) {
-      throw new Error('The configured Matrix room is not end-to-end encrypted. Refusing to send messages.');
-    }
+    await waitForRoomEncryption(() => cryptoApi.isEncryptionEnabledInRoom(credentials.roomId));
 
     const receive = (event: MatrixEvent, eventRoom: Room | undefined, toStartOfTimeline?: boolean, removed?: boolean) => {
       if (removed || toStartOfTimeline || eventRoom?.roomId !== credentials.roomId) return;
@@ -513,18 +545,68 @@ export async function connectMatrix(
       async getSecurityState() {
         return refreshSecurity();
       },
-      async bootstrapSecurity(password) {
-        if (!password) throw new Error('Enter this Matrix account’s password to authorize cross-signing setup.');
-        const storageStatus = await cryptoApi.getSecretStorageStatus();
-        let recoveryKey = '';
-        if (!storageStatus.defaultKeyId) {
-          const generated = await cryptoApi.createRecoveryKeyFromPassphrase();
-          await cryptoApi.bootstrapSecretStorage({
-            createSecretStorageKey: async () => generated,
-          });
-          recoveryKey = generated.encodedPrivateKey ?? '';
-        } else {
-          await cryptoApi.bootstrapSecretStorage({});
+      async unlockExistingSecretStorage(recoveryKey, password) {
+        const keyId = await client.secretStorage.getDefaultKeyId();
+        if (!keyId) {
+          throw new Error(`No existing default Secret Storage key is configured for ${credentials.userId}.`);
+        }
+        const keyInfo = await client.secretStorage.getKey(keyId);
+        if (!keyInfo || keyInfo[1].algorithm !== 'm.secret_storage.v1.aes-hmac-sha2') {
+          throw new Error(`The existing default Secret Storage key for ${credentials.userId} is unavailable or unsupported.`);
+        }
+
+        let decoded: Uint8Array<ArrayBuffer>;
+        try {
+          decoded = decodeRecoveryKey(recoveryKey);
+        } catch {
+          throw new Error(`The recovery key provided for ${credentials.userId} is invalid.`);
+        }
+        if (!(await client.secretStorage.checkKey(decoded, keyInfo[1]))) {
+          decoded.fill(0);
+          throw new Error(`The recovery key does not match ${credentials.userId}'s default Secret Storage key.`);
+        }
+        secretStorageKeys.get(keyId)?.fill(0);
+        secretStorageKeys.set(keyId, new Uint8Array(decoded));
+        decoded.fill(0);
+
+        const hasPublicKeys = await cryptoApi.userHasCrossSigningKeys(credentials.userId, true);
+        const privateSecrets = await Promise.all([
+          client.secretStorage.get('m.cross_signing.master'),
+          client.secretStorage.get('m.cross_signing.self_signing'),
+          client.secretStorage.get('m.cross_signing.user_signing'),
+        ]);
+        if (!hasPublicKeys || privateSecrets.some((secret) => !secret)) {
+          throw new Error(
+            `Existing cross-signing keys are incomplete for ${credentials.userId}; ` +
+            'recovery stopped without creating or replacing keys.',
+          );
+        }
+        if (!password) throw new Error('Enter this Matrix account password to restore cross-signing on this device.');
+
+        const crossSigningTypes = [
+          CrossSigningKey.Master,
+          CrossSigningKey.SelfSigning,
+          CrossSigningKey.UserSigning,
+        ];
+        const publishedKeys = await cryptoApi.getUserCrossSigningKeys(credentials.userId);
+        const publishedKeyIds = crossSigningTypes.map((type) => {
+          const key = publishedKeys?.[type];
+          return key ? Object.keys(key.keys)[0] : undefined;
+        });
+        if (publishedKeyIds.some((id) => !id)) {
+          throw new Error(`The published cross-signing identity is incomplete for ${credentials.userId}.`);
+        }
+        const localStatus = await cryptoApi.getCrossSigningStatus();
+        if (Object.values(localStatus.privateKeysCachedLocally).every(Boolean)) {
+          const cachedKeyIds = await Promise.all(
+            crossSigningTypes.map((type) => cryptoApi.getCrossSigningKeyId(type)),
+          );
+          if (cachedKeyIds.some((id, index) => id !== publishedKeyIds[index])) {
+            throw new Error(
+              `The cached cross-signing identity does not match the published identity for ${credentials.userId}. ` +
+              'Recovery stopped without changing either identity.',
+            );
+          }
         }
         await cryptoApi.bootstrapCrossSigning({
           authUploadDeviceSigningKeys: async (makeRequest) => makeRequest({
@@ -533,11 +615,122 @@ export async function connectMatrix(
             password,
           }),
         });
+        const restoredKeyIds = await Promise.all(
+          crossSigningTypes.map((type) => cryptoApi.getCrossSigningKeyId(type)),
+        );
+        if (
+          !(await cryptoApi.isCrossSigningReady()) ||
+          restoredKeyIds.some((id, index) => id !== publishedKeyIds[index])
+        ) {
+          throw new Error(`Existing cross-signing keys could not be restored for ${credentials.userId}.`);
+        }
         await refreshSecurity();
-        return recoveryKey;
+        return keyId;
       },
-      async requestPartnerVerification() {
-        const request = await cryptoApi.requestVerificationDM(credentials.partnerUserId, credentials.roomId);
+      async prepareSecretStorageSetup() {
+        if (pendingSecretStorageKey) {
+          pendingSecretStorageKey.privateKey.fill(0);
+          pendingSecretStorageKey = undefined;
+        }
+        const status = await cryptoApi.getSecretStorageStatus();
+        if (status.defaultKeyId) {
+          throw new Error(
+            `Secret Storage is already configured for ${credentials.userId}; unlock it instead of creating a replacement key.`,
+          );
+        }
+        const crossSigningStatus = await cryptoApi.getCrossSigningStatus();
+        const publicKeysPresent = await cryptoApi.userHasCrossSigningKeys(credentials.userId, true);
+        const allLocalPrivateKeys = Object.values(crossSigningStatus.privateKeysCachedLocally).every(Boolean);
+        if (publicKeysPresent && !allLocalPrivateKeys) {
+          throw new Error(
+            `An existing cross-signing identity is published for ${credentials.userId}, but its private keys are not available locally. ` +
+            'Recovery is required; a replacement will not be generated.',
+          );
+        }
+        const generated = await cryptoApi.createRecoveryKeyFromPassphrase();
+        if (!generated.encodedPrivateKey) {
+          generated.privateKey.fill(0);
+          throw new Error('The Matrix SDK did not return an encoded recovery key.');
+        }
+        pendingSecretStorageKey = generated;
+        return generated.encodedPrivateKey;
+      },
+      async commitSecretStorageSetup(confirmation) {
+        const generated = pendingSecretStorageKey;
+        if (!generated?.encodedPrivateKey) {
+          throw new Error('Generate a new recovery key before confirming Secret Storage setup.');
+        }
+        if (confirmation !== generated.encodedPrivateKey) {
+          throw new Error('The confirmation does not match the displayed recovery key.');
+        }
+        let keyId = await client.secretStorage.getDefaultKeyId();
+        if (!keyId) {
+          await cryptoApi.bootstrapSecretStorage({
+            createSecretStorageKey: async () => generated,
+          });
+          keyId = await client.secretStorage.getDefaultKeyId();
+        }
+        if (!keyId) throw new Error('Secret Storage setup completed without a default key ID.');
+        const storedKey = await client.secretStorage.getKey(keyId);
+        if (!storedKey || !(await client.secretStorage.checkKey(generated.privateKey, storedKey[1]))) {
+          throw new Error(
+            `The account default key changed during setup for ${credentials.userId}; ` +
+            'the generated recovery key was not accepted as the default.',
+          );
+        }
+        generated.privateKey.fill(0);
+        if (pendingSecretStorageKey === generated) pendingSecretStorageKey = undefined;
+        await refreshSecurity();
+        return keyId;
+      },
+      discardPendingSecretStorageKey() {
+        pendingSecretStorageKey?.privateKey.fill(0);
+        pendingSecretStorageKey = undefined;
+      },
+      async bootstrapSecurity(password) {
+        if (!password) throw new Error('Enter this Matrix account’s password to authorize cross-signing setup.');
+        const storageStatus = await cryptoApi.getSecretStorageStatus();
+        if (!storageStatus.defaultKeyId) {
+          throw new Error('Confirm a new Secret Storage recovery key before setting up cross-signing.');
+        }
+        const crossSigningStatus = await cryptoApi.getCrossSigningStatus();
+        const publicKeysPresent = await cryptoApi.userHasCrossSigningKeys(credentials.userId, true);
+        const hasPrivateKeys = Object.values(crossSigningStatus.privateKeysCachedLocally).every(Boolean) ||
+          crossSigningStatus.privateKeysInSecretStorage;
+        if (publicKeysPresent && !hasPrivateKeys) {
+          throw new Error(
+            `Existing cross-signing keys for ${credentials.userId} are unavailable. ` +
+            'Unlock the original Secret Storage; key replacement is not allowed here.',
+          );
+        }
+        await cryptoApi.bootstrapSecretStorage({});
+        await cryptoApi.bootstrapCrossSigning({
+          authUploadDeviceSigningKeys: async (makeRequest) => makeRequest({
+            type: 'm.login.password',
+            identifier: { type: 'm.id.user', user: credentials.userId },
+            password,
+          }),
+        });
+        if (!(await cryptoApi.isCrossSigningReady())) {
+          throw new Error(`Cross-signing did not become ready for ${credentials.userId}.`);
+        }
+        await refreshSecurity();
+      },
+      async requestPartnerVerification(deviceId) {
+        const deadline = Date.now() + 15_000;
+        let deviceAvailable = false;
+        while (Date.now() < deadline) {
+          const devices = await cryptoApi.getUserDeviceInfo([credentials.partnerUserId], true);
+          if (devices.get(credentials.partnerUserId)?.has(deviceId)) {
+            deviceAvailable = true;
+            break;
+          }
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+        }
+        if (!deviceAvailable) throw new Error('That partner device is no longer available.');
+        const status = await cryptoApi.getDeviceVerificationStatus(credentials.partnerUserId, deviceId);
+        if (status?.isVerified()) throw new Error('That partner device is already verified.');
+        const request = await cryptoApi.requestDeviceVerification(credentials.partnerUserId, deviceId);
         onVerificationRequest(request);
       },
       async acceptVerification(id) {
@@ -614,12 +807,12 @@ export async function connectMatrix(
         client.removeListener(CryptoEvent.UserTrustStatusChanged, onUserTrustChanged);
         client.removeListener(CryptoEvent.DevicesUpdated, onDevicesUpdated);
         client.stopClient();
-        secretStorageKeys.clear();
+        clearSecretStorageKeyMaterial();
       },
     };
   } catch (error) {
     client.stopClient();
-    secretStorageKeys.clear();
+    clearSecretStorageKeyMaterial();
     throw error;
   }
 }

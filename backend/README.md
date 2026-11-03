@@ -47,7 +47,7 @@ Run the PowerShell setup script from the repository root:
 .\backend\start-dev.ps1
 ```
 
-It creates random local-only passwords and a registration secret under the ignored `backend/dev-secrets/` directory, generates the Synapse config if needed, starts the pinned SQLite service, disables public registration, guests, room discovery and federation, and provisions exactly the two regular partner accounts. It creates no administrator account. To let the one-time local bootstrap invite partner B, `block_non_admin_invites` is disabled only in this development config; the server-side policy module restricts invites to partner A inviting partner B. The production scaffold keeps non-admin invites disabled. The password files stay on this machine and are never printed by the script. Keep the directory private and never copy these credentials to production.
+It creates random local-only passwords and a registration secret under the ignored `backend/dev-secrets/` directory, generates the Synapse config if needed, starts the pinned SQLite service, disables public registration, guests, room discovery and federation, and provisions exactly the two regular partner accounts. It creates no administrator account. To let the one-time local bootstrap invite partner B, `block_non_admin_invites` is disabled only in this development config; the server-side policy module restricts invites to partner A inviting partner B. The local-only login throttle allows a small burst of repeated test logins while remaining enabled; production Synapse rate limits are not changed. The production scaffold keeps non-admin invites disabled. The password files stay on this machine and are never printed by the script. Keep the directory private and never copy these credentials to production.
 
 The base service binds only to `127.0.0.1:8008`. Synapse's development policy module permits one private, non-federatable, invite-only encrypted room, one invite from partner1 to partner2, and no other room members. It also exposes a short-lived, single-use pairing invitation endpoint. Redeeming an invitation yields a Synapse `m.login.token` that is itself one-time and short-lived; the QR payload never contains a permanent access token. This is local development code, not a production-ready invitation store or Android credential store.
 
@@ -63,11 +63,49 @@ npm test
 npm run test:matrix:live
 ```
 
-Chrome is required. Set `NYMPH_CHROME_PATH` if it is not installed at `C:\Program Files\Google\Chrome\Application\chrome.exe`. The test reads the two ignored local password files but never prints their contents. Its isolated browser profiles are created in the operating-system temporary directory and removed at the end.
+Chrome is required. Set `NYMPH_CHROME_PATH` if it is not installed at `C:\Program Files\Google\Chrome\Application\chrome.exe`. The test reads the two ignored local password files but never prints their contents. Separate browser profiles and encrypted IndexedDB stores persist under the ignored `.matrix-e2e/partner-a-live-2` and `.matrix-e2e/partner-b-live-2` directories so restart recovery can be exercised. Preserve these directories between runs; deleting them resets the local test clients' crypto state.
 
-The live test uses the production `connectMatrix` implementation and existing encrypted room to exercise pairing and replay rejection, Rust crypto initialization, cross-signing bootstrap, independently compared/confirmed SAS values, rejection before verification, encrypted messages in all four modes, replies, reactions, typing, read receipts, reconnection/offline delivery, browser-profile restart history recovery, and device revocation. Synapse policy unit tests separately cover expired invitations and unauthorized membership. This is a PC/browser integration test, not Android Keystore or physical-device validation.
+The test requires both original account recovery keys. It fails before login unless these process environment variables are non-empty:
 
-Android debug builds use `http://localhost:8008` only in Vite's `android` mode, with cleartext allowed only for `localhost` in the debug Network Security Config. Release networking denies cleartext. The Capacitor WebView origin is `https://localhost`; the custom pairing endpoint's development allowlist includes that exact origin. Synapse 1.164.2's built-in Matrix API uses a wildcard CORS response; CORS is not an authentication boundary.
+- Partner A (`@partner1:localhost`): `NYMPH_E2E_PARTNER1_RECOVERY_KEY`
+- Partner B (`@partner2:localhost`): `NYMPH_E2E_PARTNER2_RECOVERY_KEY`
+
+The local account-provisioning script does not generate or save Matrix recovery keys; it only creates the Synapse account passwords and registration secret. Recovery keys produced by the app are kept in memory until the user exports/copies them and confirms them. A new recovery key is not uploaded to Matrix before the user completes that confirmation. If either original recovery key was not saved elsewhere, do not generate a replacement or reset Secret Storage; recovery of the existing account secrets is blocked until that key is found.
+
+To enter both values without putting them in command history, source files, or `.env` files, use a masked PowerShell prompt in the same PowerShell window that runs the test:
+
+```powershell
+$recoveryKeyVariables = @(
+    @{ Name = 'NYMPH_E2E_PARTNER1_RECOVERY_KEY'; Prompt = 'Partner A original Matrix recovery key' },
+    @{ Name = 'NYMPH_E2E_PARTNER2_RECOVERY_KEY'; Prompt = 'Partner B original Matrix recovery key' }
+)
+try {
+    foreach ($item in $recoveryKeyVariables) {
+        $secureValue = Read-Host $item.Prompt -AsSecureString
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
+        try {
+            [Environment]::SetEnvironmentVariable(
+                $item.Name,
+                [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer),
+                'Process'
+            )
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+            $secureValue.Dispose()
+        }
+    }
+    npm run test:matrix:live
+} finally {
+    Remove-Item Env:NYMPH_E2E_PARTNER1_RECOVERY_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:NYMPH_E2E_PARTNER2_RECOVERY_KEY -ErrorAction SilentlyContinue
+}
+```
+
+The test reports only whether each variable is present and whether each account unlocked; it does not print recovery keys or decoded key material. Each key is supplied only to its corresponding independent browser context and validated against that account's default Secret Storage key metadata. The built harness uses `http://127.0.0.1:5174`, allowlisted separately from the desktop app origin.
+
+The live test uses the production `connectMatrix` implementation and existing encrypted room. It checks each supplied recovery key against the corresponding default key ID, decrypts all three existing cross-signing secrets, confirms the public identity is already published, and only then asks the SDK to restore the existing identity. It stops before cross-signing if either account fails any check; it does not reset Secret Storage or generate replacement keys. The acceptance flow then exercises invitation replay rejection, SAS comparison and confirmation, pre-verification send rejection, encrypted messages in all four modes, replies, reactions, typing, read receipts, reconnection/offline delivery, browser-profile restart history recovery, and device revocation. Pairing, replay rejection, both clients' encrypted sync, and Partner B device-key visibility have passed. Neither existing Secret Storage has been unlocked in the live test, so cross-signing, SAS, encrypted message exchange, restart recovery, and revocation remain unverified. Synapse policy unit tests separately cover expired invitations and unauthorized membership. This is a PC/browser integration test, not Android Keystore or physical-device validation.
+
+Android debug builds use `http://localhost:8008` only in Vite's `android` mode, with cleartext allowed only for `localhost` in the debug Network Security Config. Release networking denies cleartext. The Capacitor WebView origin is `https://localhost`; the custom pairing endpoint's development allowlist includes that exact origin. The isolated browser integration harness uses `http://127.0.0.1:5174`, which is separately allowlisted for local testing. Synapse 1.164.2's built-in Matrix API uses a wildcard CORS response; CORS is not an authentication boundary.
 
 For production, set `VITE_MATRIX_HOMESERVER` to the eventual deployed HTTPS URL and run `npm run android:release`. The release command rejects an unset or loopback URL. No permanent hostname, signing key, or hosting credentials are supplied here; release APK signing still requires the owner's signing configuration.
 
@@ -77,13 +115,13 @@ Room creation and membership enforcement must be tested before using private con
 
 ## Two-partner policy and enrollment status
 
-The local development setup provisions only `@partner1:localhost`, `@partner2:localhost`, and their private encrypted room. The production deployment scaffold is not a completed private two-person service. The app has a development Partner 1 password sign-in, a one-time QR invitation flow for Partner 2, and Matrix SDK device-verification/cross-signing controls. The PC live suite validates their Matrix protocol path against local Synapse; physical Android UI and storage behavior still require device testing. No production partner credentials are embedded in the frontend.
+The local development setup provisions only `@partner1:localhost`, `@partner2:localhost`, and their private encrypted room. The production deployment scaffold is not a completed private two-person service. The app has a development Partner 1 password sign-in, a one-time QR invitation flow for Partner 2, and Matrix SDK device-verification/cross-signing controls. The PC live suite has reached invitation redemption, both clients' encrypted sync, and device-key lookup, but has not yet unlocked the existing Secret Storage or validated the rest of the Matrix protocol path; physical Android UI and storage behavior also remain untested. No production partner credentials are embedded in the frontend.
 
 `block_non_admin_invites`, a private room, and a client-side member check are not enough to enforce an exact two-person allowlist. The local development module uses Synapse's supported spam-checker callbacks `user_may_create_room`, `user_may_invite`, `user_may_join_room`, and `check_event_for_spam`; the API is present in pinned Synapse 1.164.2. Its `on_new_event` callback records the newly created room ID after Synapse persists the validated creation event, so later membership checks are bound to that room. It also uses `ModuleApi.create_login_token` (available since 1.69.0) for the second, one-time login credential. The module limits its local policy state to one created room and checks private/invite-only/encrypted room settings. The more generic third-party `check_event_allowed` callback is documented as very experimental and is not used.
 
 In local development, `block_non_admin_invites` is disabled only because the bootstrap client must invite partner B; the module restricts that action to partner A inviting partner B. The production scaffold keeps non-admin invitations disabled. Policy unit tests cover invite/join restrictions and pairing-token expiry/reuse, and local API checks confirmed both accounts can log in, the room is encrypted and invite-only, a third-user invite is rejected, and partner B cannot create another room. An actual join attempt by a separately provisioned unauthorized account and a federation join have not been tested. The administrator remains trusted and can override any room policy. Registration remains disabled; account creation must be performed by an administrator through the local Synapse provisioning process, never by exposing admin credentials to either phone.
 
-Synapse device verification is distinct from app invitation redemption. The local pairing endpoint is not a replacement for Matrix device verification. The app uses the SDK's `VerificationRequest` flow for SAS emoji/decimal or QR verification, explicit confirmation, cross-signing bootstrap, key-change status, and device revocation controls. The PC live suite validates SAS and cross-signing between its isolated browser profiles. On Android, the app stores the Matrix session and a random 32-byte Rust crypto-store key in `@aparajita/capacitor-secure-storage`, which encrypts values with an Android Keystore-generated AES-GCM key. The Rust crypto store itself remains in persistent IndexedDB and uses that random key for its SDK-supported encrypted storage. The six-digit app PIN is not used as the crypto-store key. Device IDs are saved and passed back to the SDK so the same device identity and per-device store are restored after restart. Android persistence still requires physical-device restart-and-decrypt validation.
+Synapse device verification is distinct from app invitation redemption. The local pairing endpoint is not a replacement for Matrix device verification. The app uses the SDK's `VerificationRequest` flow for SAS emoji/decimal or QR verification, explicit confirmation, cross-signing bootstrap, key-change status, and device revocation controls. The PC live suite has not yet validated SAS or cross-signing between its isolated browser profiles. On Android, the app stores the Matrix session and a random 32-byte Rust crypto-store key in `@aparajita/capacitor-secure-storage`, which encrypts values with an Android Keystore-generated AES-GCM key. The Rust crypto store itself remains in persistent IndexedDB and uses that random key for its SDK-supported encrypted storage. The six-digit app PIN is not used as the crypto-store key. Device IDs are saved and passed back to the SDK so the same device identity and per-device store are restored after restart. Android persistence still requires physical-device restart-and-decrypt validation.
 
 The app also uses native biometrics/device credentials for the app lock, a native `FLAG_SECURE` window, and background relocking. These protections are not substitutes for verifying device identity. Synapse 1.164.2's supported module callbacks do not provide a device-login admission callback to atomically enforce one active authenticated device per partner; the present backend therefore does not meet the one-active-device requirement. Do not represent client-side device checks as server enforcement or use it for production device replacement until a supported server-side revocation/admission design is implemented and tested.
 
@@ -91,17 +129,14 @@ The app also uses native biometrics/device credentials for the app lock, a nativ
 
 Back up PostgreSQL consistently, the Synapse data volume (signing key, media, and config), the Caddy data volume (ACME state), and both secret files. A basic database dump can be made with `docker compose exec -T postgres pg_dump -U synapse -d synapse > synapse.sql`; use a volume-aware backup tool for the named volumes. Encrypt backups and keep them off-host. Test restoration to an isolated host before relying on them. Never rotate or lose the Synapse signing key without following Synapse's documented key-rotation/recovery procedure. Database snapshots alone do not include media or signing keys.
 
+Before any Matrix recovery operation, preserve the Synapse persistent data and each browser profile's IndexedDB crypto store. The Stage 3F metadata audit created an ignored, local snapshot under `backend/dev-backups/recovery-audit-*`; its SQLite copy passed `PRAGMA integrity_check`, and the copied Synapse/profile file counts were verified. This is a local safeguard, not an encrypted off-host backup or a tested restore.
+
 ## Current limitations
 
-- The deployment scaffold has not been started against a real public hostname or an always-on server.
-- The production scaffold does not yet include or validate the local room-policy module.
-- QR enrollment, device verification, cross-signing, and device revocation have not been tested end-to-end against the running server.
-- Seven Synapse policy unit tests pass in the pinned Synapse container. No live QR pairing, cross-signing, encrypted two-client messaging, offline delivery, read-receipt, unauthorized-join, or revoked-device integration test has been completed.
-- The focused client suite passes (3/3), and `npm run android:debug` previously produced a successful debug APK build. Partner A's Android 36 emulator booted, installed the APK, and opened `MainActivity`, but Android System UI reported an ANR; after dismissing it, the app UI still could not be verified. The emulator's TCP connection to `10.0.2.2:8008` succeeded, while no Matrix login or in-app request was completed.
-- The previous emulator ANR dialog named `System UI`, and ADB's focused window was `Application Not Responding: com.android.systemui`; this identifies the reported ANR as System UI, not NYMPH. No retained emulator bugreport or ANR trace was found, and the emulator was not restarted, so the underlying System UI cause remains undiagnosed.
-- USB physical-device testing is pending. One Samsung SM-X115 (`R9ZX…49B7F`, serial redacted) is attached, and the `tcp:8008` reverse rule is active. Its browser was opened to the Matrix versions URL, but the response body has not been confirmed. A second phone is not connected, and neither phone has completed app login or messaging.
-- The LAN HTTPS overlay and firewall rule have not been activated. No Windows network profile or firewall changes were made. No physical-phone messaging test has completed.
+- The deployment scaffold has not been started against a real public hostname or an always-on server. It does not yet include or validate the local room-policy module.
+- Seven Synapse policy unit tests pass in the pinned Synapse container; the focused client suite passes (7/7), and `npm run build` succeeds. A prior live run verified invitation creation, replay rejection, encrypted sync for both independent clients, and Partner B device-key visibility from both sessions. The metadata-only audit found default Secret Storage keys, all public cross-signing key types, and encrypted private cross-signing secret records for both accounts, but no server-side room-key backup. It does not prove that either recovery key is available or that an existing device can unlock the secrets. The live test now requires both account-specific recovery-key environment variables before login, validates each against its account's default key, and restores existing cross-signing keys only if they match the published identity. No recovery-key values are stored in the repository or printed. SAS verification, cross-signing completion, encrypted two-client delivery, offline/read receipts, restart recovery, and revocation have not passed as an end-to-end suite.
+- Android debug packaging was previously built, but this is not physical-device validation. Per the current testing strategy, no phone, USB, ADB-reverse, or emulator testing is being performed; native UI, biometric, Keystore persistence, background locking, and screenshot protection still require later device validation.
 - One-active-device-per-partner enforcement is not implemented server-side.
-- Photo/video/voice transfer, push notifications, server-side retention, and media deletion remain unimplemented.
+- Photo/video/voice transfer, push notifications, server-side retention, and media deletion remain unimplemented. Push configuration and production signing credentials also require owner-provided deployment details.
 
 Do not present NYMPH as ready for daily two-phone use until the above security controls and real-device tests pass.

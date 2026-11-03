@@ -7,7 +7,7 @@ services:
       SYNAPSE_REPORT_STATS: "no"
       PARTNER_A_USER_ID: ${PARTNER_A_USER_ID:?Set PARTNER_A_USER_ID in .env}
       PARTNER_B_USER_ID: ${PARTNER_B_USER_ID:?Set PARTNER_B_USER_ID in .env}
-      DEV_APP_ORIGINS: ${DEV_APP_ORIGINS:-http://localhost:5173,https://localhost}
+      DEV_APP_ORIGINS: ${DEV_APP_ORIGINS:-http://localhost:5173,http://127.0.0.1:5174,https://localhost}
       DEV_HOMESERVER_URL: ${DEV_HOMESERVER_URL:-http://localhost:8008}
       PYTHONPATH: /modules
     secrets:

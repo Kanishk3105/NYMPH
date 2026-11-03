@@ -3,5 +3,6 @@
 secrets/
 dev-secrets/
 dev-data/
+dev-backups/
 dev-caddy-data/
 dev-caddy-root.crt

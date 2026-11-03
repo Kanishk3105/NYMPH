@@ -33,6 +33,10 @@ def main() -> None:
     config["public_baseurl"] = "http://localhost:8008/"
     config["enable_registration"] = False
     config["allow_guest_access"] = False
+    config["rc_login"] = {
+        "address": {"per_second": 0.05, "burst_count": 10},
+        "account": {"per_second": 0.05, "burst_count": 10},
+    }
     config["allow_public_rooms"] = False
     config["allow_public_rooms_over_federation"] = False
     # The policy module narrows non-admin invitations to partner A inviting partner B only.
@@ -47,7 +51,10 @@ def main() -> None:
                 "partner_a_user_id": os.environ["PARTNER_A_USER_ID"],
                 "partner_b_user_id": os.environ["PARTNER_B_USER_ID"],
                 "homeserver_url": os.environ.get("DEV_HOMESERVER_URL", "http://localhost:8008"),
-                "app_origins": os.environ.get("DEV_APP_ORIGINS", "http://localhost:5173,https://localhost").replace(" ", ""),
+                "app_origins": os.environ.get(
+                    "DEV_APP_ORIGINS",
+                    "http://localhost:5173,http://127.0.0.1:5174,https://localhost",
+                ).replace(" ", ""),
                 "state_path": "/data/nymph-policy.sqlite3",
             },
         }
