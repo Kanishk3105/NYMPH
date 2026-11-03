@@ -294,6 +294,13 @@ test('independent Partner A/B sessions pair, verify and exchange real encrypted 
     expect(securityB.crossSigningReady).toBe(true);
     console.info('[matrix-e2e] Partner B existing cross-signing identity restored');
     await mark('cross-signing-ready');
+    const recoveryVerification = await Promise.all([
+      call<string>(pageA, 'verifyRecoveryOnSeparateDevice', recoveryKeyA, partnerAPassword),
+      call<string>(pageB, 'verifyRecoveryOnSeparateDevice', recoveryKeyB, partnerBPassword),
+    ]);
+    expect(recoveryVerification.every(Boolean)).toBe(true);
+    console.info('[matrix-e2e] Both recovery keys restored the existing identities on separate temporary devices');
+    await mark('separate-device-recovery-verified');
 
     await expect(call(pageA, 'send', {
       version: 1,

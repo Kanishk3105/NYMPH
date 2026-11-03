@@ -1,7 +1,9 @@
 import { BrowserQRCodeReader } from '@zxing/browser';
 import type { IScannerControls } from '@zxing/browser';
 import { useEffect, useRef, useState } from 'react';
+import type { ChangeEvent } from 'react';
 import QRCode from 'qrcode';
+import { decryptRecoveryExport, encryptRecoveryExport } from './recovery-export';
 import type {
   MatrixMessagingClient,
   MatrixSecurityState,
@@ -27,21 +29,32 @@ export function MatrixSecurityPanel({
   const [recoveryKey, setRecoveryKey] = useState('');
   const [recoveryConfirmation, setRecoveryConfirmation] = useState('');
   const [existingRecoveryKey, setExistingRecoveryKey] = useState('');
+  const [recoveryVerificationKey, setRecoveryVerificationKey] = useState('');
+  const [exportPassphrase, setExportPassphrase] = useState('');
+  const [exportConfirmation, setExportConfirmation] = useState('');
   const [partnerSelection, setPartnerSelection] = useState('');
   const [recoveryKeyId, setRecoveryKeyId] = useState('');
+  const [crossSigningSetup, setCrossSigningSetup] = useState(false);
+  const [verifiedRecoveryKeyId, setVerifiedRecoveryKeyId] = useState('');
   const [recoveryKeyVisible, setRecoveryKeyVisible] = useState(false);
   const [verificationQr, setVerificationQr] = useState('');
   const [scanOpen, setScanOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const scannerRef = useRef<IScannerControls | null>(null);
+  const recoveryImportRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setPartnerSelection(security?.userId ?? '');
     setRecoveryKey('');
     setRecoveryConfirmation('');
     setExistingRecoveryKey('');
+    setRecoveryVerificationKey('');
+    setExportPassphrase('');
+    setExportConfirmation('');
     setRecoveryKeyId('');
+    setCrossSigningSetup(false);
+    setVerifiedRecoveryKeyId('');
     setPassword('');
     setRecoveryKeyVisible(false);
   }, [security?.userId]);
@@ -64,6 +77,8 @@ export function MatrixSecurityPanel({
       setRecoveryKey(key);
       setRecoveryConfirmation('');
       setRecoveryKeyId('');
+      setCrossSigningSetup(false);
+      setVerifiedRecoveryKeyId('');
       setRecoveryKeyVisible(false);
       onNotify('A new key was generated locally. It has not been uploaded to Matrix yet.');
     } catch (error) {
@@ -73,24 +88,73 @@ export function MatrixSecurityPanel({
     }
   }
 
-  function exportRecoveryKey() {
+  async function exportEncryptedRecoveryKey() {
     if (!recoveryKey || !security?.userId) return;
-    const body = [
-      'NYMPH Matrix Secret Storage recovery key',
-      `Account: ${security.userId}`,
-      `Secret Storage key ID: ${recoveryKeyId || 'will be assigned after confirmation'}`,
-      `Recovery key: ${recoveryKey}`,
-      'Keep this file offline in a private, encrypted location.',
-    ].join('\r\n');
-    const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `nymph-${security.userId.slice(1).replace(/[^a-zA-Z0-9_-]/g, '-')}-matrix-recovery.txt`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    if (exportPassphrase.length < 12 || exportConfirmation !== exportPassphrase) {
+      onNotify('Use a 12-character-or-longer export passphrase and confirm it exactly.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const contents = await encryptRecoveryExport({
+        account: security.userId,
+        keyId: recoveryKeyId || security.defaultSecretStorageKeyId,
+        recoveryKey,
+      }, exportPassphrase);
+      const blob = new Blob([contents], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = 'nymph-matrix-recovery.enc';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      setExportPassphrase('');
+      setExportConfirmation('');
+      onNotify('Encrypted recovery export downloaded. Keep its passphrase separately and offline.');
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : 'Could not encrypt the recovery export.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importEncryptedRecoveryFile(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file || !security) return;
+    if (!exportPassphrase) {
+      onNotify('Enter the encrypted export passphrase first.');
+      input.value = '';
+      return;
+    }
+    setBusy(true);
+    try {
+      const contents = await decryptRecoveryExport(await file.text(), exportPassphrase);
+      if (contents.account !== security.userId) {
+        throw new Error('This encrypted recovery export belongs to a different Matrix account.');
+      }
+      if (
+        contents.keyId &&
+        contents.keyId !== security.defaultSecretStorageKeyId
+      ) {
+        throw new Error('This encrypted recovery export does not match the account default Secret Storage key.');
+      }
+      if (!security.defaultSecretStorageKeyId) {
+        throw new Error('This account has no committed Secret Storage key to recover.');
+      }
+      setExistingRecoveryKey(contents.recoveryKey);
+      setRecoveryVerificationKey(contents.recoveryKey);
+      setExportPassphrase('');
+      setExportConfirmation('');
+      onNotify('Encrypted recovery export imported for the signed-in partner account.');
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : 'Could not import the encrypted recovery export.');
+    } finally {
+      input.value = '';
+      setBusy(false);
+    }
   }
 
   async function confirmNewRecoveryKey() {
@@ -109,19 +173,60 @@ export function MatrixSecurityPanel({
         const keyId = await client.commitSecretStorageSetup(recoveryConfirmation);
         setRecoveryKeyId(keyId);
         setRecoveryConfirmation('');
+        setPassword('');
+        setCrossSigningSetup(false);
         onRefresh();
         onNotify(`The recovery key is confirmed for ${security?.userId}. Export it again now to include key ID ${keyId}, then continue cross-signing.`);
         return;
       }
-      await client.bootstrapSecurity(password);
+      if (!crossSigningSetup) {
+        await client.bootstrapSecurity(password);
+        setCrossSigningSetup(true);
+        setPassword('');
+        onRefresh();
+        onNotify('Cross-signing is ready. Re-enter the recovery key and account password to verify restoration on a separate temporary Matrix device.');
+        return;
+      }
+      if (!recoveryVerificationKey) {
+        onNotify('Re-enter the recovery key to verify it on a separate Matrix device.');
+        return;
+      }
+      const verifiedKeyId = await client.verifyRecoveryOnSeparateDevice(recoveryVerificationKey, password);
+      setVerifiedRecoveryKeyId(verifiedKeyId);
       setPassword('');
+      setRecoveryVerificationKey('');
       setRecoveryConfirmation('');
       setRecoveryKey('');
       setRecoveryKeyVisible(false);
+      setExportPassphrase('');
+      setExportConfirmation('');
       onRefresh();
-      onNotify(`Secret Storage and cross-signing are ready for ${security?.userId}. The recovery key ID is ${recoveryKeyId}.`);
+      onNotify(`Recovery was restored on a separate Matrix device and verified for ${security?.userId}. Temporary verification device revoked.`);
     } catch (error) {
       onNotify(error instanceof Error ? error.message : 'Could not configure Matrix security.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function verifyExistingRecoveryKey() {
+    if (!client || !assertSelectedPartner()) return;
+    if (!recoveryVerificationKey || !password) {
+      onNotify('Enter this account’s recovery key and Matrix password to verify recovery.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const verifiedKeyId = await client.verifyRecoveryOnSeparateDevice(recoveryVerificationKey, password);
+      setVerifiedRecoveryKeyId(verifiedKeyId);
+      setRecoveryVerificationKey('');
+      setExistingRecoveryKey('');
+      setPassword('');
+      setExportPassphrase('');
+      onRefresh();
+      onNotify(`Recovery was restored on a separate Matrix device and verified for ${security?.userId}.`);
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : 'Could not verify recovery on a separate Matrix device.');
     } finally {
       setBusy(false);
     }
@@ -241,9 +346,11 @@ export function MatrixSecurityPanel({
             <div><span>Private keys in Secret Storage</span><b>{security.privateCrossSigningSecretsStored ? 'Present' : 'Not confirmed'}</b></div>
             <div><span>Private keys cached on this device</span><b>{security.privateCrossSigningKeysCachedLocally ? 'Present' : 'Not confirmed'}</b></div>
             <div><span>Server key backup</span><b>{security.keyBackupVersion ? `Version ${security.keyBackupVersion}` : 'Not found'}</b></div>
+            <div><span>Recovery setup</span><b className={security.recoverySetupVerified || verifiedRecoveryKeyId ? 'security-ok' : 'security-warn'}>{security.recoverySetupVerified || verifiedRecoveryKeyId ? 'Verified on a separate device' : 'Recovery verification required'}</b></div>
             <div><span>This device</span><b>{security.ownDeviceId || 'Unavailable'}</b></div>
           </div>
           <div className="security-bootstrap">
+            <input ref={recoveryImportRef} type="file" accept=".enc,application/json" hidden onChange={(event) => void importEncryptedRecoveryFile(event)} />
             <label className="field-label">Partner account to manage
               <select value={partnerSelection} onChange={(event) => setPartnerSelection(event.target.value)} disabled={!client || busy}>
                 <option value="@partner1:localhost">Partner A · @partner1:localhost</option>
@@ -256,7 +363,9 @@ export function MatrixSecurityPanel({
               <div className="recovery-key">
                 <b>Unlock existing Secret Storage</b>
                 <small>Enter this account’s original recovery key. It is checked against the default key ID before the SDK uses it. No keys are reset or regenerated.</small>
-                <label className="field-label">Existing Matrix recovery key<input type="password" autoComplete="off" spellCheck={false} value={existingRecoveryKey} onChange={(event) => setExistingRecoveryKey(event.target.value)} /></label>
+                <label className="field-label">Existing Matrix recovery key<input type="password" autoComplete="off" spellCheck={false} value={existingRecoveryKey} onChange={(event) => { setExistingRecoveryKey(event.target.value); setRecoveryVerificationKey(event.target.value); }} /></label>
+                <label className="field-label">Encrypted export passphrase<input type="password" autoComplete="current-password" value={exportPassphrase} onChange={(event) => setExportPassphrase(event.target.value)} /></label>
+                <button className="quiet-button full-button" disabled={busy || !exportPassphrase} onClick={() => recoveryImportRef.current?.click()}>Import encrypted recovery file</button>
                 <label className="field-label">Matrix account password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
                 <button className="secondary full-button" disabled={!client || busy || !existingRecoveryKey || !password || partnerSelection !== security.userId} onClick={() => void recoverExistingKeys()}>{busy ? 'Checking existing keys…' : 'Validate key and restore existing identity'}</button>
               </div>
@@ -282,22 +391,43 @@ export function MatrixSecurityPanel({
               <div className="pairing-actions">
                 <button className="quiet-button" onClick={() => setRecoveryKeyVisible((visible) => !visible)}>{recoveryKeyVisible ? 'Hide key' : 'Show key'}</button>
                 <button className="quiet-button" onClick={() => void navigator.clipboard.writeText(recoveryKey).catch(() => onNotify('Could not copy the recovery key. Copy it manually.'))}>Copy recovery key</button>
-                <button className="quiet-button" onClick={exportRecoveryKey}>Export offline file</button>
               </div>
+              <label className="field-label">Encrypted export passphrase<input type="password" autoComplete="new-password" value={exportPassphrase} onChange={(event) => setExportPassphrase(event.target.value)} /></label>
+              <label className="field-label">Confirm export passphrase<input type="password" autoComplete="new-password" value={exportConfirmation} onChange={(event) => setExportConfirmation(event.target.value)} /></label>
+              <button className="quiet-button full-button" disabled={busy || exportPassphrase.length < 12 || exportConfirmation !== exportPassphrase} onClick={() => void exportEncryptedRecoveryKey()}>Download encrypted offline export</button>
               {!recoveryKeyId && (
                 <>
-                  <small>Save this key privately before continuing. Secret Storage has not been changed yet. The export is a plaintext file; move it to an encrypted offline location and remove any temporary copy.</small>
+                  <small>Save this key privately before continuing. Secret Storage has not been changed yet. This export is encrypted; keep its passphrase separately. Export again after setup to include the assigned key ID.</small>
                   <label className="field-label">Type the saved recovery key to confirm
                     <input type="password" autoComplete="off" spellCheck={false} value={recoveryConfirmation} onChange={(event) => setRecoveryConfirmation(event.target.value)} />
                   </label>
                 </>
               )}
-              {(!security.crossSigningReady || !security.secretStorageReady) && (
+              {(!recoveryKeyId || !crossSigningSetup) && (
                 <label className="field-label">Matrix account password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
               )}
-              <button className="primary full-button" disabled={!client || busy || partnerSelection !== security.userId || !password || (!recoveryKeyId && recoveryConfirmation !== recoveryKey)} onClick={() => void confirmNewRecoveryKey()}>{busy ? 'Confirming setup…' : recoveryKeyId ? 'Continue cross-signing setup' : 'Confirm saved key and set up Secret Storage'}</button>
+              {crossSigningSetup && !verifiedRecoveryKeyId && (
+                <>
+                  <small>Re-enter the recovery key. NYMPH will create an isolated, temporary Matrix device, restore the existing keys there, compare the identity, and revoke the test device.</small>
+                  <label className="field-label">Re-enter recovery key for separate-device verification<input type="password" autoComplete="off" spellCheck={false} value={recoveryVerificationKey} onChange={(event) => setRecoveryVerificationKey(event.target.value)} /></label>
+                  <label className="field-label">Matrix account password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+                </>
+              )}
+              <button className="primary full-button" disabled={!client || busy || partnerSelection !== security.userId || !password || (!recoveryKeyId && recoveryConfirmation !== recoveryKey) || (crossSigningSetup && !recoveryVerificationKey)} onClick={() => void confirmNewRecoveryKey()}>{busy ? 'Confirming setup…' : !recoveryKeyId ? 'Confirm saved key and set up Secret Storage' : !crossSigningSetup ? 'Continue cross-signing setup' : 'Verify recovery on a separate device'}</button>
               {!recoveryKeyId && <button className="quiet-button full-button" disabled={busy} onClick={() => void discardPreparedKey()}>Cancel and discard uncommitted key</button>}
+              {verifiedRecoveryKeyId && <small className="security-ok">Recovery verified for Secret Storage key ID {verifiedRecoveryKeyId}. The temporary verification device was revoked.</small>}
               <small>Keep this key offline. Anyone who obtains it may restore encrypted account secrets. Never share it in chat or screenshots.</small>
+            </div>
+          )}
+          {security.defaultSecretStorageKeyId && security.crossSigningReady && !security.recoverySetupVerified && !verifiedRecoveryKeyId && !recoveryKey && (
+            <div className="recovery-key">
+              <b>Verify recovery on a separate device</b>
+              <small>Enter the original recovery key. A temporary Matrix device will independently unlock Secret Storage, restore the same cross-signing identity, and then be revoked. Setup is not marked verified until this succeeds.</small>
+              <label className="field-label">Recovery key<input type="password" autoComplete="off" spellCheck={false} value={recoveryVerificationKey} onChange={(event) => { setRecoveryVerificationKey(event.target.value); setExistingRecoveryKey(event.target.value); }} /></label>
+              <label className="field-label">Encrypted export passphrase<input type="password" autoComplete="current-password" value={exportPassphrase} onChange={(event) => setExportPassphrase(event.target.value)} /></label>
+              <button className="quiet-button full-button" disabled={busy || !exportPassphrase} onClick={() => recoveryImportRef.current?.click()}>Import encrypted recovery file</button>
+              <label className="field-label">Matrix account password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+              <button className="secondary full-button" disabled={!client || busy || !recoveryVerificationKey || !password || partnerSelection !== security.userId} onClick={() => void verifyExistingRecoveryKey()}>{busy ? 'Verifying recovery…' : 'Restore and verify existing recovery key'}</button>
             </div>
           )}
           {security.partnerDevices.length > 0 && (

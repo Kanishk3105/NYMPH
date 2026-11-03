@@ -23,6 +23,7 @@ type HarnessState = {
   redeemInvitation(invite: unknown, deviceId?: string): Promise<HarnessSession>;
   replayInvitation(invite: unknown): Promise<number>;
   unlockExistingSecretStorage(recoveryKey: string, password: string): Promise<string>;
+  verifyRecoveryOnSeparateDevice(recoveryKey: string, password: string): Promise<string>;
   prepareSecretStorageSetup(): Promise<string>;
   commitSecretStorageSetup(confirmation: string): Promise<string>;
   discardPendingSecretStorageKey(): void;
@@ -158,6 +159,10 @@ const state: HarnessState = {
   async unlockExistingSecretStorage(recoveryKey, password) {
     if (!this.client) throw new Error('Connect a Matrix client before unlocking Secret Storage.');
     return this.client.unlockExistingSecretStorage(recoveryKey, password);
+  },
+  async verifyRecoveryOnSeparateDevice(recoveryKey, password) {
+    if (!this.client) throw new Error('Connect a Matrix client before verifying recovery.');
+    return this.client.verifyRecoveryOnSeparateDevice(recoveryKey, password);
   },
   async prepareSecretStorageSetup() {
     if (!this.client) throw new Error('Connect a Matrix client before preparing Secret Storage.');

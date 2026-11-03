@@ -88,6 +88,7 @@ export interface MatrixSecurityState {
   privateCrossSigningSecretsStored: boolean;
   privateCrossSigningKeysCachedLocally: boolean;
   keyBackupVersion: string | null;
+  recoverySetupVerified: boolean;
   partnerDevices: MatrixDeviceSummary[];
   ownDevices: MatrixDeviceSummary[];
 }
@@ -102,6 +103,7 @@ export interface MatrixMessagingClient {
   unlockExistingSecretStorage(recoveryKey: string, password: string): Promise<string>;
   prepareSecretStorageSetup(): Promise<string>;
   commitSecretStorageSetup(confirmation: string): Promise<string>;
+  verifyRecoveryOnSeparateDevice(recoveryKey: string, password: string): Promise<string>;
   discardPendingSecretStorageKey(): void;
   bootstrapSecurity(password: string): Promise<void>;
   requestPartnerVerification(deviceId: string): Promise<void>;
@@ -124,6 +126,7 @@ type VerificationListener = (verification: MatrixVerification | null) => void;
 type SecurityListener = (state: MatrixSecurityState) => void;
 type ReadListener = (eventId: string) => void;
 const ENVELOPE_PREFIX = 'nymph.v1:';
+const RECOVERY_VERIFICATION_EVENT = 'org.nymph.security.recovery_verification';
 
 function isMode(value: unknown): value is NymphMode {
   return value === 'romantic' || value === 'flirty' || value === 'spicy' || value === 'kinky';
@@ -198,6 +201,7 @@ function decodeEnvelope(event: MatrixEvent): ReceivedNymphEvent | undefined {
 function waitForInitialSync(
   client: MatrixClient,
   syncEvent: typeof import('matrix-js-sdk').ClientEvent.Sync,
+  initialSyncLimit = 50,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const timeout = window.setTimeout(() => reject(new Error('Timed out waiting for the homeserver sync.')), 30_000);
@@ -213,7 +217,7 @@ function waitForInitialSync(
       }
     };
     client.on(syncEvent, onSync);
-    void client.startClient({ initialSyncLimit: 50 }).catch((error: unknown) => {
+    void client.startClient({ initialSyncLimit }).catch((error: unknown) => {
       window.clearTimeout(timeout);
       client.removeListener(syncEvent, onSync);
       reject(error);
@@ -393,6 +397,20 @@ export async function connectMatrix(
       cryptoApi.userHasCrossSigningKeys(credentials.userId, true),
       cryptoApi.getKeyBackupInfo(),
     ]);
+    const recoveryVerification = client.getAccountData(RECOVERY_VERIFICATION_EVENT)?.getContent();
+    const publishedSigningKeys = await cryptoApi.getUserCrossSigningKeys(credentials.userId);
+    const publishedSigningKeyIds = {
+      master_key: publishedSigningKeys?.[CrossSigningKey.Master]
+        ? Object.keys(publishedSigningKeys[CrossSigningKey.Master].keys)[0]
+        : undefined,
+      self_signing_key: publishedSigningKeys?.[CrossSigningKey.SelfSigning]
+        ? Object.keys(publishedSigningKeys[CrossSigningKey.SelfSigning].keys)[0]
+        : undefined,
+      user_signing_key: publishedSigningKeys?.[CrossSigningKey.UserSigning]
+        ? Object.keys(publishedSigningKeys[CrossSigningKey.UserSigning].keys)[0]
+        : undefined,
+    };
+    const verifiedSigningIds = recoveryVerification?.cross_signing_key_ids;
     const state: MatrixSecurityState = {
       userId: credentials.userId,
       ownDeviceId: client.getDeviceId() ?? '',
@@ -405,6 +423,12 @@ export async function connectMatrix(
       privateCrossSigningSecretsStored: crossSigningStatus.privateKeysInSecretStorage,
       privateCrossSigningKeysCachedLocally: Object.values(crossSigningStatus.privateKeysCachedLocally).every(Boolean),
       keyBackupVersion: keyBackupInfo?.version ?? null,
+      recoverySetupVerified:
+        recoveryVerification?.key_id === secretStorageStatus.defaultKeyId &&
+        typeof recoveryVerification?.verified_at === 'number' &&
+        verifiedSigningIds?.master_key === publishedSigningKeyIds.master_key &&
+        verifiedSigningIds?.self_signing_key === publishedSigningKeyIds.self_signing_key &&
+        verifiedSigningIds?.user_signing_key === publishedSigningKeyIds.user_signing_key,
       partnerDevices,
       ownDevices,
     };
@@ -682,6 +706,191 @@ export async function connectMatrix(
         if (pendingSecretStorageKey === generated) pendingSecretStorageKey = undefined;
         await refreshSecurity();
         return keyId;
+      },
+      async verifyRecoveryOnSeparateDevice(recoveryKey, password) {
+        if (!password) throw new Error('Enter this Matrix account password to verify recovery on a separate device.');
+        const keyId = await client.secretStorage.getDefaultKeyId();
+        if (!keyId) throw new Error(`No default Secret Storage key is configured for ${credentials.userId}.`);
+        const keyInfo = await client.secretStorage.getKey(keyId);
+        if (!keyInfo || keyInfo[1].algorithm !== 'm.secret_storage.v1.aes-hmac-sha2') {
+          throw new Error(`The default Secret Storage key for ${credentials.userId} is unavailable or unsupported.`);
+        }
+
+        let recoveryKeyBytes: Uint8Array<ArrayBuffer>;
+        try {
+          recoveryKeyBytes = decodeRecoveryKey(recoveryKey);
+        } catch {
+          throw new Error('The recovery key is invalid.');
+        }
+        try {
+          if (!(await client.secretStorage.checkKey(recoveryKeyBytes, keyInfo[1]))) {
+            throw new Error(`The recovery key does not match ${credentials.userId}'s default Secret Storage key.`);
+          }
+
+          const signingTypes = [
+            CrossSigningKey.Master,
+            CrossSigningKey.SelfSigning,
+            CrossSigningKey.UserSigning,
+          ];
+          const publishedKeys = await cryptoApi.getUserCrossSigningKeys(credentials.userId);
+          const masterKeyId = publishedKeys?.[CrossSigningKey.Master]
+            ? Object.keys(publishedKeys[CrossSigningKey.Master].keys)[0]
+            : undefined;
+          const selfSigningKeyId = publishedKeys?.[CrossSigningKey.SelfSigning]
+            ? Object.keys(publishedKeys[CrossSigningKey.SelfSigning].keys)[0]
+            : undefined;
+          const userSigningKeyId = publishedKeys?.[CrossSigningKey.UserSigning]
+            ? Object.keys(publishedKeys[CrossSigningKey.UserSigning].keys)[0]
+            : undefined;
+          if (!masterKeyId || !selfSigningKeyId || !userSigningKeyId) {
+            throw new Error(`The published cross-signing identity is incomplete for ${credentials.userId}.`);
+          }
+          const publishedKeyIds = [masterKeyId, selfSigningKeyId, userSigningKeyId];
+          const currentKeyIds = await Promise.all(
+            signingTypes.map((type) => cryptoApi.getCrossSigningKeyId(type)),
+          );
+          const storedSecrets = await Promise.all([
+            client.secretStorage.get('m.cross_signing.master'),
+            client.secretStorage.get('m.cross_signing.self_signing'),
+            client.secretStorage.get('m.cross_signing.user_signing'),
+          ]);
+          if (
+            currentKeyIds.some((id, index) => !id || id !== publishedKeyIds[index]) ||
+            storedSecrets.some((secret) => !secret) ||
+            !(await cryptoApi.isCrossSigningReady())
+          ) {
+            throw new Error(
+              `Secret Storage and the published cross-signing identity are not ready for ${credentials.userId}.`,
+            );
+          }
+
+          const verificationKey = new Uint8Array(recoveryKeyBytes);
+          let temporaryDeviceId: string | undefined;
+          let verificationClient: MatrixClient | undefined;
+          let loginClient: MatrixClient | undefined;
+          let verificationFailure: unknown;
+          let cleanupFailed = false;
+          try {
+            loginClient = sdk.createClient({ baseUrl: homeserver.origin });
+            const session = await loginClient.login('m.login.password', {
+              identifier: { type: 'm.id.user', user: credentials.userId },
+              password,
+              initial_device_display_name: 'NYMPH recovery verification',
+            });
+            if (session.user_id !== credentials.userId || !session.device_id) {
+              throw new Error('The recovery verification login did not create an account device.');
+            }
+            temporaryDeviceId = session.device_id;
+            if (!session.access_token || session.device_id === client.getDeviceId()) {
+              throw new Error('The recovery verification login did not create an independent Matrix device.');
+            }
+            verificationClient = sdk.createClient({
+              baseUrl: homeserver.origin,
+              accessToken: session.access_token,
+              userId: session.user_id,
+              deviceId: session.device_id,
+              cryptoCallbacks: {
+                getSecretStorageKey: async ({ keys }) => {
+                  if (!Object.hasOwn(keys, keyId)) return null;
+                  if (keys[keyId].algorithm !== 'm.secret_storage.v1.aes-hmac-sha2') {
+                    throw new Error('The recovery verification client encountered an unsupported key algorithm.');
+                  }
+                  return [keyId, new Uint8Array(verificationKey)];
+                },
+              },
+            });
+            await verificationClient.initRustCrypto({ useIndexedDB: false });
+            await waitForInitialSync(verificationClient, sdk.ClientEvent.Sync, 0);
+
+            const verificationCrypto = verificationClient.getCrypto();
+            if (!verificationCrypto) throw new Error('The separate recovery client could not initialize Matrix encryption.');
+            const verificationKeyId = await verificationClient.secretStorage.getDefaultKeyId();
+            const verificationKeyInfo = verificationKeyId
+              ? await verificationClient.secretStorage.getKey(verificationKeyId)
+              : null;
+            if (
+              verificationKeyId !== keyId ||
+              !verificationKeyInfo ||
+              verificationKeyInfo[1].algorithm !== 'm.secret_storage.v1.aes-hmac-sha2' ||
+              !(await verificationClient.secretStorage.checkKey(verificationKey, verificationKeyInfo[1]))
+            ) {
+              throw new Error('The separate recovery client could not validate this account’s Secret Storage key.');
+            }
+
+            const restoredSecrets = await Promise.all([
+              verificationClient.secretStorage.get('m.cross_signing.master'),
+              verificationClient.secretStorage.get('m.cross_signing.self_signing'),
+              verificationClient.secretStorage.get('m.cross_signing.user_signing'),
+            ]);
+            if (restoredSecrets.some((secret) => !secret)) {
+              throw new Error('The separate recovery client could not decrypt all cross-signing secrets.');
+            }
+            await verificationClient.downloadKeysForUsers([credentials.userId]);
+            const separatePublishedKeys = await verificationCrypto.getUserCrossSigningKeys(credentials.userId);
+            const separatePublishedIds = signingTypes.map((type) => {
+              const key = separatePublishedKeys?.[type];
+              return key ? Object.keys(key.keys)[0] : undefined;
+            });
+            if (
+              separatePublishedIds.some((id, index) => !id || id !== publishedKeyIds[index]) ||
+              !(await verificationCrypto.userHasCrossSigningKeys(credentials.userId, true))
+            ) {
+              throw new Error('The separate recovery client did not find the existing published cross-signing identity.');
+            }
+
+            await verificationCrypto.bootstrapCrossSigning({
+              authUploadDeviceSigningKeys: async () => {
+                throw new Error('Recovery verification refused to upload replacement cross-signing keys.');
+              },
+            });
+            const restoredKeyIds = await Promise.all(
+              signingTypes.map((type) => verificationCrypto.getCrossSigningKeyId(type)),
+            );
+            if (
+              !(await verificationCrypto.isCrossSigningReady()) ||
+              restoredKeyIds.some((id, index) => !id || id !== publishedKeyIds[index])
+            ) {
+              throw new Error('The separate recovery client did not restore the existing cross-signing identity.');
+            }
+          } catch (error) {
+            verificationFailure = error;
+          } finally {
+            verificationClient?.stopClient();
+            loginClient?.stopClient();
+            verificationKey.fill(0);
+            if (temporaryDeviceId) {
+              try {
+                await client.deleteDevice(temporaryDeviceId, {
+                  type: 'm.login.password',
+                  user: credentials.userId,
+                  password,
+                });
+              } catch {
+                cleanupFailed = true;
+              }
+            }
+          }
+
+          if (cleanupFailed) {
+            throw new Error(
+              'The recovery test device could not be revoked. Remove the NYMPH recovery verification device from account settings before continuing.',
+            );
+          }
+          if (verificationFailure) throw verificationFailure;
+          await client.setAccountData(RECOVERY_VERIFICATION_EVENT, {
+            key_id: keyId,
+            verified_at: Date.now(),
+            cross_signing_key_ids: {
+              master_key: masterKeyId,
+              self_signing_key: selfSigningKeyId,
+              user_signing_key: userSigningKeyId,
+            },
+          });
+          await refreshSecurity();
+          return keyId;
+        } finally {
+          recoveryKeyBytes.fill(0);
+        }
       },
       discardPendingSecretStorageKey() {
         pendingSecretStorageKey?.privateKey.fill(0);
