@@ -1,0 +1,20 @@
+{$DEV_LAN_ADDRESS}:8443 {
+	tls internal
+
+	@blocked path /_synapse/admin/* /_matrix/client/v3/createRoom /_matrix/client/r0/createRoom
+	respond @blocked 404
+
+	handle /_matrix/* {
+		reverse_proxy synapse:8008
+	}
+
+	handle /_synapse/client/nymph/pairing/* {
+		reverse_proxy synapse:8008
+	}
+
+	handle {
+		root * /srv/nymph
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -1,0 +1,42 @@
+{
+  "name": "nymph-private-room",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "build:android:debug": "tsc -b && vite build --mode android",
+    "android:sync": "npm run build:android:debug && cap sync android",
+    "android:debug": "npm run android:sync && cd android && gradlew.bat assembleDebug",
+    "android:release": "node scripts/validate-production-env.mjs && npm run build && npx cap sync android && cd android && gradlew.bat assembleRelease",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node --experimental-strip-types --test src/matrix/MessagingClient.test.ts src/matrix/homeserver.test.ts",
+    "test:matrix:live": "playwright test --config=playwright.matrix.config.ts"
+  },
+  "dependencies": {
+    "@aparajita/capacitor-biometric-auth": "^10.0.0",
+    "@aparajita/capacitor-secure-storage": "^8.0.1",
+    "@capacitor/android": "^8.6.0",
+    "@capacitor/app": "^8.1.2",
+    "@capacitor/core": "^8.6.0",
+    "@capacitor/splash-screen": "^8.0.2",
+    "@capacitor/status-bar": "^8.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "@zxing/browser": "^0.2.1",
+    "matrix-js-sdk": "^45.0.0",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.7"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.6.0",
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^26.6.6",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0"
+  }
+}

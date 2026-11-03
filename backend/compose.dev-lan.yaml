@@ -1,0 +1,15 @@
+services:
+  lan-proxy:
+    image: ${CADDY_IMAGE:-caddy:2.10.2-alpine}
+    profiles: ["lan"]
+    restart: unless-stopped
+    environment:
+      DEV_LAN_ADDRESS: ${DEV_LAN_ADDRESS:?Run configure-dev-lan.ps1 to set DEV_LAN_ADDRESS}
+    depends_on:
+      - synapse
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile:ro
+      - ./dev-caddy-data:/data
+      - ../dist:/srv/nymph:ro
+    ports:
+      - "${DEV_LAN_ADDRESS}:8443:8443"

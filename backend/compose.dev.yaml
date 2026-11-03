@@ -1,0 +1,43 @@
+services:
+  synapse:
+    image: ${SYNAPSE_IMAGE:-matrixdotorg/synapse:v1.164.2}
+    restart: unless-stopped
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME in .env}
+      SYNAPSE_REPORT_STATS: "no"
+      PARTNER_A_USER_ID: ${PARTNER_A_USER_ID:?Set PARTNER_A_USER_ID in .env}
+      PARTNER_B_USER_ID: ${PARTNER_B_USER_ID:?Set PARTNER_B_USER_ID in .env}
+      DEV_APP_ORIGINS: ${DEV_APP_ORIGINS:-http://localhost:5173,https://localhost}
+      DEV_HOMESERVER_URL: ${DEV_HOMESERVER_URL:-http://localhost:8008}
+      PYTHONPATH: /modules
+    secrets:
+      - dev_registration_shared_secret
+      - partner1_password
+      - partner2_password
+    volumes:
+      - ./dev-data:/data
+      - ./dev-modules:/modules:ro
+      - ./tests:/tests:ro
+      - ./configure_dev_synapse.py:/opt/nymph/configure_dev_synapse.py:ro
+    ports:
+      - "127.0.0.1:8008:8008"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["python /opt/nymph/configure_dev_synapse.py && exec /start.py run"]
+
+  synapse-generate:
+    image: ${SYNAPSE_IMAGE:-matrixdotorg/synapse:v1.164.2}
+    profiles: ["init"]
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME in .env}
+      SYNAPSE_REPORT_STATS: "no"
+    volumes:
+      - ./dev-data:/data
+    command: generate
+
+secrets:
+  dev_registration_shared_secret:
+    file: ./dev-secrets/registration_shared_secret
+  partner1_password:
+    file: ./dev-secrets/partner1_password
+  partner2_password:
+    file: ./dev-secrets/partner2_password

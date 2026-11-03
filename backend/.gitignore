@@ -1,0 +1,7 @@
+.env
+.env.dev
+secrets/
+dev-secrets/
+dev-data/
+dev-caddy-data/
+dev-caddy-root.crt

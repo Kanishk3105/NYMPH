@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.10-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_DB: synapse
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - private
+    security_opt:
+      - no-new-privileges:true
+
+  synapse-generate:
+    image: ${SYNAPSE_IMAGE:-matrixdotorg/synapse:v1.164.2}
+    profiles: ["init"]
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME in .env}
+      SYNAPSE_REPORT_STATS: "no"
+    volumes:
+      - synapse_data:/data
+    command: generate
+    networks:
+      - private
+
+  synapse:
+    image: ${SYNAPSE_IMAGE:-matrixdotorg/synapse:v1.164.2}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME in .env}
+      SYNAPSE_REPORT_STATS: "no"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: synapse
+      POSTGRES_DB: synapse
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      REGISTRATION_SHARED_SECRET_FILE: /run/secrets/registration_shared_secret
+    secrets:
+      - postgres_password
+      - registration_shared_secret
+    volumes:
+      - synapse_data:/data
+      - ./configure_synapse.py:/opt/nymph/configure_synapse.py:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["python /opt/nymph/configure_synapse.py && exec /start.py run"]
+    expose:
+      - "8008"
+    networks:
+      - private
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2.10.2-alpine}
+    restart: unless-stopped
+    depends_on:
+      - synapse
+    environment:
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - private
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  private:
+
+volumes:
+  postgres_data:
+  synapse_data:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  registration_shared_secret:
+    file: ./secrets/registration_shared_secret
