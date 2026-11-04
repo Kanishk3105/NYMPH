@@ -408,7 +408,7 @@ async function call<T>(
       if (typeof operation !== 'function') {
         throw new Error('The requested isolated Matrix test operation is unavailable.');
       }
-      return operation(...parameters);
+      return operation.apply(harnessValue, parameters);
     },
     { methodName: method, parameters: args },
   ) as Promise<T>;
