@@ -264,7 +264,7 @@ const state: HarnessState = {
     const response = await fetch(
       `${apiBase}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/joined_members`,
       {
-        headers: { Authorization: `****** },
+        headers: { Authorization: `Bearer ${session.accessToken}` },
         cache: 'no-store',
       },
     );
