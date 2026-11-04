@@ -1,17 +1,20 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
 import { BiometricAuth } from '@aparajita/capacitor-biometric-auth';
 import { StatusBar, Style } from '@capacitor/status-bar';
-import { connectMatrix, type MatrixConnection, type MatrixMessagingClient, type MatrixSecurityState, type MatrixVerification, type NymphEnvelope } from './matrix/MessagingClient';
-import { PairingPanel } from './matrix/PairingPanel';
-import { MatrixSecurityPanel } from './matrix/MatrixSecurityPanel';
+import type { EncryptedFile } from 'matrix-js-sdk/lib/@types/media';
+import type { MatrixConnection, MatrixMessagingClient, MatrixSecurityState, MatrixVerification, NymphEnvelope, ReceivedNymphEvent } from './matrix/MessagingClient';
 import { getDefaultHomeserver } from './matrix/homeserver';
 import { PARTNER_DEVICE_IDS, PARTNER_IDENTITIES } from './matrix/partner-identity';
 import { DEMO_STATE_STORAGE_KEY, getMatrixDeviceStorageKey, getNymphStateStorageKey } from './matrix/state-storage';
 import { getMatrixCryptoStorageKey, loadMatrixSession, removeMatrixSession, saveMatrixSession } from './native/secureSession';
+import { encodeStickerFile, getStickerImportError, getStickerPackNameError, normalizeStickerPackName } from './sticker-library';
 import './styles.css';
+
+const PairingPanel = lazy(() => import('./matrix/PairingPanel').then(({ PairingPanel: component }) => ({ default: component })));
+const MatrixSecurityPanel = lazy(() => import('./matrix/MatrixSecurityPanel').then(({ MatrixSecurityPanel: component }) => ({ default: component })));
 
 type Mode = 'romantic' | 'flirty' | 'spicy' | 'kinky';
 type Panel = 'stickers' | 'mood' | 'profile' | 'settings' | 'gallery' | 'matrix' | null;
@@ -33,8 +36,12 @@ type Message = {
   delivery?: 'sending' | 'sent' | 'read' | 'failed';
   remoteEventId?: string;
   reactionTo?: string;
+  encryptedAttachment?: EncryptedFile;
+  mediaError?: string;
 };
 type Profile = { displayName: string; username: string; bio: string; avatar: string };
+type CustomSticker = { id: string; name: string; dataUrl: string; type?: string };
+type CustomStickerPack = { id: string; name: string; adult: boolean; stickers: CustomSticker[] };
 type LocalState = {
   messages: Message[];
   profile: Profile;
@@ -45,6 +52,9 @@ type LocalState = {
   pinHash?: string;
   favourites: string[];
   recent: string[];
+  favoriteCustomStickerIds: string[];
+  recentCustomStickerIds: string[];
+  customStickerPacks: CustomStickerPack[];
 };
 
 const DEFAULT_HOMESERVER = getDefaultHomeserver({
@@ -89,6 +99,9 @@ const defaultState: LocalState = {
   roomReady: false,
   favourites: [],
   recent: [],
+  favoriteCustomStickerIds: [],
+  recentCustomStickerIds: [],
+  customStickerPacks: [],
 };
 
 function readState(
@@ -98,7 +111,14 @@ function readState(
   try {
     const stored = localStorage.getItem(storageKey);
     if (!stored) return useDemoMessages ? defaultState : { ...defaultState, messages: [] };
-    return { ...defaultState, ...JSON.parse(stored) as Partial<LocalState> };
+    const parsed = JSON.parse(stored) as Partial<LocalState>;
+    return {
+      ...defaultState,
+      ...parsed,
+      favoriteCustomStickerIds: Array.isArray(parsed.favoriteCustomStickerIds) ? parsed.favoriteCustomStickerIds : [],
+      recentCustomStickerIds: Array.isArray(parsed.recentCustomStickerIds) ? parsed.recentCustomStickerIds : [],
+      customStickerPacks: Array.isArray(parsed.customStickerPacks) ? parsed.customStickerPacks : [],
+    };
   } catch (error) {
     console.error('Could not restore local NYMPH demo state.', error);
     return defaultState;
@@ -151,12 +171,12 @@ function App() {
   const [selectedPack, setSelectedPack] = useState('Love notes');
   const [packTab, setPackTab] = useState<'everyday' | 'adult'>('everyday');
   const [search, setSearch] = useState('');
+  const [customPackName, setCustomPackName] = useState('My stickers');
   const [showGif, setShowGif] = useState(false);
   const [viewOnceSeconds, setViewOnceSeconds] = useState('Off');
-  const [preview, setPreview] = useState<{ url: string; name: string; type: string } | null>(null);
+  const [preview, setPreview] = useState<{ url: string; name: string; type: string; file?: File } | null>(null);
   const [moodCard, setMoodCard] = useState<{ label: string; emoji: string } | null>(null);
   const [stickerImportRequested, setStickerImportRequested] = useState(false);
-  const [customStickers, setCustomStickers] = useState<{ url: string; name: string }[]>([]);
   const [galleryFilter, setGalleryFilter] = useState('All');
   const [customMood, setCustomMood] = useState('');
   const [profileDraft, setProfileDraft] = useState(data.profile);
@@ -169,6 +189,8 @@ function App() {
   const matrixClient = useRef<MatrixMessagingClient | null>(null);
   const matrixConnecting = useRef(false);
   const typingTimer = useRef<number | undefined>(undefined);
+  const pendingMatrixMedia = useRef<ReceivedNymphEvent[]>([]);
+  const downloadingMatrixMedia = useRef(new Set<string>());
 
   useEffect(() => {
     try {
@@ -244,14 +266,34 @@ function App() {
 
   const activeMode = modes.find((item) => item.id === mode)!;
   const visibleMessages = useMemo(() => data.messages.filter((message) => message.mode === mode && (!message.expiresAt || message.expiresAt > Date.now()) && (!matrixClient.current || message.transport === 'matrix')), [data.messages, mode, matrixStatus]);
-  const packNames = [...(packTab === 'everyday' ? everydayPacks : adultPacks), 'Favorites', 'Recent'];
+  const visibleCustomPacks = data.customStickerPacks.filter((pack) => pack.adult === (packTab === 'adult'));
+  const packNames = [
+    ...(packTab === 'everyday' ? everydayPacks : adultPacks),
+    ...visibleCustomPacks.map((pack) => `custom:${pack.id}`),
+    'Favorites',
+    'Recent',
+  ];
+  const selectedCustomPack = data.customStickerPacks.find((pack) => selectedPack === `custom:${pack.id}`);
+  const collectionCustomStickers = visibleCustomPacks.flatMap((pack) => pack.stickers);
+  const customStickerSource = selectedPack === 'Favorites'
+    ? collectionCustomStickers.filter((sticker) => data.favoriteCustomStickerIds.includes(sticker.id))
+    : selectedPack === 'Recent'
+      ? data.recentCustomStickerIds
+        .map((id) => collectionCustomStickers.find((sticker) => sticker.id === id))
+        .filter((sticker): sticker is CustomSticker => Boolean(sticker))
+      : selectedCustomPack?.stickers ?? [];
   const adultStickerSet = new Set(packData['After dark']);
   const stickerSource = selectedPack === 'Favorites'
     ? data.favourites.filter((item) => packTab === 'adult' ? adultStickerSet.has(item) : !adultStickerSet.has(item))
     : selectedPack === 'Recent'
       ? data.recent.filter((item) => packTab === 'adult' ? adultStickerSet.has(item) : !adultStickerSet.has(item))
-      : packData[selectedPack] ?? [];
+      : selectedCustomPack ? [] : packData[selectedPack] ?? [];
   const stickers = stickerSource.filter((item) => item.toLowerCase().includes(search.toLowerCase()));
+  const customPackStickers = customStickerSource.filter((sticker) => sticker.name.toLowerCase().includes(search.toLowerCase()));
+  const importedGifs = data.customStickerPacks
+    .filter((pack) => pack.adult === (packTab === 'adult'))
+    .flatMap((pack) => pack.stickers.map((sticker) => ({ ...sticker, packName: pack.name })))
+    .filter((sticker) => (sticker.type ?? sticker.dataUrl.slice(5, sticker.dataUrl.indexOf(';'))) === 'image/gif');
   const galleryMessages = data.messages.filter((item) => item.kind === 'media' && item.image && !item.mediaType?.startsWith('audio/') && (
     galleryFilter === 'All' ||
     (galleryFilter === 'Photos' && item.mediaType?.startsWith('image/')) ||
@@ -309,6 +351,70 @@ function App() {
       updateMessages((items) => items.map((item) => item.id === message.id ? { ...item, transport: 'matrix', delivery: 'failed' } : item));
       notify('Encrypted send failed. This message was not delivered.');
     }
+  }
+  function hydrateMatrixMedia(event: ReceivedNymphEvent) {
+      const client = matrixClient.current;
+      if (!client || !event.attachment || !event.mediaType || downloadingMatrixMedia.current.has(event.id)) return;
+      downloadingMatrixMedia.current.add(event.id);
+      void client.downloadAttachment(event.attachment, event.mediaType).then((blob) => {
+        const objectUrl = URL.createObjectURL(blob);
+        updateMessages((items) => items.map((item) =>
+          item.id === event.id ? { ...item, image: objectUrl, mediaError: undefined } : item,
+        ));
+      }).catch(() => {
+        updateMessages((items) => items.map((item) =>
+          item.id === event.id ? { ...item, mediaError: 'Encrypted media could not be downloaded or verified.' } : item,
+        ));
+      }).finally(() => {
+        downloadingMatrixMedia.current.delete(event.id);
+      });
+    }
+  function sendEncryptedAttachment(
+      file: File,
+      kind: 'media' | 'sticker',
+      text: string,
+      contentMode: Mode,
+      image?: string,
+    ): boolean {
+      const sender = matrixClient.current;
+      if (!sender) return false;
+      const messageId = makeId();
+      const sentAt = Date.now();
+      const mediaType = file.type || 'application/octet-stream';
+      const outgoing: Message = {
+        id: messageId,
+        mode: contentMode,
+        sender: 'me',
+        kind,
+        text,
+        time: sentAt,
+        mediaType,
+        image,
+        transport: 'matrix',
+        delivery: 'sending',
+      };
+      updateMessages((items) => [...items, outgoing]);
+      const envelope: NymphEnvelope = {
+        version: 1,
+        id: messageId,
+        mode: contentMode,
+        kind,
+        text,
+        sentAt,
+        mediaType,
+        mediaName: file.name,
+      };
+      void sender.sendAttachment(file, envelope).then(({ eventId, attachment }) => {
+        updateMessages((items) => items.map((item) =>
+          item.id === messageId ? { ...item, delivery: 'sent', remoteEventId: eventId, encryptedAttachment: attachment } : item,
+        ));
+      }).catch(() => {
+        updateMessages((items) => items.map((item) =>
+          item.id === messageId ? { ...item, delivery: 'failed', mediaError: 'Encrypted media was not sent.' } : item,
+        ));
+        notify('Encrypted media was not sent. Verify the partner device and try again.');
+      });
+      return true;
   }
   async function connectPrivateRoom(connection: MatrixConnection = matrixConnection, internalHandoff = false) {
     if (matrixConnecting.current && !internalHandoff) return;
@@ -429,6 +535,7 @@ function App() {
       const accountScope = getNymphStateStorageKey(connection.userId);
       setStateScope(accountScope);
       setData(readState(accountScope, false));
+      const { connectMatrix } = await import('./matrix/MessagingClient');
       const connected = await connectMatrix(
         persistentConnection,
         (event) => {
@@ -450,8 +557,14 @@ function App() {
           transport: 'matrix',
           delivery: 'sent',
           remoteEventId: event.eventId,
+          encryptedAttachment: event.attachment,
+          mediaType: event.mediaType,
         };
         setData((current) => current.messages.some((item) => item.id === received.id) ? current : { ...current, messages: [...current.messages, received] });
+        if (event.attachment) {
+          if (matrixClient.current) hydrateMatrixMedia(event);
+          else pendingMatrixMedia.current.push(event);
+        }
         if (received.sender === 'partner') void matrixClient.current?.markRead(event.eventId);
       },
         (status) => setMatrixSync(String(status)),
@@ -471,6 +584,7 @@ function App() {
         }
       }
       matrixClient.current = connected;
+      for (const event of pendingMatrixMedia.current.splice(0)) hydrateMatrixMedia(event);
       setMatrixConnection({ ...connection, deviceId });
       setMatrixStatus(`Encrypted · ${connected.userId}`);
       setPanel(null);
@@ -492,12 +606,19 @@ function App() {
     setReply(null);
   }
   function reactToMessage(message: Message) {
-    updateMessages((items) => items.map((item) => item.id === message.id ? { ...item, reaction: item.reaction ? undefined : '❤️' } : item));
-    if (matrixClient.current && message.remoteEventId) {
+    if (matrixClient.current) {
+      if (!message.remoteEventId) {
+        notify('This message does not have a Matrix event ID to react to.');
+        return;
+      }
+      if (message.reaction === '❤️') {
+        notify('A heart reaction is already on this message.');
+        return;
+      }
       appendOutgoing({ mode: message.mode, kind: 'reaction', text: '❤️', reactionTo: message.remoteEventId });
-    } else if (matrixClient.current) {
-      notify('This message does not have a Matrix event ID to react to.');
+      return;
     }
+    updateMessages((items) => items.map((item) => item.id === message.id ? { ...item, reaction: item.reaction ? undefined : '❤️' } : item));
   }
   function changeMode(next: Mode) {
     if (mode === 'kinky' && next !== 'kinky') {
@@ -523,6 +644,35 @@ function App() {
       favourites: current.favourites.includes(sticker) ? current.favourites.filter((item) => item !== sticker) : [...current.favourites, sticker],
     }));
   }
+  async function useCustomSticker(sticker: CustomSticker) {
+    if (matrixClient.current) {
+      try {
+        const response = await fetch(sticker.dataUrl);
+        if (!response.ok) throw new Error('Could not read the imported sticker.');
+        const file = new File([await response.blob()], `${sticker.name}.sticker`, { type: sticker.type ?? 'image/png' });
+        if (!sendEncryptedAttachment(file, 'sticker', sticker.name, mode)) return;
+      } catch {
+        notify('This custom sticker could not be prepared for encrypted sending.');
+        return;
+      }
+    } else {
+      addMessage({ mode, sender: 'me', kind: 'sticker', text: sticker.name, image: sticker.dataUrl });
+      notify('Sticker saved locally only — no encrypted room is connected.');
+    }
+    setData((current) => ({
+      ...current,
+      recentCustomStickerIds: [sticker.id, ...current.recentCustomStickerIds.filter((id) => id !== sticker.id)].slice(0, 12),
+    }));
+    setPanel(null);
+  }
+  function toggleCustomStickerFavourite(stickerId: string) {
+    setData((current) => ({
+      ...current,
+      favoriteCustomStickerIds: current.favoriteCustomStickerIds.includes(stickerId)
+        ? current.favoriteCustomStickerIds.filter((id) => id !== stickerId)
+        : [...current.favoriteCustomStickerIds, stickerId],
+    }));
+  }
   function onFile(file?: File) {
     if (!file) {
       setStickerImportRequested(false);
@@ -530,12 +680,36 @@ function App() {
     }
     if (stickerImportRequested) {
       setStickerImportRequested(false);
-      if (!file.type.startsWith('image/')) {
-        notify('Sticker imports must be an image or GIF.');
+      const packName = normalizeStickerPackName(customPackName);
+      const storedCharacters = data.customStickerPacks.reduce(
+        (total, pack) => total + pack.stickers.reduce((packTotal, sticker) => packTotal + sticker.dataUrl.length, 0),
+        0,
+      );
+      const importError = getStickerImportError(file, storedCharacters, packName);
+      if (importError) {
+        notify(importError);
         return;
       }
-      setCustomStickers((items) => [...items, { url: URL.createObjectURL(file), name: file.name }]);
-      notify('Sticker imported for this session on this device.');
+      void encodeStickerFile(file).then((dataUrl) => {
+        const existingPack = data.customStickerPacks.find(
+          (pack) => pack.adult === (packTab === 'adult') && pack.name.toLocaleLowerCase() === packName.toLocaleLowerCase(),
+        );
+        const packId = existingPack?.id ?? makeId();
+        const stickerName = file.name.replace(/\.[^.]+$/, '') || 'Sticker';
+        const sticker = { id: makeId(), name: stickerName, dataUrl, type: file.type.toLowerCase() };
+        setData((current) => {
+          const currentPack = current.customStickerPacks.find((pack) => pack.id === packId);
+          const customStickerPacks = currentPack
+            ? current.customStickerPacks.map((pack) => pack.id === packId ? { ...pack, stickers: [...pack.stickers, sticker] } : pack)
+            : [...current.customStickerPacks, { id: packId, name: packName, adult: packTab === 'adult', stickers: [sticker] }];
+          return { ...current, customStickerPacks };
+        });
+        setSelectedPack(`custom:${packId}`);
+        notify('Sticker saved in a device-local pack. It is not uploaded or end-to-end encrypted.');
+      }).catch((error: unknown) => {
+        console.error('Could not read the selected sticker file.', error);
+        notify('Could not read this sticker file.');
+      });
       return;
     }
     if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
@@ -543,10 +717,75 @@ function App() {
       return;
     }
     const url = URL.createObjectURL(file);
-    setPreview({ url, name: file.name, type: file.type });
+    setPreview({ url, name: file.name, type: file.type, file });
+  }
+  function deleteSelectedStickerPack() {
+    if (!selectedCustomPack) return;
+    if (!window.confirm(`Delete “${selectedCustomPack.name}” and its stickers from this device?`)) return;
+    setData((current) => ({
+      ...current,
+      customStickerPacks: current.customStickerPacks.filter((pack) => pack.id !== selectedCustomPack.id),
+    }));
+    setSelectedPack(packTab === 'adult' ? adultPacks[0] : everydayPacks[0]);
+    notify('Sticker pack deleted from this device.');
+  }
+  function createStickerPack() {
+    const name = normalizeStickerPackName(customPackName);
+    const nameError = getStickerPackNameError(name, visibleCustomPacks.map((pack) => pack.name));
+    if (nameError) {
+      notify(nameError);
+      return;
+    }
+    const id = makeId();
+    setData((current) => ({
+      ...current,
+      customStickerPacks: [...current.customStickerPacks, { id, name, adult: packTab === 'adult', stickers: [] }],
+    }));
+    setSelectedPack(`custom:${id}`);
+    notify('Empty sticker pack created on this device.');
+  }
+  function renameSelectedStickerPack() {
+    if (!selectedCustomPack) return;
+    const name = normalizeStickerPackName(customPackName);
+    const nameError = getStickerPackNameError(
+      name,
+      visibleCustomPacks.filter((pack) => pack.id !== selectedCustomPack.id).map((pack) => pack.name),
+    );
+    if (nameError) {
+      notify(nameError);
+      return;
+    }
+    setData((current) => ({
+      ...current,
+      customStickerPacks: current.customStickerPacks.map((pack) =>
+        pack.id === selectedCustomPack.id ? { ...pack, name } : pack,
+      ),
+    }));
+    notify('Sticker pack renamed on this device.');
+  }
+  function switchStickerCollection() {
+    const nextTab = packTab === 'everyday' ? 'adult' : 'everyday';
+    setPackTab(nextTab);
+    setSelectedPack(nextTab === 'adult' ? adultPacks[0] : everydayPacks[0]);
   }
   function sendMedia() {
     if (!preview) return;
+    const selectedPreview = preview;
+    const sender = matrixClient.current;
+    if (sender && viewOnceSeconds !== 'Off') {
+      notify('Encrypted one-view media is not available yet. Turn the timer off to send this media.');
+      return;
+    }
+    if (sender && !selectedPreview.file) {
+      notify('Select the original photo or video file again before sending.');
+      return;
+    }
+    if (selectedPreview.file && sendEncryptedAttachment(selectedPreview.file, 'media', selectedPreview.name, mode, selectedPreview.url)) {
+      setPreview(null);
+      setViewOnceSeconds('Off');
+      setPanel(null);
+      return;
+    }
     const expiresAt = viewOnceSeconds === 'Off' ? undefined : Date.now() + Number(viewOnceSeconds) * 1000;
     addMessage({
       mode, sender: 'me', kind: 'media', text: preview.name, image: preview.url,
@@ -556,6 +795,7 @@ function App() {
     setPreview(null);
     setViewOnceSeconds('Off');
     setPanel(null);
+    if (!sender) notify('Saved locally only — no encrypted room is connected.');
   }
   function sendMood(label: string, emoji: string) {
     setMoodCard({ label, emoji });
@@ -582,10 +822,11 @@ function App() {
       });
       voiceRecorder.addEventListener('stop', () => {
         const voiceNote = new Blob(chunks, { type: voiceRecorder.mimeType || 'audio/webm' });
-        addMessage({ mode, sender: 'me', kind: 'media', text: 'Voice note', image: URL.createObjectURL(voiceNote), mediaType: voiceNote.type });
+        const file = new File([voiceNote], `voice-note.${voiceNote.type.includes('ogg') ? 'ogg' : 'webm'}`, { type: voiceNote.type });
+        setPreview({ url: URL.createObjectURL(voiceNote), name: 'Voice note', type: voiceNote.type, file });
         stream.getTracks().forEach((track) => track.stop());
         recorder.current = null;
-        notify('Voice note added to this device.');
+        notify('Voice note ready to preview. Tap send to continue.');
       }, { once: true });
       voiceRecorder.start();
       notify('Recording… tap the microphone again to finish.');
@@ -706,10 +947,10 @@ function App() {
                 {message.sender === 'partner' && <div className="message-avatar">{data.partnerName.slice(0, 1).toUpperCase()}</div>}
                 <div className={`bubble ${message.sender === 'me' ? 'mine' : ''} ${message.kind}`}>
                   {message.reply && <div className="reply-quote">{message.reply}</div>}
-                  {message.kind === 'media' && message.image ? message.mediaType?.startsWith('audio/') ? <div className="voice-note"><span>♫</span><audio controls src={message.image} aria-label="Voice note" /></div> : <button className={`sent-media ${message.viewSeconds && !message.opened ? 'sealed' : ''}`} onClick={() => { if (message.expiresAt && message.expiresAt <= Date.now()) return; if (message.viewSeconds && !message.opened) { const expiresAt = Date.now() + message.viewSeconds * 1000; updateMessages((items) => items.map((item) => item.id === message.id ? { ...item, opened: true, expiresAt } : item)); window.setTimeout(() => { updateMessages((items) => items.filter((item) => item.id !== message.id)); setPreview((current) => current?.url === message.image ? null : current); URL.revokeObjectURL(message.image!); }, message.viewSeconds * 1000); } setPreview({ url: message.image!, name: message.text, type: message.mediaType ?? 'image/*' }); }}>{message.viewSeconds && !message.opened ? <div className="sealed-media"><span>♧</span><strong>Sealed just for you</strong><small>Tap to open · {message.viewSeconds}s</small></div> : message.mediaType?.startsWith('video/') ? <video src={message.image} /> : <img src={message.image} alt="Shared privately" />}{message.viewSeconds && message.opened && <span>VIEW ONCE · {message.viewSeconds}s</span>}</button> : message.kind === 'sticker' ? message.image ? <img className="sticker-image" src={message.image} alt={message.text} /> : <div className="sticker-message">{message.text}</div> : message.kind === 'mood' ? <div className="mood-message"><span>{message.text.split(' ')[0]}</span><div><small>MOOD PING</small><strong>{message.text.substring(message.text.indexOf(' ') + 1)}</strong></div></div> : <div className="bubble-text">{message.text}</div>}
+                  {message.kind === 'media' ? message.image ? message.mediaType?.startsWith('audio/') ? <div className="voice-note"><span>♫</span><audio controls src={message.image} aria-label="Voice note" /></div> : <button className={`sent-media ${message.viewSeconds && !message.opened ? 'sealed' : ''}`} onClick={() => { if (message.expiresAt && message.expiresAt <= Date.now()) return; if (message.viewSeconds && !message.opened) { const expiresAt = Date.now() + message.viewSeconds * 1000; updateMessages((items) => items.map((item) => item.id === message.id ? { ...item, opened: true, expiresAt } : item)); window.setTimeout(() => { updateMessages((items) => items.filter((item) => item.id !== message.id)); setPreview((current) => current?.url === message.image ? null : current); URL.revokeObjectURL(message.image!); }, message.viewSeconds * 1000); } setPreview({ url: message.image!, name: message.text, type: message.mediaType ?? 'image/*' }); }}>{message.viewSeconds && !message.opened ? <div className="sealed-media"><span>♧</span><strong>Sealed just for you</strong><small>Tap to open · {message.viewSeconds}s</small></div> : message.mediaType?.startsWith('video/') ? <video src={message.image} /> : <img src={message.image} alt="Shared privately" />}{message.viewSeconds && message.opened && <span>VIEW ONCE · {message.viewSeconds}s</span>}</button> : <div className="media-transfer-state" role="status">{message.mediaError ?? (message.delivery === 'sending' ? 'Encrypting and sending…' : 'Encrypted media is loading…')}</div> : message.kind === 'sticker' ? message.image ? <img className="sticker-image" src={message.image} alt={message.text} /> : message.encryptedAttachment ? <div className="media-transfer-state" role="status">Decrypting personal sticker…</div> : <div className="sticker-message">{message.text}</div> : message.kind === 'mood' ? <div className="mood-message"><span>{message.text.split(' ')[0]}</span><div><small>MOOD PING</small><strong>{message.text.substring(message.text.indexOf(' ') + 1)}</strong></div></div> : <div className="bubble-text">{message.text}</div>}
                   <div className="bubble-meta"><time>{formatTime(message.time)}</time>{message.sender === 'me' && <span>{message.delivery === 'failed' ? '!' : message.delivery === 'sending' ? '…' : message.delivery === 'read' ? '✓✓' : '✓'}</span>}{message.reaction && <b className="reaction">{message.reaction}</b>}</div>
                 </div>
-                <div className="message-tools"><button aria-label="Reply" onClick={() => { setReply(message); document.querySelector<HTMLTextAreaElement>('#message-input')?.focus(); }}>↩</button><button aria-label="React with heart" onClick={() => reactToMessage(message)}>♡</button></div>
+                <div className="message-tools"><button aria-label="Reply" onClick={() => { setReply(message); document.querySelector<HTMLTextAreaElement>('#message-input')?.focus(); }}>↩</button><button className={message.reaction === '❤️' ? 'is-reacted' : ''} aria-label={message.reaction === '❤️' ? 'Heart reaction added' : 'React with heart'} aria-pressed={message.reaction === '❤️'} onClick={() => reactToMessage(message)}>{message.reaction === '❤️' ? '♥' : '♡'}</button></div>
               </article>)}
               {partnerTyping && <div className="typing-indicator"><span>{data.partnerName} is writing</span><i /><i /><i /></div>}
             </div>
@@ -742,20 +983,31 @@ function App() {
       {panel === 'stickers' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet sticker-sheet" onClick={(event) => event.stopPropagation()}>
         <div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">A LITTLE EXTRA</div><h2>Stickers & more</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div>
         <div className="picker-tabs"><button className={!showGif ? 'active' : ''} onClick={() => setShowGif(false)}>Stickers</button><button className={showGif ? 'active' : ''} onClick={() => setShowGif(true)}>GIFs</button><button onClick={() => { setEmojiTray(!emojiTray); setShowGif(false); }}>Emoji</button><button className="picker-import" onClick={() => { setStickerImportRequested(true); fileInput.current?.click(); }}>Import +</button></div>
-        {showGif ? <div className="gif-empty"><div>✧</div><h3>Your GIF collection, your way.</h3><p>Import GIFs from your device. Nothing is pulled from a public library.</p><button className="secondary" onClick={() => { setStickerImportRequested(true); fileInput.current?.click(); }}>Import a GIF</button>{customStickers.length > 0 && <div className="imported-gif-grid">{customStickers.map((sticker) => <button key={sticker.url} title={sticker.name} onClick={() => { addMessage({ mode, sender: 'me', kind: 'sticker', text: sticker.name, image: sticker.url }); setPanel(null); }}><img src={sticker.url} alt={sticker.name} /></button>)}</div>}</div> : <>
-          <div className="pack-tabs">{packNames.map((pack) => <button className={selectedPack === pack ? 'active' : ''} key={pack} onClick={() => setSelectedPack(pack)}>{pack}</button>)}</div>
-          <div className="picker-toolbar"><div className="picker-search"><span>⌕</span><input aria-label="Search stickers" placeholder="Search this collection" value={search} onChange={(event) => setSearch(event.target.value)} /></div><button onClick={() => setPackTab(packTab === 'everyday' ? 'adult' : 'everyday')}>{packTab === 'everyday' ? '18+ collection' : 'Everyday collection'}</button></div>
+        <div className="sticker-pack-manager">
+          <div><label htmlFor="custom-sticker-pack-name">Pack name</label><input id="custom-sticker-pack-name" maxLength={32} value={customPackName} onChange={(event) => setCustomPackName(event.target.value)} /></div>
+          <button className="secondary" onClick={createStickerPack}>Create pack</button>
+          {selectedCustomPack && <button className="secondary" onClick={renameSelectedStickerPack}>Rename</button>}
+          <button className="secondary" onClick={() => { setStickerImportRequested(true); fileInput.current?.click(); }}>Add file</button>
+          {selectedCustomPack && <button className="text-danger" onClick={deleteSelectedStickerPack}>Delete pack</button>}
+          <p>Stored in this browser only. Not uploaded, shared, or end-to-end encrypted.</p>
+        </div>
+        {showGif ? <div className="gif-empty"><div>✧</div><h3>Your GIF collection, your way.</h3><p>Import GIFs from your device. Nothing is pulled from a public library.</p>{importedGifs.length > 0 && <div className="imported-gif-grid">{importedGifs.map((sticker) => <button key={sticker.id} title={`${sticker.name} · ${sticker.packName}`} onClick={() => useCustomSticker(sticker)}><img src={sticker.dataUrl} alt={sticker.name} /></button>)}</div>}</div> : <>
+          <div className="pack-tabs">{packNames.map((pack) => {
+            const customPack = visibleCustomPacks.find((item) => `custom:${item.id}` === pack);
+            return <button className={selectedPack === pack ? 'active' : ''} key={pack} onClick={() => { setSelectedPack(pack); if (customPack) setCustomPackName(customPack.name); }}>{customPack?.name ?? pack}</button>;
+          })}</div>
+          <div className="picker-toolbar"><div className="picker-search"><span>⌕</span><input aria-label="Search stickers" placeholder="Search this collection" value={search} onChange={(event) => setSearch(event.target.value)} /></div><button onClick={switchStickerCollection}>{packTab === 'everyday' ? '18+ collection' : 'Everyday collection'}</button></div>
           {emojiTray && <div className="emoji-tray">{'😀 😍 🥰 😘 😉 😏 🥺 🫂 💋 ❤️ 💕 🔥 😈 ✨ 🫶'.split(' ').map((emoji) => <button key={emoji} onClick={() => addSticker(emoji)}>{emoji}</button>)}</div>}
-          <div className="sticker-grid">{stickers.map((sticker) => <div key={`${selectedPack}-${sticker}`} className="sticker-cell"><button className="sticker-select" onClick={() => addSticker(sticker)}>{sticker}</button><button className={`favorite-toggle ${data.favourites.includes(sticker) ? 'favorited' : ''}`} aria-label="Favorite sticker" onClick={() => toggleFavourite(sticker)}>{data.favourites.includes(sticker) ? '♥' : '♡'}</button></div>)}{customStickers.map((sticker) => <div key={sticker.url} className="sticker-cell"><button className="sticker-select custom-sticker" title={sticker.name} onClick={() => { addMessage({ mode, sender: 'me', kind: 'sticker', text: sticker.name, image: sticker.url }); setPanel(null); }}><img src={sticker.url} alt={sticker.name} /></button></div>)}</div>
+          <div className="sticker-grid">{stickers.map((sticker) => <div key={`${selectedPack}-${sticker}`} className="sticker-cell"><button className="sticker-select" onClick={() => addSticker(sticker)}>{sticker}</button><button className={`favorite-toggle ${data.favourites.includes(sticker) ? 'favorited' : ''}`} aria-label="Favorite sticker" onClick={() => toggleFavourite(sticker)}>{data.favourites.includes(sticker) ? '♥' : '♡'}</button></div>)}{customPackStickers.map((sticker) => <div key={sticker.id} className="sticker-cell"><button className="sticker-select custom-sticker" title={sticker.name} onClick={() => useCustomSticker(sticker)}><img src={sticker.dataUrl} alt={sticker.name} /></button><button className={`favorite-toggle ${data.favoriteCustomStickerIds.includes(sticker.id) ? 'favorited' : ''}`} aria-label={`Favorite ${sticker.name}`} onClick={() => toggleCustomStickerFavourite(sticker.id)}>{data.favoriteCustomStickerIds.includes(sticker.id) ? '♥' : '♡'}</button></div>)}{(selectedCustomPack || selectedPack === 'Favorites' || selectedPack === 'Recent') && customPackStickers.length === 0 && stickers.length === 0 && <p className="sticker-pack-empty">{selectedPack === 'Favorites' ? 'Favorite a sticker to keep it here.' : selectedPack === 'Recent' ? 'Your personal sticker history will appear here.' : 'No matching stickers in this pack yet.'}</p>}</div>
           <div className="sticker-foot"><span>Recently used</span><div>{(data.recent.length ? data.recent : ['♡', '💋', '🥺', '✨']).map((item, index) => <button key={`${item}-${index}`} onClick={() => addSticker(item)}>{item}</button>)}</div></div>
         </>}
-        <div className="sticker-sheet-bottom"><button className="adult-toggle" onClick={() => setPackTab(packTab === 'everyday' ? 'adult' : 'everyday')}>{packTab === 'everyday' ? '◉ Everyday' : '◉ Adults only · 18+'}</button><button className="import-link" onClick={() => { setStickerImportRequested(true); fileInput.current?.click(); }}>＋ Import personal stickers / GIFs</button></div>
+        <div className="sticker-sheet-bottom"><button className="adult-toggle" onClick={switchStickerCollection}>{packTab === 'everyday' ? '◉ Everyday' : '◉ Adults only · 18+'}</button><button className="import-link" onClick={() => { setStickerImportRequested(true); fileInput.current?.click(); }}>＋ Import personal stickers / GIFs</button></div>
       </section></div>}
       {panel === 'mood' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet mood-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">A QUIET LITTLE SIGNAL</div><h2>How are you feeling right now?</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><p className="sheet-intro">Choose a mood. Your partner can reply with a note, a reaction, or a mood of their own.</p><div className="mood-grid">{moodOptions.map(([label, emoji]) => <button key={`${label}${emoji}`} className="mood-option" onClick={() => sendMood(label, emoji)}><span>{emoji}</span><b>{label}</b></button>)}</div><div className="custom-mood"><input placeholder="Add your own mood…" value={customMood} onChange={(event) => setCustomMood(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && customMood.trim() && sendMood(customMood.trim(), '♡')} /><button onClick={() => customMood.trim() && sendMood(customMood.trim(), '♡')}>Send mood</button></div><div className="discreet-note">Lock-screen notifications are not configured in this local demo.</div></section></div>}
       {panel === 'profile' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet detail-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">YOUR PRIVATE PROFILE</div><h2>A little about you</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><div className="profile-cover"><div className="profile-avatar-big">{profileDraft.avatar}</div><span>Just between the two of you</span></div><label className="field-label">Display name<input value={profileDraft.displayName} onChange={(event) => setProfileDraft({ ...profileDraft, displayName: event.target.value })} /></label><label className="field-label">Username<input value={profileDraft.username} onChange={(event) => setProfileDraft({ ...profileDraft, username: event.target.value })} /></label><label className="field-label">Bio<textarea value={profileDraft.bio} onChange={(event) => setProfileDraft({ ...profileDraft, bio: event.target.value })} /></label><label className="field-label">Avatar initials<input maxLength={2} value={profileDraft.avatar} onChange={(event) => setProfileDraft({ ...profileDraft, avatar: event.target.value.toUpperCase() })} /></label><div className="partner-info">Paired partner <b>{data.partnerName}</b><span>Private room · two identities</span></div><button className="primary full-button" onClick={() => { setData((current) => ({ ...current, profile: profileDraft })); setPanel(null); notify('Profile saved on this device.'); }}>Save profile</button></section></div>}
       {panel === 'settings' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet detail-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">YOUR ROOM, YOUR RULES</div><h2>Privacy & settings</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><button className="matrix-connect-card" onClick={() => setPanel('matrix')}><span className="matrix-lock">⌑</span><span><b>{matrixClient.current ? 'Encrypted room connected' : 'Connect an encrypted room'}</b><small>{matrixClient.current ? matrixStatus : 'Self-hosted Matrix · Rust-backed E2EE'}</small></span><i>↗</i></button><label className="field-label">Message retention<select value={data.retention} onChange={(event) => setData((current) => ({ ...current, retention: event.target.value }))}>{['Never', '1 hour', '24 hours', '7 days', '30 days', 'Custom'].map((value) => <option key={value}>{value}</option>)}</select></label><div className="setting-control"><div><b>View once media timer</b><span>Local preview only; not secure expiration.</span></div><select value={viewOnceSeconds} onChange={(event) => setViewOnceSeconds(event.target.value)}>{['Off', '5', '10', '15', '30', '60'].map((value) => <option key={value} value={value}>{value === 'Off' ? 'Off' : `${value} seconds`}</option>)}</select></div><div className="setting-control"><div><b>Hide adult timeline when leaving Kinky</b><span>Adult messages stay in their own mode.</span></div><span className="enabled-pill">On</span></div><div className="setting-control"><div><b>Lock on background</b><span>Requires PIN again when you return.</span></div><span className="enabled-pill">On</span></div>      <div className="discreet-note">Screenshot protection, biometric unlock, push notifications, device revocation and server-side retention need native Android integration.</div><button className="secondary full-button" onClick={() => { setPanel(null); setLocked(true); }}>Lock this device now</button><button className="text-danger" onClick={() => { if (window.confirm('Delete all local data for this account from this browser?')) { localStorage.removeItem(stateScope); location.reload(); } }}>Delete local data for this account</button></section></div>}
       {panel === 'gallery' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet gallery-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">ONLY YOUR SHARED MOMENTS</div><h2>Private gallery</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><div className="gallery-tabs">{['All', 'Photos', 'Videos', 'Favourites', 'Expiring'].map((filter) => <button key={filter} className={galleryFilter === filter ? 'active' : ''} onClick={() => setGalleryFilter(filter)}>{filter}</button>)}</div><div className="gallery-grid">{galleryMessages.map((item) => <button key={item.id} className="gallery-item" onClick={() => item.image && setPreview({ url: item.image, name: item.text, type: item.mediaType ?? 'image/*' })}>{item.mediaType?.startsWith('video/') ? <video src={item.image} /> : <img src={item.image} alt="Shared media" />}{item.viewSeconds && <span>VIEW ONCE · {item.viewSeconds}s</span>}</button>)}</div>{galleryMessages.length === 0 && <div className="gallery-empty large"><span>✧</span><h3>Moments, kept close.</h3><p>Photos and videos you share will appear here. Your imports stay on this device in this demo.</p><button className="secondary" onClick={() => fileInput.current?.click()}>Choose a photo or video</button></div>}</section></div>}
-      {preview && <div className="viewer-backdrop" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}><div className="viewer" onClick={(event) => event.stopPropagation()}><button className="close-button viewer-close" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}>×</button>{preview.type.startsWith('video/') ? <video src={preview.url} controls autoPlay /> : <img src={preview.url} alt="Media preview" />}<div className="viewer-footer"><span>{preview.name}</span><label>View once<select value={viewOnceSeconds} onChange={(event) => setViewOnceSeconds(event.target.value)}>{['Off', '5', '10', '15', '30', '60'].map((value) => <option key={value}>{value === 'Off' ? 'Off' : `${value} seconds`}</option>)}</select></label><button className="primary" onClick={sendMedia}>Send privately ↗</button><button className="secondary" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}>Cancel</button></div></div></div>}
+      {preview && <div className="viewer-backdrop" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}><div className="viewer" onClick={(event) => event.stopPropagation()}><button className="close-button viewer-close" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}>×</button>{preview.type.startsWith('video/') ? <video src={preview.url} controls autoPlay /> : preview.type.startsWith('audio/') ? <audio className="voice-preview" src={preview.url} controls autoPlay /> : <img src={preview.url} alt="Media preview" />}<div className="viewer-footer"><span>{preview.name}</span><label>View once<select value={viewOnceSeconds} disabled={Boolean(matrixClient.current)} onChange={(event) => setViewOnceSeconds(event.target.value)}>{['Off', '5', '10', '15', '30', '60'].map((value) => <option key={value}>{value === 'Off' ? 'Off' : `${value} seconds`}</option>)}</select></label><button className="primary" onClick={sendMedia}>Send privately ↗</button><button className="secondary" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}>Cancel</button></div></div></div>}
       {exitMode && <div className="dialog-backdrop"><section className="dialog"><div className="dialog-symbol">♠</div><div className="eyebrow">LEAVING KINKY · 18+</div><h2>Back to your other room?</h2><p>Your adult conversation will be hidden from the normal timeline. It will still be here when you return.</p><label className="delete-option"><input type="checkbox" checked={deleteAdult} onChange={(event) => setDeleteAdult(event.target.checked)} /><span><b>Permanently delete this mode’s local messages</b><small>This is local demo data only. Remote media/key deletion is not available here.</small></span></label><div className="dialog-actions"><button className="secondary" onClick={() => setExitMode(null)}>Stay here</button><button className="primary" onClick={() => confirmExit(deleteAdult)}>Leave mode</button></div></section></div>}
       {panel === 'matrix' && <div className="sheet-backdrop" onClick={() => setPanel(null)}>
         <section className="sheet detail-sheet matrix-sheet" onClick={(event) => event.stopPropagation()}>
@@ -780,19 +1032,21 @@ function App() {
               onClick={() => { setPairingRole('replace-device'); setPanel(null); }}
             >Authorize device replacement</button>
           </div>
-          <MatrixSecurityPanel
-            client={matrixClient.current}
-            security={matrixSecurity}
-            verification={matrixVerification}
-            onRefresh={() => {
-              void matrixClient.current?.getSecurityState().then(setMatrixSecurity).catch((error: unknown) => notify(error instanceof Error ? error.message : 'Could not refresh device trust.'));
-            }}
-            onNotify={notify}
-          />
+          <Suspense fallback={<div className="matrix-panel-loading" role="status">Loading security controls…</div>}>
+            <MatrixSecurityPanel
+              client={matrixClient.current}
+              security={matrixSecurity}
+              verification={matrixVerification}
+              onRefresh={() => {
+                void matrixClient.current?.getSecurityState().then(setMatrixSecurity).catch((error: unknown) => notify(error instanceof Error ? error.message : 'Could not refresh device trust.'));
+              }}
+              onNotify={notify}
+            />
+          </Suspense>
           <button className="secondary full-button" onClick={() => setPanel('settings')}>Back to settings</button>
         </section>
       </div>}
-      {pairingRole && <PairingPanel
+      {pairingRole && <Suspense fallback={<div className="dialog-backdrop"><section className="dialog matrix-panel-loading" role="status">Loading secure pairing…</section></div>}><PairingPanel
         role={pairingRole}
         credentials={matrixConnection}
         client={matrixClient.current}
@@ -805,7 +1059,7 @@ function App() {
         onClose={() => {
           if (!replacementActivationPending) setPairingRole(null);
         }}
-      />}
+      /></Suspense>}
       {toast && <div className="toast"><span>♡</span>{toast}</div>}
       {moodCard && <div className="dialog-backdrop" onClick={() => setMoodCard(null)}><section className="mood-received-card" onClick={(event) => event.stopPropagation()}><button className="close-button" onClick={() => setMoodCard(null)}>×</button><div className="mood-received-emoji">{moodCard.emoji}</div><div className="eyebrow">A LITTLE SIGNAL FROM YOU</div><h2>{moodCard.label}</h2><p>Your mood is saved in this device’s private room. A real partner notification needs the messaging backend.</p><div className="mood-reply-actions"><button className="secondary" onClick={() => { const latestMood = [...data.messages].reverse().find((item) => item.kind === 'mood' && item.text === `${moodCard.emoji} ${moodCard.label}`); if (latestMood) updateMessages((items) => items.map((item) => item.id === latestMood.id ? { ...item, reaction: '❤️' } : item)); setMoodCard(null); notify('Heart reaction added locally.'); }}>React ❤️</button><button className="secondary" onClick={() => { setMoodCard(null); setPanel('mood'); }}>Reply with a mood</button><button className="primary" onClick={() => { setMoodCard(null); setPanel(null); }}>Open chat</button></div></section></div>}
     </div>

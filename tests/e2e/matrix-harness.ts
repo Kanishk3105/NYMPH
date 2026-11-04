@@ -6,7 +6,9 @@ import {
   type NymphEnvelope,
   type ReceivedNymphEvent,
 } from '../../src/matrix/MessagingClient';
-import { decryptRecoveryExport, encryptRecoveryExport } from '../../src/matrix/recovery-export';
+import { decryptRecoveryExport } from '../../src/matrix/recovery-export';
+import QRCode from 'qrcode';
+import { BrowserQRCodeReader } from '@zxing/browser';
 
 type HarnessSession = MatrixConnection;
 type HarnessState = {
@@ -16,23 +18,22 @@ type HarnessState = {
   security: unknown;
   typing: boolean;
   readEventIds: string[];
-  preparedRecoveryKey: string;
   connect(connection: HarnessSession, storageKey?: number[]): Promise<void>;
   disconnect(): void;
   passwordLogin(userId: string, password: string, deviceName: string, deviceId?: string): Promise<HarnessSession>;
   roomStatus(connection: HarnessSession): Promise<{ room_id: string }>;
   createInvitation(connection: HarnessSession): Promise<unknown>;
+  encodeInvitationQr(invite: unknown): Promise<string>;
   redeemInvitation(invite: unknown, deviceId?: string): Promise<HarnessSession>;
   replayInvitation(invite: unknown): Promise<number>;
   unlockExistingSecretStorage(recoveryKey: string, password: string): Promise<string>;
-  prepareRecoveryExport(passphrase: string): Promise<{ keyId: string; encryptedExport: string }>;
-  finishRecoverySetup(password: string): Promise<string[]>;
-  restoreRecoveryExport(encryptedExport: string, passphrase: string, password: string): Promise<string[]>;
+  validateRecoveryExport(
+    encryptedExport: string,
+    passphrase: string,
+    recoveryKey: string,
+    expectedUserId: string,
+  ): Promise<void>;
   verifyRecoveryOnSeparateDevice(recoveryKey: string, password: string): Promise<string>;
-  prepareSecretStorageSetup(): Promise<string>;
-  commitSecretStorageSetup(confirmation: string): Promise<string>;
-  discardPendingSecretStorageKey(): void;
-  bootstrapSecurity(password: string): Promise<void>;
   requestPartnerVerification(deviceId: string): Promise<void>;
   acceptVerification(id: string): Promise<void>;
   startSasVerification(id: string): Promise<void>;
@@ -41,23 +42,6 @@ type HarnessState = {
   setTyping(isTyping: boolean): Promise<void>;
   markRead(eventId: string): Promise<void>;
   refreshSecurity(): Promise<unknown>;
-  revokeDevice(deviceId: string, password: string): Promise<void>;
-  createDeviceReplacement(connection: HarnessSession, deviceId: string): Promise<{
-    user_id: string;
-    device_id: string;
-    previous_device_id: string;
-    room_id: string;
-    login_token: string;
-  }>;
-  loginReplacement(homeserver: string, authorization: {
-    user_id: string;
-    device_id: string;
-    room_id: string;
-    login_token: string;
-  }): Promise<HarnessSession>;
-  deleteDevice(session: HarnessSession, deviceId: string, password: string): Promise<void>;
-  activateReplacement(session: HarnessSession): Promise<void>;
-  cancelReplacement(session: HarnessSession): Promise<void>;
   logout(session: HarnessSession): Promise<void>;
   whoamiStatus(session: HarnessSession): Promise<number>;
   inviteStatus(session: HarnessSession, roomId: string, userId: string): Promise<number>;
@@ -69,11 +53,22 @@ type HarnessState = {
   getReadEventIds(): string[];
 };
 
-const apiBase = 'http://127.0.0.1:8008';
-const partnerPairs = [
-  ['@partner1:localhost', '@partner2:localhost'],
-  ['@partner1-dev:localhost', '@partner2-dev:localhost'],
-] as const;
+const matrixConfig = {
+  homeserverUrl: import.meta.env.VITE_MATRIX_HOMESERVER,
+  serverName: import.meta.env.VITE_MATRIX_SERVER_NAME,
+  partnerA: import.meta.env.VITE_MATRIX_PARTNER_A_USER_ID,
+  partnerB: import.meta.env.VITE_MATRIX_PARTNER_B_USER_ID,
+};
+if (
+  matrixConfig.homeserverUrl !== 'http://127.0.0.1:18008' ||
+  matrixConfig.serverName !== 'nymph-dev.localhost' ||
+  matrixConfig.partnerA !== '@partner1-dev:nymph-dev.localhost' ||
+  matrixConfig.partnerB !== '@partner2-dev:nymph-dev.localhost'
+) {
+  throw new Error('Matrix test harness requires the exact isolated Stage 3H development configuration.');
+}
+const apiBase = matrixConfig.homeserverUrl;
+const partnerPairs = [[matrixConfig.partnerA, matrixConfig.partnerB]] as const;
 const state: HarnessState = {
   client: null,
   events: [],
@@ -81,7 +76,6 @@ const state: HarnessState = {
   security: null,
   typing: false,
   readEventIds: [],
-  preparedRecoveryKey: '',
   async connect(connection, storageKey) {
     this.disconnect();
     this.events = [];
@@ -107,7 +101,6 @@ const state: HarnessState = {
   disconnect() {
     this.client?.close();
     this.client = null;
-    this.preparedRecoveryKey = '';
   },
   async passwordLogin(userId, password, deviceName, deviceId) {
     const pair = partnerPairs.find(([partnerA, partnerB]) => userId === partnerA || userId === partnerB);
@@ -147,10 +140,29 @@ const state: HarnessState = {
     return { room_id: body.room_id };
   },
   async createInvitation(connection) {
-    return postJson('/_synapse/client/nymph/pairing/create', { room_id: connection.roomId }, connection.accessToken);
+    const invitation = await postJson<Record<string, unknown>>(
+      '/_synapse/client/nymph/pairing/create',
+      { room_id: connection.roomId },
+      connection.accessToken,
+    );
+    return { ...invitation, homeserver: matrixConfig.homeserverUrl };
+  },
+  async encodeInvitationQr(invite) {
+    const dataUrl = await QRCode.toDataURL(JSON.stringify(invite), {
+      errorCorrectionLevel: 'Q',
+      margin: 2,
+      width: 320,
+    });
+    const decoded = await new BrowserQRCodeReader().decodeFromImageUrl(dataUrl);
+    return decoded.getText();
   },
   async redeemInvitation(invite, deviceId) {
-    const invitation = invite as { token: string; room_id: string; partner_user_id: string };
+    const invitation = (
+      typeof invite === 'string' ? JSON.parse(invite) : invite
+    ) as { token: string; homeserver: string; room_id: string; partner_user_id: string };
+    if (invitation.homeserver !== matrixConfig.homeserverUrl) {
+      throw new Error('The pairing QR does not target the isolated NYMPH homeserver.');
+    }
     const pair = partnerPairs.find(([, partnerB]) => partnerB === invitation.partner_user_id);
     if (!pair) throw new Error('The pairing invitation targets an unconfigured NYMPH partner.');
     const [partnerA, partnerB] = pair;
@@ -197,59 +209,12 @@ const state: HarnessState = {
     if (!this.client) throw new Error('Connect a Matrix client before unlocking Secret Storage.');
     return this.client.unlockExistingSecretStorage(recoveryKey, password);
   },
-  async prepareRecoveryExport(passphrase) {
-    if (!this.client) throw new Error('Connect a Matrix client before preparing recovery.');
-    const recoveryKey = await this.client.prepareSecretStorageSetup();
-    this.preparedRecoveryKey = recoveryKey;
-    try {
-      const keyId = await this.client.commitSecretStorageSetup(recoveryKey);
-      const encryptedExport = await encryptRecoveryExport({
-        account: this.client.userId,
-        keyId,
-        recoveryKey,
-      }, passphrase);
-      return { keyId, encryptedExport };
-    } catch (error) {
-      this.client.discardPendingSecretStorageKey();
-      this.preparedRecoveryKey = '';
-      throw error;
-    }
-  },
-  async finishRecoverySetup(password) {
-    if (!this.client || !this.preparedRecoveryKey) {
-      throw new Error('Prepare the partner recovery export before completing security setup.');
-    }
-    const recoveryKey = this.preparedRecoveryKey;
-    try {
-      await this.client.bootstrapSecurity(password);
-      await this.client.verifyRecoveryOnSeparateDevice(recoveryKey, password);
-      const identityIds = await this.client.getCrossSigningIdentityIds();
-      if (identityIds.length !== 3) {
-        throw new Error('The restored cross-signing identity is incomplete.');
-      }
-      return identityIds;
-    } finally {
-      this.preparedRecoveryKey = '';
-    }
-  },
-  async restoreRecoveryExport(encryptedExport, passphrase, password) {
-    if (!this.client) throw new Error('Connect a Matrix client before restoring recovery.');
+  async validateRecoveryExport(encryptedExport, passphrase, recoveryKey, expectedUserId) {
     const contents = await decryptRecoveryExport(encryptedExport, passphrase);
-    if (contents.account !== this.client.userId) {
-      throw new Error('The encrypted recovery export belongs to a different Matrix account.');
-    }
-    const security = await this.client.getSecurityState();
-    if (!security.defaultSecretStorageKeyId || contents.keyId !== security.defaultSecretStorageKeyId) {
-      throw new Error('The encrypted recovery export does not match the account default Secret Storage key.');
-    }
     try {
-      await this.client.unlockExistingSecretStorage(contents.recoveryKey, password);
-      await this.client.verifyRecoveryOnSeparateDevice(contents.recoveryKey, password);
-      const identityIds = await this.client.getCrossSigningIdentityIds();
-      if (identityIds.length !== 3) {
-        throw new Error('The restored cross-signing identity is incomplete.');
+      if (contents.account !== expectedUserId || contents.recoveryKey !== recoveryKey) {
+        throw new Error('The local encrypted recovery export does not match the supplied partner credentials.');
       }
-      return identityIds;
     } finally {
       contents.recoveryKey = '';
     }
@@ -257,21 +222,6 @@ const state: HarnessState = {
   async verifyRecoveryOnSeparateDevice(recoveryKey, password) {
     if (!this.client) throw new Error('Connect a Matrix client before verifying recovery.');
     return this.client.verifyRecoveryOnSeparateDevice(recoveryKey, password);
-  },
-  async prepareSecretStorageSetup() {
-    if (!this.client) throw new Error('Connect a Matrix client before preparing Secret Storage.');
-    return this.client.prepareSecretStorageSetup();
-  },
-  async commitSecretStorageSetup(confirmation) {
-    if (!this.client) throw new Error('Connect a Matrix client before confirming Secret Storage.');
-    return this.client.commitSecretStorageSetup(confirmation);
-  },
-  discardPendingSecretStorageKey() {
-    this.client?.discardPendingSecretStorageKey();
-  },
-  async bootstrapSecurity(password) {
-    if (!this.client) throw new Error('Connect a Matrix client before bootstrapping security.');
-    return this.client.bootstrapSecurity(password);
   },
   async requestPartnerVerification(deviceId) {
     if (!this.client) throw new Error('Connect a Matrix client before requesting verification.');
@@ -304,63 +254,6 @@ const state: HarnessState = {
   async refreshSecurity() {
     if (!this.client) throw new Error('Connect a Matrix client before checking security.');
     return this.client.getSecurityState();
-  },
-  async revokeDevice(deviceId, password) {
-    if (!this.client) throw new Error('Connect a Matrix client before revoking a device.');
-    await this.client.revokeDevice(deviceId, password);
-  },
-  async createDeviceReplacement(connection, deviceId) {
-    return postJson('/_synapse/client/nymph/device/replace', { device_id: deviceId }, connection.accessToken);
-  },
-  async loginReplacement(homeserver, authorization) {
-    const { createClient } = await import('matrix-js-sdk');
-    const loginClient = createClient({ baseUrl: homeserver });
-    try {
-      const session = await loginClient.login('m.login.token', {
-        token: authorization.login_token,
-        device_id: authorization.device_id,
-        initial_device_display_name: 'NYMPH replacement acceptance test',
-      });
-      if (session.user_id !== authorization.user_id || session.device_id !== authorization.device_id) {
-        throw new Error('The replacement token authenticated an unexpected Matrix device.');
-      }
-      return {
-        homeserver,
-        userId: session.user_id,
-        partnerUserId: session.user_id === '@partner1-dev:localhost'
-          ? '@partner2-dev:localhost'
-          : '@partner1-dev:localhost',
-        accessToken: session.access_token,
-        roomId: authorization.room_id,
-        deviceId: session.device_id,
-      };
-    } finally {
-      loginClient.stopClient();
-    }
-  },
-  async deleteDevice(session, deviceId, password) {
-    const { createClient } = await import('matrix-js-sdk');
-    const client = createClient({
-      baseUrl: session.homeserver,
-      accessToken: session.accessToken,
-      userId: session.userId,
-      ...(session.deviceId ? { deviceId: session.deviceId } : {}),
-    });
-    try {
-      await client.deleteDevice(deviceId, {
-        type: 'm.login.password',
-        user: session.userId,
-        password,
-      });
-    } finally {
-      client.stopClient();
-    }
-  },
-  async activateReplacement(session) {
-    await postJson('/_synapse/client/nymph/device/activate', {}, session.accessToken);
-  },
-  async cancelReplacement(session) {
-    await postJson('/_synapse/client/nymph/device/cancel', {}, session.accessToken);
   },
   async logout(session) {
     const response = await fetch(`${apiBase}/_matrix/client/v3/logout`, {

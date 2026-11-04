@@ -37,3 +37,36 @@ test('keeps romantic, flirty, spicy, and kinky mode identifiers valid', () => {
     assert.equal(decodeEnvelopeBody(body, '@partner:example.test', `$${mode}`, 20)?.mode, mode);
   }
 });
+
+test('accepts a media envelope only when it contains a valid encrypted attachment reference', () => {
+  const media: NymphEnvelope = {
+    version: 1,
+    id: 'media-1',
+    mode: 'romantic',
+    kind: 'media',
+    text: 'photo.jpg',
+    sentAt: 20,
+    mediaName: 'photo.jpg',
+    mediaType: 'image/jpeg',
+    attachment: {
+      v: 'v2',
+      url: 'mxc://example.test/opaque-id',
+      key: { alg: 'A256CTR', ext: true, k: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', key_ops: ['encrypt', 'decrypt'], kty: 'oct' },
+      iv: 'AAAAAAAAAAAAAAAAAAAAAA==',
+      hashes: { sha256: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
+    },
+  };
+  const decoded = decodeEnvelopeBody(encodeEnvelope(media), '@partner:example.test', '$media', 20);
+
+  assert.equal(decoded?.kind, 'media');
+  assert.equal(decoded?.attachment?.url, media.attachment?.url);
+  assert.equal(
+    decodeEnvelopeBody(
+      'nymph.v1:{"version":1,"id":"x","mode":"romantic","kind":"media","text":"photo.jpg","sentAt":1}',
+      '@partner:example.test',
+      '$invalid-media',
+      1,
+    ),
+    undefined,
+  );
+});

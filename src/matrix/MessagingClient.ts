@@ -21,11 +21,13 @@ import type {
 } from 'matrix-js-sdk/lib/crypto-api/verification';
 import { MsgType, RelationType } from 'matrix-js-sdk/lib/@types/event.js';
 import type { ReactionEventContent, RoomMessageEventContent } from 'matrix-js-sdk/lib/@types/events.js';
+import type { EncryptedFile } from 'matrix-js-sdk/lib/@types/media.js';
 import { RoomMemberEvent } from 'matrix-js-sdk/lib/models/room-member.js';
 import { revokeRecoveryVerifier, writeRecoveryMarkerAfterCleanup } from './recovery-device-cleanup.ts';
+import { decryptAttachment, encryptAttachment, isEncryptedAttachment } from './encrypted-attachment.ts';
 
 export type NymphMode = 'romantic' | 'flirty' | 'spicy' | 'kinky';
-export type NymphEventKind = 'text' | 'mood' | 'sticker' | 'reaction';
+export type NymphEventKind = 'text' | 'mood' | 'sticker' | 'media' | 'reaction';
 
 export interface MatrixConnection {
   homeserver: string;
@@ -47,6 +49,9 @@ export interface NymphEnvelope {
   replyTo?: string;
   replyToEventId?: string;
   reactionTo?: string;
+  attachment?: EncryptedFile;
+  mediaType?: string;
+  mediaName?: string;
 }
 
 export interface ReceivedNymphEvent extends NymphEnvelope {
@@ -98,6 +103,8 @@ export interface MatrixMessagingClient {
   readonly userId: string;
   readonly deviceId: string;
   send(envelope: NymphEnvelope): Promise<string>;
+  sendAttachment(file: File, envelope: NymphEnvelope): Promise<{ eventId: string; attachment: EncryptedFile }>;
+  downloadAttachment(file: EncryptedFile, mediaType: string): Promise<Blob>;
   markRead(eventId: string): Promise<void>;
   setTyping(isTyping: boolean): Promise<void>;
   getSecurityState(): Promise<MatrixSecurityState>;
@@ -153,9 +160,16 @@ export function decodeEnvelopeBody(
       payload.version !== 1 ||
       typeof payload.id !== 'string' ||
       !isMode(payload.mode) ||
-      !['text', 'mood', 'sticker', 'reaction'].includes(String(payload.kind)) ||
+      !['text', 'mood', 'sticker', 'media', 'reaction'].includes(String(payload.kind)) ||
       typeof payload.text !== 'string' ||
       typeof payload.sentAt !== 'number'
+    ) return undefined;
+    if (
+      (payload.kind === 'media' && !isEncryptedAttachment(payload.attachment)) ||
+      (payload.attachment !== undefined &&
+        (!isEncryptedAttachment(payload.attachment) ||
+          typeof payload.mediaType !== 'string' ||
+          typeof payload.mediaName !== 'string'))
     ) return undefined;
 
     return {
@@ -560,6 +574,48 @@ export async function connectMatrix(
         }
         const result = await client.sendMessage(credentials.roomId, content);
         return result.event_id;
+      },
+      async sendAttachment(file, envelope) {
+        if (!['media', 'sticker'].includes(envelope.kind) || file.size <= 0) {
+          throw new Error('Choose a non-empty photo, video, or voice recording to send.');
+        }
+        if (typeof envelope.mediaType !== 'string' || typeof envelope.mediaName !== 'string') {
+          throw new Error('Encrypted media is missing its content type or display name.');
+        }
+        if (file.size > 40 * 1024 * 1024) {
+          throw new Error('Encrypted media is limited to 40 MB on this device.');
+        }
+        await assertPairMembership(client, credentials);
+        await requireVerifiedPartner();
+        const { ciphertext, file: encryptedMetadata } = await encryptAttachment(await file.arrayBuffer());
+        const upload = await client.uploadContent(
+          new Blob([ciphertext], { type: 'application/octet-stream' }),
+          { type: 'application/octet-stream', includeFilename: false },
+        );
+        const content: RoomMessageEventContent = {
+          msgtype: MsgType.Text,
+          body: encodeEnvelope({
+            ...envelope,
+            kind: 'media',
+            attachment: { ...encryptedMetadata, url: upload.content_uri },
+            mediaType: file.type || 'application/octet-stream',
+            mediaName: file.name,
+          }),
+        };
+        const result = await client.sendMessage(credentials.roomId, content);
+        return {
+          eventId: result.event_id,
+          attachment: { ...encryptedMetadata, url: upload.content_uri },
+        };
+      },
+      async downloadAttachment(file, mediaType) {
+        if (!isEncryptedAttachment(file)) throw new Error('The encrypted media reference is invalid.');
+        const downloadUrl = client.mxcUrlToHttp(file.url);
+        if (!downloadUrl) throw new Error('The homeserver returned an invalid encrypted media URL.');
+        const response = await fetch(downloadUrl, { credentials: 'omit' });
+        if (!response.ok) throw new Error(`Encrypted media download failed with HTTP ${response.status}.`);
+        const plaintext = await decryptAttachment(await response.arrayBuffer(), file);
+        return new Blob([plaintext], { type: mediaType || 'application/octet-stream' });
       },
       async markRead(eventId) {
         const event = client.getRoom(credentials.roomId)?.findEventById(eventId);

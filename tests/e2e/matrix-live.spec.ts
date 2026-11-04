@@ -3,6 +3,8 @@ import { randomUUID, scryptSync } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+test.skip(true, 'Legacy Matrix live suite is disabled. Use the isolated Stage 3I configuration.');
+
 type Session = {
   homeserver: string;
   userId: string;
