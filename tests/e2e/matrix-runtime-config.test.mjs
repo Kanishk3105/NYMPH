@@ -31,7 +31,7 @@ test('rejects legacy, public, or mismatched Matrix configuration', () => {
   }
 });
 
-test('live acceptance wiring requires process credentials and cannot bootstrap or replace crypto state', () => {
+test('live acceptance wiring uses isolated local credentials and never replaces an existing identity', () => {
   const spec = readFileSync(
     fileURLToPath(new URL('./matrix-dev-live.spec.ts', import.meta.url)),
     'utf8',
@@ -40,25 +40,30 @@ test('live acceptance wiring requires process credentials and cannot bootstrap o
     fileURLToPath(new URL('./matrix-harness.ts', import.meta.url)),
     'utf8',
   );
-  for (const variable of [
-    'NYMPH_E2E_PARTNER1_PASSWORD',
-    'NYMPH_E2E_PARTNER2_PASSWORD',
-    'NYMPH_E2E_PARTNER1_RECOVERY_KEY',
-    'NYMPH_E2E_PARTNER2_RECOVERY_KEY',
-    'NYMPH_E2E_PARTNER1_RECOVERY_EXPORT_PASSPHRASE',
-    'NYMPH_E2E_PARTNER2_RECOVERY_EXPORT_PASSPHRASE',
+  for (const requiredOperation of [
+    'partner1_dev_password',
+    'partner2_dev_password',
+    'prepareSecretStorageSetup',
+    'commitSecretStorageSetup',
+    'bootstrapSecurity',
+    'verifyRecoveryOnSeparateDevice',
+    'writeProtectedRecoveryExport',
+    'joinedMembers',
+    'cancelVerification',
+    'revokeDevice',
   ]) {
-    assert.ok(spec.includes(variable), `Missing process credential ${variable}.`);
+    assert.ok(spec.includes(requiredOperation) || harness.includes(requiredOperation), `Missing live operation ${requiredOperation}.`);
   }
   for (const forbiddenOperation of [
-    'prepareSecretStorageSetup',
-    'finishRecoverySetup',
-    'bootstrapSecurity',
+    'resetKeyBackup',
     'createDeviceReplacement',
     'activateReplacement',
   ]) {
     assert.ok(!spec.includes(forbiddenOperation), `Live spec must not call ${forbiddenOperation}.`);
     assert.ok(!harness.includes(forbiddenOperation), `Test harness must not expose ${forbiddenOperation}.`);
   }
+  assert.ok(spec.includes('Hey, missing you ❤️'));
+  assert.ok(spec.includes('Missing you too 🥺💋'));
+  assert.ok(spec.includes('UseSystemPasswordChar'));
   assert.doesNotMatch(spec, /console\.(?:log|info|debug)\s*\(/);
 });
