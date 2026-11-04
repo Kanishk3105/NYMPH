@@ -100,6 +100,7 @@ export interface MatrixMessagingClient {
   markRead(eventId: string): Promise<void>;
   setTyping(isTyping: boolean): Promise<void>;
   getSecurityState(): Promise<MatrixSecurityState>;
+  getCrossSigningIdentityIds(): Promise<string[]>;
   unlockExistingSecretStorage(recoveryKey: string, password: string): Promise<string>;
   prepareSecretStorageSetup(): Promise<string>;
   commitSecretStorageSetup(confirmation: string): Promise<string>;
@@ -569,6 +570,24 @@ export async function connectMatrix(
       async getSecurityState() {
         return refreshSecurity();
       },
+      async getCrossSigningIdentityIds() {
+        const keys = await cryptoApi.getUserCrossSigningKeys(credentials.userId);
+        const ids = [
+          CrossSigningKey.Master,
+          CrossSigningKey.SelfSigning,
+          CrossSigningKey.UserSigning,
+        ].map((type) => {
+          const key = keys?.[type];
+          return key ? Object.keys(key.keys)[0] : undefined;
+        });
+        if (ids.some((id) => !id)) {
+          throw new Error(`The published cross-signing identity is incomplete for ${credentials.userId}.`);
+        }
+        return ids.map((id) => {
+          if (!id) throw new Error(`The published cross-signing identity is incomplete for ${credentials.userId}.`);
+          return id;
+        });
+      },
       async unlockExistingSecretStorage(recoveryKey, password) {
         const keyId = await client.secretStorage.getDefaultKeyId();
         if (!keyId) {
@@ -768,19 +787,64 @@ export async function connectMatrix(
           let temporaryDeviceId: string | undefined;
           let verificationClient: MatrixClient | undefined;
           let loginClient: MatrixClient | undefined;
+          let recoveryAuthorization: { userId: string; deviceId: string } | undefined;
           let verificationFailure: unknown;
           let cleanupFailed = false;
           try {
             loginClient = sdk.createClient({ baseUrl: homeserver.origin });
-            const session = await loginClient.login('m.login.password', {
-              identifier: { type: 'm.id.user', user: credentials.userId },
-              password,
-              initial_device_display_name: 'NYMPH recovery verification',
-            });
+            let session: Awaited<ReturnType<typeof loginClient.login>>;
+            if (homeserver.hostname === 'localhost' || homeserver.hostname === '127.0.0.1') {
+              const deviceId = `NYMPH_RECOVERY_${crypto.randomUUID().replaceAll('-', '')}`;
+              const authorizationResponse = await fetch(
+                `${homeserver.origin}/_synapse/client/nymph/device/recovery-check`,
+                {
+                  method: 'POST',
+                  headers: {
+                    Authorization: `Bearer ${credentials.accessToken}`,
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({ device_id: deviceId }),
+                  cache: 'no-store',
+                },
+              );
+              if (!authorizationResponse.ok) {
+                throw new Error(`The active development device could not authorize recovery verification (${authorizationResponse.status}).`);
+              }
+              recoveryAuthorization = { userId: credentials.userId, deviceId };
+              const authorization = await authorizationResponse.json() as {
+                user_id?: unknown;
+                device_id?: unknown;
+                login_token?: unknown;
+                expires_in_ms?: unknown;
+              };
+              if (
+                authorization.user_id !== credentials.userId ||
+                authorization.device_id !== deviceId ||
+                typeof authorization.login_token !== 'string' ||
+                typeof authorization.expires_in_ms !== 'number' ||
+                authorization.expires_in_ms <= 0
+              ) {
+                throw new Error('The server returned an invalid recovery-verification authorization.');
+              }
+              session = await loginClient.login('m.login.token', {
+                token: authorization.login_token,
+                device_id: deviceId,
+                initial_device_display_name: 'NYMPH recovery verification',
+              });
+            } else {
+              session = await loginClient.login('m.login.password', {
+                identifier: { type: 'm.id.user', user: credentials.userId },
+                password,
+                initial_device_display_name: 'NYMPH recovery verification',
+              });
+            }
             if (session.user_id !== credentials.userId || !session.device_id) {
               throw new Error('The recovery verification login did not create an account device.');
             }
             temporaryDeviceId = session.device_id;
+            if (recoveryAuthorization && temporaryDeviceId !== recoveryAuthorization.deviceId) {
+              throw new Error('The recovery verifier did not use its authorized temporary device ID.');
+            }
             if (!session.access_token || session.device_id === client.getDeviceId()) {
               throw new Error('The recovery verification login did not create an independent Matrix device.');
             }
@@ -804,6 +868,14 @@ export async function connectMatrix(
 
             const verificationCrypto = verificationClient.getCrypto();
             if (!verificationCrypto) throw new Error('The separate recovery client could not initialize Matrix encryption.');
+            const backupInfo = await verificationCrypto.getKeyBackupInfo();
+            if (backupInfo) {
+              await verificationCrypto.loadSessionBackupPrivateKeyFromSecretStorage();
+              const backupCheck = await verificationCrypto.checkKeyBackupAndEnable();
+              if (!backupCheck?.trustInfo.trusted || !backupCheck.trustInfo.matchesDecryptionKey) {
+                throw new Error('The separate recovery client could not verify the existing room-key backup.');
+              }
+            }
             const verificationKeyId = await verificationClient.secretStorage.getDefaultKeyId();
             const verificationKeyInfo = verificationKeyId
               ? await verificationClient.secretStorage.getKey(verificationKeyId)
@@ -869,6 +941,26 @@ export async function connectMatrix(
                 cleanupFailed = true;
               }
             }
+            if (recoveryAuthorization) {
+              try {
+                const cancellation = await fetch(
+                  `${homeserver.origin}/_synapse/client/nymph/device/cancel`,
+                  {
+                    method: 'POST',
+                    headers: {
+                      Authorization: `Bearer ${credentials.accessToken}`,
+                      'Content-Type': 'application/json',
+                    },
+                    body: '{}',
+                    cache: 'no-store',
+                  },
+                );
+                if (!cancellation.ok) cleanupFailed = true;
+                await cancellation.arrayBuffer();
+              } catch {
+                cleanupFailed = true;
+              }
+            }
           }
 
           if (cleanupFailed) {
@@ -922,6 +1014,23 @@ export async function connectMatrix(
         });
         if (!(await cryptoApi.isCrossSigningReady())) {
           throw new Error(`Cross-signing did not become ready for ${credentials.userId}.`);
+        }
+        const existingBackup = await cryptoApi.getKeyBackupInfo();
+        if (existingBackup) {
+          const backupCheck = await cryptoApi.checkKeyBackupAndEnable();
+          if (!backupCheck?.trustInfo.trusted || !backupCheck.trustInfo.matchesDecryptionKey) {
+            throw new Error(`The existing room-key backup could not be trusted for ${credentials.userId}; it was not replaced.`);
+          }
+        } else {
+          await cryptoApi.resetKeyBackup();
+          const createdBackup = await cryptoApi.getKeyBackupInfo();
+          if (!createdBackup) {
+            throw new Error(`Matrix did not create a room-key backup for ${credentials.userId}.`);
+          }
+          const backupTrust = await cryptoApi.isKeyBackupTrusted(createdBackup);
+          if (!backupTrust.trusted || !backupTrust.matchesDecryptionKey) {
+            throw new Error(`The new room-key backup could not be verified for ${credentials.userId}.`);
+          }
         }
         await refreshSecurity();
       },

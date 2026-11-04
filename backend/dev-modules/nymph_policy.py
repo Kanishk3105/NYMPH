@@ -105,6 +105,14 @@ class PairingResource(Resource):
                 result = await self.policy.cancel_invitation(request)
             elif self.endpoint == "status":
                 result = await self.policy.get_room_status(request)
+            elif self.endpoint == "device_replace":
+                result = await self.policy.create_device_replacement(request, payload)
+            elif self.endpoint == "device_activate":
+                result = await self.policy.activate_device_replacement(request)
+            elif self.endpoint == "device_cancel":
+                result = await self.policy.cancel_device_replacement(request)
+            elif self.endpoint == "device_recovery_check":
+                result = await self.policy.create_recovery_verification(request, payload)
             else:
                 result = await self.policy.redeem_invitation(payload)
         except SynapseError as error:
@@ -130,17 +138,29 @@ class NymphPolicy:
         required = (
             "partner_a_user_id",
             "partner_b_user_id",
+            "dev_partner_a_user_id",
+            "dev_partner_b_user_id",
             "homeserver_url",
             "app_origins",
             "state_path",
         )
         if any(not isinstance(config.get(key), str) or not config[key] for key in required):
             raise ValueError("NYMPH policy requires both development IDs and local service URLs.")
-        if config["partner_a_user_id"] == config["partner_b_user_id"]:
-            raise ValueError("NYMPH development partner IDs must be distinct.")
+        user_ids = (
+            config["partner_a_user_id"],
+            config["partner_b_user_id"],
+            config["dev_partner_a_user_id"],
+            config["dev_partner_b_user_id"],
+        )
+        if len(set(user_ids)) != len(user_ids):
+            raise ValueError("NYMPH legacy and development partner IDs must be distinct.")
+        if user_ids[:2] != ("@partner1:localhost", "@partner2:localhost"):
+            raise ValueError("The archived development identities cannot be rebound by the policy.")
+        if user_ids[2:] != ("@partner1-dev:localhost", "@partner2-dev:localhost"):
+            raise ValueError("The additive development identities must use their dedicated IDs.")
         if not all(
             user_id.startswith("@") and user_id.endswith(":localhost")
-            for user_id in (config["partner_a_user_id"], config["partner_b_user_id"])
+            for user_id in user_ids
         ):
             raise ValueError("The development-only policy accepts @user:localhost IDs.")
         homeserver = config["homeserver_url"]
@@ -152,15 +172,38 @@ class NymphPolicy:
         return config
 
     def __init__(self, config: dict[str, Any], api: ModuleApi) -> None:
-        self.partner_a = config["partner_a_user_id"]
-        self.partner_b = config["partner_b_user_id"]
+        self.pairs = {
+            "legacy": {
+                "partner_a": config["partner_a_user_id"],
+                "partner_b": config["partner_b_user_id"],
+                "table": "nymph_room_policy",
+            },
+            "dev": {
+                "partner_a": config["dev_partner_a_user_id"],
+                "partner_b": config["dev_partner_b_user_id"],
+                "table": "nymph_dev_room_policy",
+            },
+        }
+        all_users = [
+            user_id
+            for pair in self.pairs.values()
+            for user_id in (pair["partner_a"], pair["partner_b"])
+        ]
+        if len(set(all_users)) != len(all_users):
+            raise ValueError("Legacy and development partner IDs must all be distinct.")
+        self.dev_users = {
+            self.pairs["dev"]["partner_a"],
+            self.pairs["dev"]["partner_b"],
+        }
         self.homeserver_url = config["homeserver_url"]
         self.app_origins = set(config["app_origins"].split(","))
         self.api = api
         self.invitation_lock = asyncio.Lock()
-        self.invitations: dict[str, int] = {}
-        self.invitation_status = "not_created"
-        self.invitation_expires_at: int | None = None
+        self.invitations: dict[str, tuple[str, int]] = {}
+        self.invitation_status = {
+            key: {"status": "not_created", "expires_at": None}
+            for key in self.pairs
+        }
         self.db = sqlite3.connect(config["state_path"], check_same_thread=False, isolation_level=None)
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS nymph_room_policy "
@@ -169,6 +212,40 @@ class NymphPolicy:
         self.db.execute(
             "INSERT OR IGNORE INTO nymph_room_policy (id, room_id, creation_reserved_at) VALUES (1, NULL, NULL)"
         )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_dev_room_policy "
+            "(id INTEGER PRIMARY KEY CHECK (id = 1), room_id TEXT, creation_reserved_at INTEGER)"
+        )
+        self.db.execute(
+            "INSERT OR IGNORE INTO nymph_dev_room_policy "
+            "(id, room_id, creation_reserved_at) VALUES (1, NULL, NULL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_active_device "
+            "(user_id TEXT PRIMARY KEY, device_id TEXT, first_login_allowed INTEGER NOT NULL DEFAULT 1)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_pending_device "
+            "(user_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, previous_device_id TEXT NOT NULL, "
+            "expires_at INTEGER NOT NULL, purpose TEXT NOT NULL DEFAULT 'replace')"
+        )
+        pending_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(nymph_pending_device)").fetchall()
+        }
+        if "previous_device_id" not in pending_columns:
+            self.db.execute(
+                "ALTER TABLE nymph_pending_device ADD COLUMN previous_device_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "purpose" not in pending_columns:
+            self.db.execute(
+                "ALTER TABLE nymph_pending_device ADD COLUMN purpose TEXT NOT NULL DEFAULT 'replace'"
+            )
+        for user_id in self.dev_users:
+            self.db.execute(
+                "INSERT OR IGNORE INTO nymph_active_device (user_id, device_id, first_login_allowed) "
+                "VALUES (?, NULL, 1)",
+                (user_id,),
+            )
         self.api.register_spam_checker_callbacks(
             check_event_for_spam=self.check_event_for_spam,
             user_may_join_room=self.user_may_join_room,
@@ -176,6 +253,7 @@ class NymphPolicy:
             user_may_create_room=self.user_may_create_room,
             user_may_create_room_alias=self.user_may_create_room_alias,
             user_may_publish_room=self.user_may_publish_room,
+            check_login_for_spam=self.check_login_for_spam,
         )
         self.api.register_third_party_rules_callbacks(on_new_event=self.on_new_event)
         self.api.register_web_resource(
@@ -194,6 +272,22 @@ class NymphPolicy:
             "/_synapse/client/nymph/pairing/status",
             PairingResource(self, "status"),
         )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/device/replace",
+            PairingResource(self, "device_replace"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/device/activate",
+            PairingResource(self, "device_activate"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/device/cancel",
+            PairingResource(self, "device_cancel"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/device/recovery-check",
+            PairingResource(self, "device_recovery_check"),
+        )
 
     def allow_origin(self, request: Any) -> bool:
         origin = request.getHeader("origin")
@@ -207,22 +301,90 @@ class NymphPolicy:
         request.setHeader(b"Access-Control-Allow-Headers", b"Authorization, Content-Type")
         request.setHeader(b"Vary", b"Origin")
 
-    def current_room_id(self) -> str | None:
-        row = self.db.execute("SELECT room_id FROM nymph_room_policy WHERE id = 1").fetchone()
+    def room_id(self, pair_key: str) -> str | None:
+        table = self.pairs[pair_key]["table"]
+        row = self.db.execute(f"SELECT room_id FROM {table} WHERE id = 1").fetchone()
         return row[0] if row else None
 
-    async def on_new_event(self, event: Any, _state: Any) -> None:
-        if (
-            event.type != "m.room.create"
-            or event.sender != self.partner_a
-            or event.content.get("m.federate") is not False
-        ):
-            return
+    def current_room_id(self) -> str | None:
+        return self.room_id("legacy")
+
+    def pair_for_user(self, user_id: str) -> tuple[str, dict[str, str]] | None:
+        for pair_key, pair in self.pairs.items():
+            if user_id in {pair["partner_a"], pair["partner_b"]}:
+                return pair_key, pair
+        return None
+
+    def pair_for_room(self, room_id: str) -> tuple[str, dict[str, str]] | None:
+        for pair_key, pair in self.pairs.items():
+            if room_id == self.room_id(pair_key):
+                return pair_key, pair
+        return None
+
+    async def check_login_for_spam(
+        self,
+        user_id: str,
+        device_id: str | None,
+        _initial_display_name: str | None,
+        _request_info: Any,
+        _auth_provider_id: str | None = None,
+    ) -> str | Codes:
+        if user_id not in self.dev_users:
+            return NOT_SPAM
+        if not device_id:
+            return Codes.FORBIDDEN
 
         self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.db.execute(
-                "SELECT room_id, creation_reserved_at FROM nymph_room_policy WHERE id = 1"
+                "SELECT device_id, first_login_allowed FROM nymph_active_device WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                self.db.execute("ROLLBACK")
+                return Codes.FORBIDDEN
+            active_device_id, first_login_allowed = row
+            if active_device_id == device_id:
+                self.db.execute("COMMIT")
+                return NOT_SPAM
+
+            pending = self.db.execute(
+                "SELECT device_id, expires_at FROM nymph_pending_device WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if pending and pending[0] == device_id and pending[1] > now_ms():
+                self.db.execute("COMMIT")
+                return NOT_SPAM
+
+            if active_device_id is None and first_login_allowed:
+                self.db.execute(
+                    "UPDATE nymph_active_device SET device_id = ?, first_login_allowed = 0 WHERE user_id = ?",
+                    (device_id, user_id),
+                )
+                self.db.execute("COMMIT")
+                return NOT_SPAM
+
+            self.db.execute("ROLLBACK")
+            return Codes.FORBIDDEN
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+    async def on_new_event(self, event: Any, _state: Any) -> None:
+        if event.type != "m.room.create" or event.content.get("m.federate") is not False:
+            return
+        pair_info = self.pair_for_user(event.sender)
+        if pair_info is None:
+            return
+        pair_key, pair = pair_info
+        if event.sender != pair["partner_a"]:
+            return
+
+        table = pair["table"]
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                f"SELECT room_id, creation_reserved_at FROM {table} WHERE id = 1"
             ).fetchone()
             reserved_at = row[1] if row else None
             if (
@@ -232,7 +394,7 @@ class NymphPolicy:
                 and now_ms() - reserved_at <= ROOM_RESERVATION_TTL_MS
             ):
                 self.db.execute(
-                    "UPDATE nymph_room_policy SET room_id = ?, creation_reserved_at = NULL WHERE id = 1",
+                    f"UPDATE {table} SET room_id = ?, creation_reserved_at = NULL WHERE id = 1",
                     (event.room_id,),
                 )
             self.db.execute("COMMIT")
@@ -241,14 +403,23 @@ class NymphPolicy:
             raise
 
     async def user_may_create_room(self, user_id: str, room_config: dict[str, Any]) -> str | Codes:
-        if user_id != self.partner_a or not is_private_encrypted_room(room_config, self.partner_a, self.partner_b):
+        pair_info = self.pair_for_user(user_id)
+        if pair_info is None:
+            return Codes.FORBIDDEN
+        pair_key, pair = pair_info
+        if user_id != pair["partner_a"] or not is_private_encrypted_room(
+            room_config,
+            pair["partner_a"],
+            pair["partner_b"],
+        ):
             return Codes.FORBIDDEN
 
         now = now_ms()
+        table = pair["table"]
         self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.db.execute(
-                "SELECT room_id, creation_reserved_at FROM nymph_room_policy WHERE id = 1"
+                f"SELECT room_id, creation_reserved_at FROM {table} WHERE id = 1"
             ).fetchone()
             if row[0] is not None:
                 self.db.execute("ROLLBACK")
@@ -258,7 +429,7 @@ class NymphPolicy:
                 self.db.execute("ROLLBACK")
                 return Codes.FORBIDDEN
             self.db.execute(
-                "UPDATE nymph_room_policy SET creation_reserved_at = ? WHERE id = 1",
+                f"UPDATE {table} SET creation_reserved_at = ? WHERE id = 1",
                 (now,),
             )
             self.db.execute("COMMIT")
@@ -273,18 +444,21 @@ class NymphPolicy:
         room_id = event.room_id
         sender = event.sender
         if event_type == "m.room.create":
-            if sender != self.partner_a or content.get("m.federate") is not False:
+            pair_info = self.pair_for_user(sender)
+            if pair_info is None or sender != pair_info[1]["partner_a"] or content.get("m.federate") is not False:
                 return Codes.FORBIDDEN
+            _pair_key, pair = pair_info
+            table = pair["table"]
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 row = self.db.execute(
-                    "SELECT room_id, creation_reserved_at FROM nymph_room_policy WHERE id = 1"
+                    f"SELECT room_id, creation_reserved_at FROM {table} WHERE id = 1"
                 ).fetchone()
                 if row[0] is not None or row[1] is None or now_ms() - row[1] > ROOM_RESERVATION_TTL_MS:
                     self.db.execute("ROLLBACK")
                     return Codes.FORBIDDEN
                 self.db.execute(
-                    "UPDATE nymph_room_policy SET room_id = ?, creation_reserved_at = NULL WHERE id = 1",
+                    f"UPDATE {table} SET room_id = ?, creation_reserved_at = NULL WHERE id = 1",
                     (room_id,),
                 )
                 self.db.execute("COMMIT")
@@ -293,14 +467,16 @@ class NymphPolicy:
                 raise
             return NOT_SPAM
 
-        if room_id != self.current_room_id():
+        pair_info = self.pair_for_room(room_id)
+        if pair_info is None:
             return Codes.FORBIDDEN
+        _pair_key, pair = pair_info
         if event_type == "m.room.member":
             target = event.state_key
             membership = content.get("membership")
-            if target not in {self.partner_a, self.partner_b} or membership not in {"join", "invite", "leave"}:
+            if target not in {pair["partner_a"], pair["partner_b"]} or membership not in {"join", "invite", "leave"}:
                 return Codes.FORBIDDEN
-            if membership == "invite" and (sender != self.partner_a or target != self.partner_b):
+            if membership == "invite" and (sender != pair["partner_a"] or target != pair["partner_b"]):
                 return Codes.FORBIDDEN
             if membership in {"join", "leave"} and sender != target:
                 return Codes.FORBIDDEN
@@ -314,17 +490,17 @@ class NymphPolicy:
             if content.get("algorithm") != ROOM_ENCRYPTION:
                 return Codes.FORBIDDEN
         elif event_type == "m.room.power_levels":
-            if not self.valid_power_levels(content):
+            if not self.valid_power_levels(content, pair["partner_a"], pair["partner_b"]):
                 return Codes.FORBIDDEN
         return NOT_SPAM
 
-    def valid_power_levels(self, content: dict[str, Any]) -> bool:
+    def valid_power_levels(self, content: dict[str, Any], partner_a: str, partner_b: str) -> bool:
         users = content.get("users")
         return (
             isinstance(users, dict)
-            and users.get(self.partner_b) == 0
-            and users.get(self.partner_a, 100) == 100
-            and set(users).issubset({self.partner_a, self.partner_b})
+            and users.get(partner_b) == 0
+            and users.get(partner_a, 100) == 100
+            and set(users).issubset({partner_a, partner_b})
             and content.get("users_default", 0) == 0
             and content.get("events_default", 0) == 0
             and content.get("state_default", 100) == 100
@@ -336,21 +512,30 @@ class NymphPolicy:
         )
 
     async def user_may_join_room(self, user_id: str, room_id: str, is_invited: bool) -> str | Codes:
-        if room_id != self.current_room_id() or user_id not in {self.partner_a, self.partner_b}:
+        pair_info = self.pair_for_room(room_id)
+        if pair_info is None:
             return Codes.FORBIDDEN
-        if user_id == self.partner_b and not is_invited:
+        pair = pair_info[1]
+        if user_id not in {pair["partner_a"], pair["partner_b"]}:
+            return Codes.FORBIDDEN
+        if user_id == pair["partner_b"] and not is_invited:
             return Codes.FORBIDDEN
         return NOT_SPAM
 
     async def user_may_invite(self, inviter: str, invitee: str, room_id: str) -> str | Codes:
-        if inviter != self.partner_a or invitee != self.partner_b:
+        pair_info = self.pair_for_user(inviter)
+        if pair_info is None:
             return Codes.FORBIDDEN
-        configured_room_id = self.current_room_id()
+        pair_key, pair = pair_info
+        if inviter != pair["partner_a"] or invitee != pair["partner_b"]:
+            return Codes.FORBIDDEN
+        configured_room_id = self.room_id(pair_key)
         if configured_room_id is not None:
             return NOT_SPAM if room_id == configured_room_id else Codes.FORBIDDEN
 
+        table = pair["table"]
         reservation = self.db.execute(
-            "SELECT creation_reserved_at FROM nymph_room_policy WHERE id = 1"
+            f"SELECT creation_reserved_at FROM {table} WHERE id = 1"
         ).fetchone()
         reserved_at = reservation[0] if reservation else None
         if reserved_at is not None and now_ms() - reserved_at < ROOM_RESERVATION_TTL_MS:
@@ -363,14 +548,16 @@ class NymphPolicy:
     async def user_may_publish_room(self, user_id: str, room_id: str) -> str | Codes:
         return Codes.FORBIDDEN
 
-    async def authenticated_partner_a(self, request: Any) -> None:
+    async def authenticated_partner_a(self, request: Any) -> tuple[str, dict[str, str]]:
         requester = await self.api.get_user_by_req(request)
-        if requester.user.to_string() != self.partner_a:
-            raise SynapseError(403, "Only partner A may manage the development pairing invitation.", Codes.FORBIDDEN)
+        pair_info = self.pair_for_user(requester.user.to_string())
+        if pair_info is None or requester.user.to_string() != pair_info[1]["partner_a"]:
+            raise SynapseError(403, "Only a configured partner A may manage its pairing invitation.", Codes.FORBIDDEN)
+        return pair_info
 
     async def create_invitation(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
-        await self.authenticated_partner_a(request)
-        room_id = self.current_room_id()
+        pair_key, pair = await self.authenticated_partner_a(request)
+        room_id = self.room_id(pair_key)
         if room_id is None:
             raise SynapseError(409, "Create the private room before inviting partner B.", Codes.INVALID_PARAM)
         if payload.get("room_id") != room_id:
@@ -379,39 +566,44 @@ class NymphPolicy:
         token_hash = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
         expires_at = now_ms() + INVITATION_TTL_MS
         async with self.invitation_lock:
-            self.invitations.clear()
-            self.invitations[token_hash] = expires_at
-            self.invitation_status = "pending"
-            self.invitation_expires_at = expires_at
+            for existing_hash, (existing_pair, _existing_expiry) in list(self.invitations.items()):
+                if existing_pair == pair_key:
+                    del self.invitations[existing_hash]
+            self.invitations[token_hash] = (pair_key, expires_at)
+            self.invitation_status[pair_key] = {"status": "pending", "expires_at": expires_at}
         return {
             "version": 1,
             "homeserver": self.homeserver_url,
-            "partner_user_id": self.partner_b,
+            "partner_user_id": pair["partner_b"],
             "room_id": room_id,
             "token": raw_token,
             "expires_at": expires_at,
         }
 
     async def cancel_invitation(self, request: Any) -> dict[str, bool]:
-        await self.authenticated_partner_a(request)
+        pair_key, _pair = await self.authenticated_partner_a(request)
         async with self.invitation_lock:
-            self.invitations.clear()
-            self.invitation_status = "cancelled"
-            self.invitation_expires_at = None
+            for token_hash, (existing_pair, _expiry) in list(self.invitations.items()):
+                if existing_pair == pair_key:
+                    del self.invitations[token_hash]
+            self.invitation_status[pair_key] = {"status": "cancelled", "expires_at": None}
         return {"cancelled": True}
 
     async def get_room_status(self, request: Any) -> dict[str, Any]:
-        await self.authenticated_partner_a(request)
+        pair_key, _pair = await self.authenticated_partner_a(request)
         async with self.invitation_lock:
-            if self.invitation_status == "pending" and (
-                self.invitation_expires_at is None or self.invitation_expires_at <= now_ms()
+            status = self.invitation_status[pair_key]
+            if status["status"] == "pending" and (
+                status["expires_at"] is None or status["expires_at"] <= now_ms()
             ):
-                self.invitations.clear()
-                self.invitation_status = "expired"
+                for token_hash, (existing_pair, _expiry) in list(self.invitations.items()):
+                    if existing_pair == pair_key:
+                        del self.invitations[token_hash]
+                self.invitation_status[pair_key] = {"status": "expired", "expires_at": None}
             return {
-                "room_id": self.current_room_id(),
-                "pairing_status": self.invitation_status,
-                "expires_at": self.invitation_expires_at,
+                "room_id": self.room_id(pair_key),
+                "pairing_status": self.invitation_status[pair_key]["status"],
+                "expires_at": self.invitation_status[pair_key]["expires_at"],
             }
 
     async def redeem_invitation(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -425,22 +617,214 @@ class NymphPolicy:
             raise SynapseError(400, "Invalid invitation.", Codes.INVALID_PARAM)
         token_hash = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
         async with self.invitation_lock:
-            expires_at = self.invitations.get(token_hash)
-            if expires_at is None or expires_at <= now_ms():
+            invitation = self.invitations.get(token_hash)
+            if invitation is None or invitation[1] <= now_ms():
                 self.invitations.pop(token_hash, None)
-                self.invitation_status = "expired"
                 raise SynapseError(403, "Invitation expired or already used.", Codes.FORBIDDEN)
             del self.invitations[token_hash]
-            self.invitation_status = "redeemed"
+            pair_key, _expires_at = invitation
+            pair = self.pairs[pair_key]
+            self.invitation_status[pair_key] = {"status": "redeemed", "expires_at": None}
 
         login_token = await self.api.create_login_token(
-            self.partner_b,
+            pair["partner_b"],
             duration_in_ms=LOGIN_TOKEN_TTL_MS,
         )
         return {
             "homeserver": self.homeserver_url,
-            "partner_user_id": self.partner_b,
-            "room_id": self.current_room_id(),
+            "partner_user_id": pair["partner_b"],
+            "room_id": self.room_id(pair_key),
             "login_token": login_token,
             "expires_in_ms": LOGIN_TOKEN_TTL_MS,
         }
+
+    async def create_device_replacement(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        requester = await self.api.get_user_by_req(request)
+        user_id = requester.user.to_string()
+        if user_id not in self.dev_users:
+            raise SynapseError(403, "Device replacement is available only for development partner accounts.", Codes.FORBIDDEN)
+
+        device_id = payload.get("device_id")
+        if not isinstance(device_id, str) or not device_id or len(device_id) > 512:
+            raise SynapseError(400, "A valid replacement device ID is required.", Codes.INVALID_PARAM)
+        if device_id == getattr(requester, "device_id", None):
+            raise SynapseError(400, "The replacement must use a different device ID.", Codes.INVALID_PARAM)
+        room_id = self.room_id("dev")
+        if not room_id:
+            raise SynapseError(409, "Device replacement requires the configured development room.", Codes.INVALID_PARAM)
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT device_id FROM nymph_active_device WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None or row[0] != getattr(requester, "device_id", None):
+                self.db.execute("ROLLBACK")
+                raise SynapseError(403, "Only the active device can authorize its replacement.", Codes.FORBIDDEN)
+            pending = self.db.execute(
+                "SELECT expires_at FROM nymph_pending_device WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if pending and pending[0] > now_ms():
+                self.db.execute("ROLLBACK")
+                raise SynapseError(409, "A device replacement is already pending.", Codes.INVALID_PARAM)
+            expires_at = now_ms() + LOGIN_TOKEN_TTL_MS
+            self.db.execute(
+                "INSERT OR REPLACE INTO nymph_pending_device "
+                "(user_id, device_id, previous_device_id, expires_at, purpose) VALUES (?, ?, ?, ?, 'replace')",
+                (user_id, device_id, row[0], expires_at),
+            )
+            self.db.execute("COMMIT")
+        except SynapseError:
+            raise
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+        try:
+            login_token = await self.api.create_login_token(user_id, duration_in_ms=LOGIN_TOKEN_TTL_MS)
+        except Exception:
+            self.db.execute(
+                "DELETE FROM nymph_pending_device WHERE user_id = ? AND device_id = ? AND purpose = 'replace'",
+                (user_id, device_id),
+            )
+            raise
+
+        return {
+            "user_id": user_id,
+            "device_id": device_id,
+            "previous_device_id": row[0],
+            "room_id": room_id,
+            "login_token": login_token,
+            "expires_in_ms": LOGIN_TOKEN_TTL_MS,
+        }
+
+    async def create_recovery_verification(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        requester = await self.api.get_user_by_req(request)
+        user_id = requester.user.to_string()
+        active_device_id = getattr(requester, "device_id", None)
+        if user_id not in self.dev_users or not active_device_id:
+            raise SynapseError(403, "Recovery verification requires an authenticated development partner device.", Codes.FORBIDDEN)
+
+        device_id = payload.get("device_id")
+        if not isinstance(device_id, str) or not device_id or len(device_id) > 512:
+            raise SynapseError(400, "A valid temporary verification device ID is required.", Codes.INVALID_PARAM)
+        if device_id == active_device_id:
+            raise SynapseError(400, "Recovery verification requires a separate device ID.", Codes.INVALID_PARAM)
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            active = self.db.execute(
+                "SELECT device_id FROM nymph_active_device WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            pending = self.db.execute(
+                "SELECT expires_at FROM nymph_pending_device WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if active is None or active[0] != active_device_id:
+                self.db.execute("ROLLBACK")
+                raise SynapseError(403, "Only the active device can authorize recovery verification.", Codes.FORBIDDEN)
+            if pending and pending[0] > now_ms():
+                self.db.execute("ROLLBACK")
+                raise SynapseError(409, "Another device operation is already pending.", Codes.INVALID_PARAM)
+
+            expires_at = now_ms() + LOGIN_TOKEN_TTL_MS
+            self.db.execute(
+                "INSERT OR REPLACE INTO nymph_pending_device "
+                "(user_id, device_id, previous_device_id, expires_at, purpose) "
+                "VALUES (?, ?, ?, ?, 'recovery')",
+                (user_id, device_id, active_device_id, expires_at),
+            )
+            self.db.execute("COMMIT")
+        except SynapseError:
+            raise
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
+        try:
+            login_token = await self.api.create_login_token(user_id, duration_in_ms=LOGIN_TOKEN_TTL_MS)
+        except Exception:
+            self.db.execute(
+                "DELETE FROM nymph_pending_device WHERE user_id = ? AND device_id = ? AND purpose = 'recovery'",
+                (user_id, device_id),
+            )
+            raise
+        return {
+            "user_id": user_id,
+            "device_id": device_id,
+            "login_token": login_token,
+            "expires_in_ms": LOGIN_TOKEN_TTL_MS,
+        }
+
+    async def activate_device_replacement(self, request: Any) -> dict[str, bool]:
+        requester = await self.api.get_user_by_req(request)
+        user_id = requester.user.to_string()
+        device_id = getattr(requester, "device_id", None)
+        if user_id not in self.dev_users or not device_id:
+            raise SynapseError(403, "Only an authenticated development partner device can be activated.", Codes.FORBIDDEN)
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            pending = self.db.execute(
+                "SELECT device_id, expires_at, purpose FROM nymph_pending_device WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if pending is None:
+                active = self.db.execute(
+                    "SELECT device_id FROM nymph_active_device WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()
+                if active and active[0] == device_id:
+                    self.db.execute("COMMIT")
+                    return {"activated": True}
+            if not pending or pending[0] != device_id or pending[2] != "replace":
+                self.db.execute("ROLLBACK")
+                raise SynapseError(403, "This device has no active replacement authorization.", Codes.FORBIDDEN)
+            self.db.execute(
+                "UPDATE nymph_active_device SET device_id = ?, first_login_allowed = 0 WHERE user_id = ?",
+                (device_id, user_id),
+            )
+            self.db.execute("DELETE FROM nymph_pending_device WHERE user_id = ?", (user_id,))
+            self.db.execute("COMMIT")
+        except SynapseError:
+            raise
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return {"activated": True}
+
+    async def cancel_device_replacement(self, request: Any) -> dict[str, bool]:
+        requester = await self.api.get_user_by_req(request)
+        user_id = requester.user.to_string()
+        device_id = getattr(requester, "device_id", None)
+        if user_id not in self.dev_users or not device_id:
+            raise SynapseError(403, "Only an authenticated development partner device can cancel replacement.", Codes.FORBIDDEN)
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            pending = self.db.execute(
+                "SELECT device_id, previous_device_id, expires_at, purpose FROM nymph_pending_device WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if not pending:
+                self.db.execute("ROLLBACK")
+                raise SynapseError(403, "There is no active device replacement to cancel.", Codes.FORBIDDEN)
+            if device_id not in {pending[0], pending[1]}:
+                self.db.execute("ROLLBACK")
+                raise SynapseError(403, "This device cannot cancel the pending replacement.", Codes.FORBIDDEN)
+            if pending[3] == "replace":
+                self.db.execute(
+                    "UPDATE nymph_active_device SET device_id = ? WHERE user_id = ?",
+                    (pending[1], user_id),
+                )
+            self.db.execute("DELETE FROM nymph_pending_device WHERE user_id = ?", (user_id,))
+            self.db.execute("COMMIT")
+        except SynapseError:
+            raise
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        return {"cancelled": True}

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent } from 'react';
 import QRCode from 'qrcode';
 import { decryptRecoveryExport, encryptRecoveryExport } from './recovery-export';
+import { PARTNER_IDENTITIES } from './partner-identity';
 import type {
   MatrixMessagingClient,
   MatrixSecurityState,
@@ -353,9 +354,9 @@ export function MatrixSecurityPanel({
             <input ref={recoveryImportRef} type="file" accept=".enc,application/json" hidden onChange={(event) => void importEncryptedRecoveryFile(event)} />
             <label className="field-label">Partner account to manage
               <select value={partnerSelection} onChange={(event) => setPartnerSelection(event.target.value)} disabled={!client || busy}>
-                <option value="@partner1:localhost">Partner A · @partner1:localhost</option>
-                <option value="@partner2:localhost">Partner B · @partner2:localhost</option>
-                {!['@partner1:localhost', '@partner2:localhost'].includes(security.userId) && <option value={security.userId}>{security.userId} · current session</option>}
+                <option value={PARTNER_IDENTITIES.partnerA}>Partner A · {PARTNER_IDENTITIES.partnerA}</option>
+                <option value={PARTNER_IDENTITIES.partnerB}>Partner B · {PARTNER_IDENTITIES.partnerB}</option>
+                {![PARTNER_IDENTITIES.partnerA, PARTNER_IDENTITIES.partnerB].includes(security.userId) && <option value={security.userId}>{security.userId} · current session</option>}
               </select>
             </label>
             <p>This security session belongs to <b>{security.userId}</b>. Recovery keys are account-specific and are never sent to the other partner.</p>

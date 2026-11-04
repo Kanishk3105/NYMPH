@@ -8,6 +8,8 @@ import { connectMatrix, type MatrixConnection, type MatrixMessagingClient, type 
 import { PairingPanel } from './matrix/PairingPanel';
 import { MatrixSecurityPanel } from './matrix/MatrixSecurityPanel';
 import { getDefaultHomeserver } from './matrix/homeserver';
+import { PARTNER_DEVICE_IDS, PARTNER_IDENTITIES } from './matrix/partner-identity';
+import { DEMO_STATE_STORAGE_KEY, getMatrixDeviceStorageKey, getNymphStateStorageKey } from './matrix/state-storage';
 import { getMatrixCryptoStorageKey, loadMatrixSession, removeMatrixSession, saveMatrixSession } from './native/secureSession';
 import './styles.css';
 
@@ -45,7 +47,6 @@ type LocalState = {
   recent: string[];
 };
 
-const STORAGE_KEY = 'nymph.local.v1';
 const DEFAULT_HOMESERVER = getDefaultHomeserver({
   configured: import.meta.env.VITE_MATRIX_HOMESERVER,
   mode: import.meta.env.MODE,
@@ -90,10 +91,13 @@ const defaultState: LocalState = {
   recent: [],
 };
 
-function readState(): LocalState {
+function readState(
+  storageKey = DEMO_STATE_STORAGE_KEY,
+  useDemoMessages = storageKey === DEMO_STATE_STORAGE_KEY,
+): LocalState {
   try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (!stored) return defaultState;
+    const stored = localStorage.getItem(storageKey);
+    if (!stored) return useDemoMessages ? defaultState : { ...defaultState, messages: [] };
     return { ...defaultState, ...JSON.parse(stored) as Partial<LocalState> };
   } catch (error) {
     console.error('Could not restore local NYMPH demo state.', error);
@@ -124,6 +128,7 @@ function decode(text: string): Uint8Array {
 
 function App() {
   const [data, setData] = useState<LocalState>(readState);
+  const [stateScope, setStateScope] = useState(DEMO_STATE_STORAGE_KEY);
   const [mode, setMode] = useState<Mode>('romantic');
   const [panel, setPanel] = useState<Panel>(null);
   const [draft, setDraft] = useState('');
@@ -135,7 +140,8 @@ function App() {
   const [matrixSync, setMatrixSync] = useState('');
   const [matrixSecurity, setMatrixSecurity] = useState<MatrixSecurityState | null>(null);
   const [matrixVerification, setMatrixVerification] = useState<MatrixVerification | null>(null);
-  const [pairingRole, setPairingRole] = useState<'partner-a' | 'partner-b' | null>(null);
+  const [pairingRole, setPairingRole] = useState<'partner-a' | 'partner-b' | 'replace-device' | null>(null);
+  const [replacementActivationPending, setReplacementActivationPending] = useState(false);
   const [partnerTyping, setPartnerTyping] = useState(false);
   const [locked, setLocked] = useState(false);
   const [pinValue, setPinValue] = useState('');
@@ -170,12 +176,12 @@ function App() {
       ...data,
       messages: data.messages.filter((message) => message.transport !== 'matrix' && message.kind !== 'media' && !(message.kind === 'sticker' && message.image)),
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(persistent));
+      localStorage.setItem(stateScope, JSON.stringify(persistent));
     } catch (error) {
       console.error('Could not save NYMPH demo state on this device.', error);
       setToast('Could not save local changes. Device storage may be full.');
     }
-  }, [data]);
+  }, [data, stateScope]);
   useEffect(() => () => matrixClient.current?.close(), []);
   useEffect(() => {
     if (!Capacitor.isNativePlatform()) return;
@@ -198,7 +204,7 @@ function App() {
       if (!isActive && data.roomReady) setLocked(true);
     });
     const backButtonListener = CapacitorApp.addListener('backButton', () => {
-      if (pairingRole) setPairingRole(null);
+      if (pairingRole && !replacementActivationPending) setPairingRole(null);
       else if (panel) setPanel(null);
       else void CapacitorApp.minimizeApp();
     });
@@ -206,7 +212,7 @@ function App() {
       void appStateListener.then((listener) => listener.remove());
       void backButtonListener.then((listener) => listener.remove());
     };
-  }, [data.roomReady, pairingRole, panel]);
+  }, [data.roomReady, pairingRole, panel, replacementActivationPending]);
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [mode, data.messages]);
@@ -329,6 +335,10 @@ function App() {
         notify('This release has no Matrix homeserver configured. Set VITE_MATRIX_HOMESERVER and rebuild.');
         return;
       }
+      if (!PARTNER_IDENTITIES.partnerA || !PARTNER_IDENTITIES.partnerB) {
+        notify('This release has no Matrix partner identities configured.');
+        return;
+      }
       if (!matrixPassword) {
         notify('Enter the Partner 1 password.');
         return;
@@ -350,14 +360,19 @@ function App() {
         }
         const sdk = await import('matrix-js-sdk');
         loginClient = sdk.createClient({ baseUrl: homeserver.origin });
+        const deviceId = localStorage.getItem(getMatrixDeviceStorageKey(PARTNER_IDENTITIES.partnerA)) ||
+          PARTNER_DEVICE_IDS.partnerA ||
+          crypto.randomUUID();
         const session = await loginClient.login('m.login.password', {
-          identifier: { type: 'm.id.user', user: '@partner1:localhost' },
+          identifier: { type: 'm.id.user', user: PARTNER_IDENTITIES.partnerA },
           password: matrixPassword,
           initial_device_display_name: 'NYMPH Partner 1',
+          device_id: deviceId,
         });
         accessToken = session.access_token;
         loginClient.stopClient();
-        if (session.user_id !== '@partner1:localhost') throw new Error('This login is not the configured Partner 1 identity.');
+        if (session.user_id !== PARTNER_IDENTITIES.partnerA) throw new Error('This login is not the configured Partner 1 identity.');
+        if (session.device_id) localStorage.setItem(getMatrixDeviceStorageKey(session.user_id), session.device_id);
         const statusResponse = await fetch(`${homeserver.origin}/_synapse/client/nymph/pairing/status`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -372,7 +387,7 @@ function App() {
         const connection: MatrixConnection = {
           homeserver: homeserver.origin,
           userId: session.user_id,
-          partnerUserId: '@partner2:localhost',
+          partnerUserId: PARTNER_IDENTITIES.partnerB,
           accessToken,
           roomId: status.room_id,
           deviceId: session.device_id,
@@ -411,6 +426,9 @@ function App() {
         deviceId,
         ...(storageKey ? { storageKey } : {}),
       };
+      const accountScope = getNymphStateStorageKey(connection.userId);
+      setStateScope(accountScope);
+      setData(readState(accountScope, false));
       const connected = await connectMatrix(
         persistentConnection,
         (event) => {
@@ -454,10 +472,6 @@ function App() {
       }
       matrixClient.current = connected;
       setMatrixConnection({ ...connection, deviceId });
-      setData((current) => ({
-        ...current,
-        messages: current.messages.filter((item) => item.transport !== 'matrix'),
-      }));
       setMatrixStatus(`Encrypted · ${connected.userId}`);
       setPanel(null);
       setPairingRole(null);
@@ -739,7 +753,7 @@ function App() {
       </section></div>}
       {panel === 'mood' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet mood-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">A QUIET LITTLE SIGNAL</div><h2>How are you feeling right now?</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><p className="sheet-intro">Choose a mood. Your partner can reply with a note, a reaction, or a mood of their own.</p><div className="mood-grid">{moodOptions.map(([label, emoji]) => <button key={`${label}${emoji}`} className="mood-option" onClick={() => sendMood(label, emoji)}><span>{emoji}</span><b>{label}</b></button>)}</div><div className="custom-mood"><input placeholder="Add your own mood…" value={customMood} onChange={(event) => setCustomMood(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && customMood.trim() && sendMood(customMood.trim(), '♡')} /><button onClick={() => customMood.trim() && sendMood(customMood.trim(), '♡')}>Send mood</button></div><div className="discreet-note">Lock-screen notifications are not configured in this local demo.</div></section></div>}
       {panel === 'profile' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet detail-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">YOUR PRIVATE PROFILE</div><h2>A little about you</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><div className="profile-cover"><div className="profile-avatar-big">{profileDraft.avatar}</div><span>Just between the two of you</span></div><label className="field-label">Display name<input value={profileDraft.displayName} onChange={(event) => setProfileDraft({ ...profileDraft, displayName: event.target.value })} /></label><label className="field-label">Username<input value={profileDraft.username} onChange={(event) => setProfileDraft({ ...profileDraft, username: event.target.value })} /></label><label className="field-label">Bio<textarea value={profileDraft.bio} onChange={(event) => setProfileDraft({ ...profileDraft, bio: event.target.value })} /></label><label className="field-label">Avatar initials<input maxLength={2} value={profileDraft.avatar} onChange={(event) => setProfileDraft({ ...profileDraft, avatar: event.target.value.toUpperCase() })} /></label><div className="partner-info">Paired partner <b>{data.partnerName}</b><span>Private room · two identities</span></div><button className="primary full-button" onClick={() => { setData((current) => ({ ...current, profile: profileDraft })); setPanel(null); notify('Profile saved on this device.'); }}>Save profile</button></section></div>}
-      {panel === 'settings' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet detail-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">YOUR ROOM, YOUR RULES</div><h2>Privacy & settings</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><button className="matrix-connect-card" onClick={() => setPanel('matrix')}><span className="matrix-lock">⌑</span><span><b>{matrixClient.current ? 'Encrypted room connected' : 'Connect an encrypted room'}</b><small>{matrixClient.current ? matrixStatus : 'Self-hosted Matrix · Rust-backed E2EE'}</small></span><i>↗</i></button><label className="field-label">Message retention<select value={data.retention} onChange={(event) => setData((current) => ({ ...current, retention: event.target.value }))}>{['Never', '1 hour', '24 hours', '7 days', '30 days', 'Custom'].map((value) => <option key={value}>{value}</option>)}</select></label><div className="setting-control"><div><b>View once media timer</b><span>Local preview only; not secure expiration.</span></div><select value={viewOnceSeconds} onChange={(event) => setViewOnceSeconds(event.target.value)}>{['Off', '5', '10', '15', '30', '60'].map((value) => <option key={value} value={value}>{value === 'Off' ? 'Off' : `${value} seconds`}</option>)}</select></div><div className="setting-control"><div><b>Hide adult timeline when leaving Kinky</b><span>Adult messages stay in their own mode.</span></div><span className="enabled-pill">On</span></div><div className="setting-control"><div><b>Lock on background</b><span>Requires PIN again when you return.</span></div><span className="enabled-pill">On</span></div><div className="discreet-note">Screenshot protection, biometric unlock, push notifications, device revocation and server-side retention need native Android integration.</div><button className="secondary full-button" onClick={() => { setPanel(null); setLocked(true); }}>Lock this device now</button><button className="text-danger" onClick={() => { if (window.confirm('Delete all local demo data from this browser?')) { localStorage.removeItem(STORAGE_KEY); location.reload(); } }}>Delete local demo data</button></section></div>}
+      {panel === 'settings' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet detail-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">YOUR ROOM, YOUR RULES</div><h2>Privacy & settings</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><button className="matrix-connect-card" onClick={() => setPanel('matrix')}><span className="matrix-lock">⌑</span><span><b>{matrixClient.current ? 'Encrypted room connected' : 'Connect an encrypted room'}</b><small>{matrixClient.current ? matrixStatus : 'Self-hosted Matrix · Rust-backed E2EE'}</small></span><i>↗</i></button><label className="field-label">Message retention<select value={data.retention} onChange={(event) => setData((current) => ({ ...current, retention: event.target.value }))}>{['Never', '1 hour', '24 hours', '7 days', '30 days', 'Custom'].map((value) => <option key={value}>{value}</option>)}</select></label><div className="setting-control"><div><b>View once media timer</b><span>Local preview only; not secure expiration.</span></div><select value={viewOnceSeconds} onChange={(event) => setViewOnceSeconds(event.target.value)}>{['Off', '5', '10', '15', '30', '60'].map((value) => <option key={value} value={value}>{value === 'Off' ? 'Off' : `${value} seconds`}</option>)}</select></div><div className="setting-control"><div><b>Hide adult timeline when leaving Kinky</b><span>Adult messages stay in their own mode.</span></div><span className="enabled-pill">On</span></div><div className="setting-control"><div><b>Lock on background</b><span>Requires PIN again when you return.</span></div><span className="enabled-pill">On</span></div>      <div className="discreet-note">Screenshot protection, biometric unlock, push notifications, device revocation and server-side retention need native Android integration.</div><button className="secondary full-button" onClick={() => { setPanel(null); setLocked(true); }}>Lock this device now</button><button className="text-danger" onClick={() => { if (window.confirm('Delete all local data for this account from this browser?')) { localStorage.removeItem(stateScope); location.reload(); } }}>Delete local data for this account</button></section></div>}
       {panel === 'gallery' && <div className="sheet-backdrop" onClick={() => setPanel(null)}><section className="sheet gallery-sheet" onClick={(event) => event.stopPropagation()}><div className="sheet-handle" /><div className="sheet-title"><div><div className="eyebrow">ONLY YOUR SHARED MOMENTS</div><h2>Private gallery</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div><div className="gallery-tabs">{['All', 'Photos', 'Videos', 'Favourites', 'Expiring'].map((filter) => <button key={filter} className={galleryFilter === filter ? 'active' : ''} onClick={() => setGalleryFilter(filter)}>{filter}</button>)}</div><div className="gallery-grid">{galleryMessages.map((item) => <button key={item.id} className="gallery-item" onClick={() => item.image && setPreview({ url: item.image, name: item.text, type: item.mediaType ?? 'image/*' })}>{item.mediaType?.startsWith('video/') ? <video src={item.image} /> : <img src={item.image} alt="Shared media" />}{item.viewSeconds && <span>VIEW ONCE · {item.viewSeconds}s</span>}</button>)}</div>{galleryMessages.length === 0 && <div className="gallery-empty large"><span>✧</span><h3>Moments, kept close.</h3><p>Photos and videos you share will appear here. Your imports stay on this device in this demo.</p><button className="secondary" onClick={() => fileInput.current?.click()}>Choose a photo or video</button></div>}</section></div>}
       {preview && <div className="viewer-backdrop" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}><div className="viewer" onClick={(event) => event.stopPropagation()}><button className="close-button viewer-close" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}>×</button>{preview.type.startsWith('video/') ? <video src={preview.url} controls autoPlay /> : <img src={preview.url} alt="Media preview" />}<div className="viewer-footer"><span>{preview.name}</span><label>View once<select value={viewOnceSeconds} onChange={(event) => setViewOnceSeconds(event.target.value)}>{['Off', '5', '10', '15', '30', '60'].map((value) => <option key={value}>{value === 'Off' ? 'Off' : `${value} seconds`}</option>)}</select></label><button className="primary" onClick={sendMedia}>Send privately ↗</button><button className="secondary" onClick={() => { URL.revokeObjectURL(preview.url); setPreview(null); }}>Cancel</button></div></div></div>}
       {exitMode && <div className="dialog-backdrop"><section className="dialog"><div className="dialog-symbol">♠</div><div className="eyebrow">LEAVING KINKY · 18+</div><h2>Back to your other room?</h2><p>Your adult conversation will be hidden from the normal timeline. It will still be here when you return.</p><label className="delete-option"><input type="checkbox" checked={deleteAdult} onChange={(event) => setDeleteAdult(event.target.checked)} /><span><b>Permanently delete this mode’s local messages</b><small>This is local demo data only. Remote media/key deletion is not available here.</small></span></label><div className="dialog-actions"><button className="secondary" onClick={() => setExitMode(null)}>Stay here</button><button className="primary" onClick={() => confirmExit(deleteAdult)}>Leave mode</button></div></section></div>}
@@ -748,9 +762,9 @@ function App() {
           <div className="sheet-handle" />
           <div className="sheet-title"><div><div className="eyebrow">PRIVATE MESSAGE RELAY</div><h2>Encrypted room</h2></div><button className="close-button" onClick={() => setPanel(null)}>×</button></div>
           <div className={`matrix-status ${matrixClient.current ? 'online' : ''}`}><i />{matrixStatus}<small> · {matrixSync}</small></div>
-          <p className="matrix-explainer">Partner 1 signs in once; Partner 2 joins only by scanning the short-lived QR. Android saves the Matrix session and an encrypted-store key in Keystore-protected storage. Browser sessions remain memory-only. Sending requires cross-signing trust.</p>
+          <p className="matrix-explainer">Partner 1 signs in once; Partner 2 joins only by scanning the short-lived QR. The local development policy is designed for one active device per partner; replacement revokes the old device before encrypted sync starts. Android saves the Matrix session and an encrypted-store key in Keystore-protected storage. Browser sessions remain memory-only. Sending requires cross-signing trust.</p>
           <label className="field-label">Homeserver URL<input autoComplete="url" placeholder="https://matrix.example.com" value={matrixConnection.homeserver} onChange={(event) => setMatrixConnection({ ...matrixConnection, homeserver: event.target.value })} /></label>
-          {matrixConnection.userId === '@partner2:localhost' && matrixConnection.accessToken
+          {matrixConnection.userId === PARTNER_IDENTITIES.partnerB && matrixConnection.accessToken
             ? <button className="primary full-button" onClick={() => void connectPrivateRoom()}>{matrixClient.current ? 'Disconnect encrypted room' : 'Reconnect this paired device'}</button>
             : <>
               <label className="field-label">Partner 1 password<input type="password" autoComplete="current-password" value={matrixPassword} onChange={(event) => setMatrixPassword(event.target.value)} /></label>
@@ -758,8 +772,13 @@ function App() {
               <button className="primary full-button" onClick={() => void connectPrivateRoom()}>{matrixClient.current ? 'Disconnect encrypted room' : 'Sign in as Partner 1'}</button>
             </>}
           <div className="pairing-actions">
-            <button className="secondary" disabled={!matrixClient.current || matrixConnection.userId !== '@partner1:localhost'} onClick={() => { setPairingRole('partner-a'); setPanel(null); }}>Create partner QR</button>
+            <button className="secondary" disabled={!matrixClient.current || matrixConnection.userId !== PARTNER_IDENTITIES.partnerA} onClick={() => { setPairingRole('partner-a'); setPanel(null); }}>Create partner QR</button>
             <button className="secondary" onClick={() => { setPairingRole('partner-b'); setPanel(null); }}>Scan partner QR</button>
+            <button
+              className="secondary"
+              disabled={!matrixClient.current || ![PARTNER_IDENTITIES.partnerA, PARTNER_IDENTITIES.partnerB].includes(matrixConnection.userId)}
+              onClick={() => { setPairingRole('replace-device'); setPanel(null); }}
+            >Authorize device replacement</button>
           </div>
           <MatrixSecurityPanel
             client={matrixClient.current}
@@ -778,10 +797,14 @@ function App() {
         credentials={matrixConnection}
         client={matrixClient.current}
         onEnrolled={(connection) => {
+          setReplacementActivationPending(false);
           setPairingRole(null);
           void connectPrivateRoom(connection);
         }}
-        onClose={() => setPairingRole(null)}
+        onActivationPending={setReplacementActivationPending}
+        onClose={() => {
+          if (!replacementActivationPending) setPairingRole(null);
+        }}
       />}
       {toast && <div className="toast"><span>♡</span>{toast}</div>}
       {moodCard && <div className="dialog-backdrop" onClick={() => setMoodCard(null)}><section className="mood-received-card" onClick={(event) => event.stopPropagation()}><button className="close-button" onClick={() => setMoodCard(null)}>×</button><div className="mood-received-emoji">{moodCard.emoji}</div><div className="eyebrow">A LITTLE SIGNAL FROM YOU</div><h2>{moodCard.label}</h2><p>Your mood is saved in this device’s private room. A real partner notification needs the messaging backend.</p><div className="mood-reply-actions"><button className="secondary" onClick={() => { const latestMood = [...data.messages].reverse().find((item) => item.kind === 'mood' && item.text === `${moodCard.emoji} ${moodCard.label}`); if (latestMood) updateMessages((items) => items.map((item) => item.id === latestMood.id ? { ...item, reaction: '❤️' } : item)); setMoodCard(null); notify('Heart reaction added locally.'); }}>React ❤️</button><button className="secondary" onClick={() => { setMoodCard(null); setPanel('mood'); }}>Reply with a mood</button><button className="primary" onClick={() => { setMoodCard(null); setPanel(null); }}>Open chat</button></div></section></div>}

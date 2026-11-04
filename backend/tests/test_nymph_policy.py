@@ -12,7 +12,10 @@ from nymph_policy import NymphPolicy, is_private_encrypted_room, now_ms
 
 PARTNER_A = "@partner1:localhost"
 PARTNER_B = "@partner2:localhost"
+DEV_PARTNER_A = "@partner1-dev:localhost"
+DEV_PARTNER_B = "@partner2-dev:localhost"
 ROOM_ID = "!private:localhost"
+DEV_ROOM_ID = "!private-dev:localhost"
 
 
 def valid_room_config() -> dict:
@@ -43,12 +46,22 @@ def valid_room_config() -> dict:
     }
 
 
+def valid_dev_room_config() -> dict:
+    config = valid_room_config()
+    config["invite"] = [DEV_PARTNER_B]
+    config["initial_state"][-1]["content"]["users"] = {DEV_PARTNER_B: 0}
+    return config
+
+
 class FakeApi:
     def __init__(self) -> None:
         self.login_token_count = 0
+        self.user_id = PARTNER_A
+        self.device_id = None
+        self.registered_callbacks = {}
 
-    def register_spam_checker_callbacks(self, **_callbacks) -> None:
-        pass
+    def register_spam_checker_callbacks(self, **callbacks) -> None:
+        self.registered_callbacks.update(callbacks)
 
     def register_third_party_rules_callbacks(self, **_callbacks) -> None:
         pass
@@ -57,7 +70,10 @@ class FakeApi:
         pass
 
     async def get_user_by_req(self, _request):
-        return SimpleNamespace(user=SimpleNamespace(to_string=lambda: PARTNER_A))
+        return SimpleNamespace(
+            user=SimpleNamespace(to_string=lambda: self.user_id),
+            device_id=self.device_id,
+        )
 
     async def create_login_token(self, user_id: str, duration_in_ms: int) -> str:
         self.login_token_count += 1
@@ -73,6 +89,8 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
             {
                 "partner_a_user_id": PARTNER_A,
                 "partner_b_user_id": PARTNER_B,
+                "dev_partner_a_user_id": DEV_PARTNER_A,
+                "dev_partner_b_user_id": DEV_PARTNER_B,
                 "homeserver_url": "http://localhost:8008",
                 "app_origins": "http://localhost:5173,https://localhost",
                 "state_path": str(Path(self.temp_dir.name) / "policy.sqlite3"),
@@ -99,6 +117,23 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
             {},
         )
 
+    async def reserve_dev_room(self) -> None:
+        self.assertEqual(
+            await self.policy.user_may_create_room(DEV_PARTNER_A, valid_dev_room_config()),
+            NOT_SPAM,
+        )
+
+    async def record_dev_room(self) -> None:
+        await self.reserve_dev_room()
+        await self.policy.check_event_for_spam(
+            SimpleNamespace(
+                type="m.room.create",
+                sender=DEV_PARTNER_A,
+                content={"m.federate": False},
+                room_id=DEV_ROOM_ID,
+            ),
+        )
+
     def test_requires_private_non_federatable_encrypted_room(self) -> None:
         self.assertTrue(is_private_encrypted_room(valid_room_config(), PARTNER_A, PARTNER_B))
 
@@ -106,7 +141,7 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
         invalid["initial_state"][0]["content"]["algorithm"] = "m.megolm.v1.aes-sha2-weak"
         self.assertFalse(is_private_encrypted_room(invalid, PARTNER_A, PARTNER_B))
 
-    async def test_only_partner_a_can_reserve_the_single_room(self) -> None:
+    async def test_each_partner_a_can_reserve_only_its_private_room(self) -> None:
         self.assertEqual(
             await self.policy.user_may_create_room(PARTNER_B, valid_room_config()),
             Codes.FORBIDDEN,
@@ -135,6 +170,30 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.policy.user_may_invite(PARTNER_A, "@third:localhost", ROOM_ID), Codes.FORBIDDEN)
         self.assertEqual(await self.policy.user_may_invite(PARTNER_B, PARTNER_A, ROOM_ID), Codes.FORBIDDEN)
 
+    async def test_legacy_and_dev_rooms_are_independent_and_preserve_legacy_membership(self) -> None:
+        await self.record_room()
+        await self.record_dev_room()
+
+        self.assertEqual(self.policy.current_room_id(), ROOM_ID)
+        self.assertEqual(self.policy.room_id("dev"), DEV_ROOM_ID)
+        self.assertEqual(await self.policy.user_may_join_room(PARTNER_A, ROOM_ID, False), NOT_SPAM)
+        self.assertEqual(await self.policy.user_may_join_room(PARTNER_B, ROOM_ID, True), NOT_SPAM)
+        self.assertEqual(await self.policy.user_may_join_room(DEV_PARTNER_A, ROOM_ID, True), Codes.FORBIDDEN)
+        self.assertEqual(await self.policy.user_may_join_room(DEV_PARTNER_B, ROOM_ID, True), Codes.FORBIDDEN)
+        self.assertEqual(await self.policy.user_may_join_room(DEV_PARTNER_A, DEV_ROOM_ID, False), NOT_SPAM)
+        self.assertEqual(await self.policy.user_may_join_room(DEV_PARTNER_B, DEV_ROOM_ID, True), NOT_SPAM)
+        self.assertEqual(await self.policy.user_may_join_room(PARTNER_A, DEV_ROOM_ID, True), Codes.FORBIDDEN)
+        self.assertEqual(await self.policy.user_may_join_room("@third:localhost", DEV_ROOM_ID, True), Codes.FORBIDDEN)
+
+    async def test_each_room_rejects_cross_pair_and_third_party_invites(self) -> None:
+        await self.record_room()
+        await self.record_dev_room()
+        self.assertEqual(await self.policy.user_may_invite(PARTNER_A, PARTNER_B, ROOM_ID), NOT_SPAM)
+        self.assertEqual(await self.policy.user_may_invite(DEV_PARTNER_A, DEV_PARTNER_B, DEV_ROOM_ID), NOT_SPAM)
+        self.assertEqual(await self.policy.user_may_invite(PARTNER_A, DEV_PARTNER_B, ROOM_ID), Codes.FORBIDDEN)
+        self.assertEqual(await self.policy.user_may_invite(DEV_PARTNER_A, PARTNER_B, DEV_ROOM_ID), Codes.FORBIDDEN)
+        self.assertEqual(await self.policy.user_may_invite(DEV_PARTNER_A, "@third:localhost", DEV_ROOM_ID), Codes.FORBIDDEN)
+
     async def test_pairing_invitation_is_single_use_and_login_token_is_short_lived(self) -> None:
         await self.record_room()
         invitation = await self.policy.create_invitation(object(), {"room_id": ROOM_ID})
@@ -150,7 +209,7 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_pairing_invitation_is_rejected(self) -> None:
         raw_token = "expired-invitation-token-which-is-long-enough"
         token_hash = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
-        self.policy.invitations[token_hash] = now_ms() - 1
+        self.policy.invitations[token_hash] = ("legacy", now_ms() - 1)
 
         with self.assertRaises(SynapseError) as error:
             await self.policy.redeem_invitation({"token": raw_token})
@@ -167,6 +226,125 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.policy.cancel_invitation(object()), {"cancelled": True})
         status = await self.policy.get_room_status(object())
         self.assertEqual(status["pairing_status"], "cancelled")
+
+    async def test_dev_pairing_uses_its_own_room_and_partner_identity(self) -> None:
+        await self.record_dev_room()
+        self.api.user_id = DEV_PARTNER_A
+        invitation = await self.policy.create_invitation(object(), {"room_id": DEV_ROOM_ID})
+        paired = await self.policy.redeem_invitation({"token": invitation["token"]})
+
+        self.assertEqual(invitation["partner_user_id"], DEV_PARTNER_B)
+        self.assertEqual(paired["partner_user_id"], DEV_PARTNER_B)
+        self.assertEqual(paired["room_id"], DEV_ROOM_ID)
+        self.assertEqual(self.api.login_token_count, 1)
+
+    async def test_dev_login_admits_one_active_device_and_replacement_only(self) -> None:
+        await self.record_dev_room()
+        callback = self.api.registered_callbacks["check_login_for_spam"]
+        first_device = "dev-first"
+        second_device = "dev-second"
+
+        self.assertEqual(await callback(DEV_PARTNER_A, first_device, None, [], None), NOT_SPAM)
+        self.assertEqual(await callback(DEV_PARTNER_A, first_device, None, [], None), NOT_SPAM)
+        self.assertEqual(await callback(DEV_PARTNER_A, second_device, None, [], None), Codes.FORBIDDEN)
+
+        self.api.user_id = DEV_PARTNER_A
+        self.api.device_id = first_device
+        replacement = await self.policy.create_device_replacement(object(), {"device_id": second_device})
+        self.assertEqual(replacement["device_id"], second_device)
+        self.assertEqual(replacement["room_id"], DEV_ROOM_ID)
+        self.assertEqual(await callback(DEV_PARTNER_A, second_device, None, [], None), NOT_SPAM)
+        self.assertEqual(await callback(DEV_PARTNER_A, first_device, None, [], None), NOT_SPAM)
+        active = self.policy.db.execute(
+            "SELECT device_id FROM nymph_active_device WHERE user_id = ?",
+            (DEV_PARTNER_A,),
+        ).fetchone()[0]
+        self.assertEqual(active, first_device)
+
+        self.api.device_id = second_device
+        self.assertEqual(await self.policy.activate_device_replacement(object()), {"activated": True})
+        self.assertEqual(await self.policy.activate_device_replacement(object()), {"activated": True})
+        self.assertEqual(await callback(DEV_PARTNER_A, first_device, None, [], None), Codes.FORBIDDEN)
+
+    async def test_pending_replacement_can_be_cancelled_by_either_authorized_device(self) -> None:
+        await self.record_dev_room()
+        callback = self.api.registered_callbacks["check_login_for_spam"]
+        self.assertEqual(await callback(DEV_PARTNER_A, "active-device", None, [], None), NOT_SPAM)
+        self.api.user_id = DEV_PARTNER_A
+        self.api.device_id = "active-device"
+        await self.policy.create_device_replacement(object(), {"device_id": "replacement"})
+        self.api.device_id = "replacement"
+        self.assertEqual(await self.policy.cancel_device_replacement(object()), {"cancelled": True})
+        self.assertEqual(await callback(DEV_PARTNER_A, "active-device", None, [], None), NOT_SPAM)
+        self.assertEqual(await callback(DEV_PARTNER_A, "replacement", None, [], None), Codes.FORBIDDEN)
+
+    async def test_authenticated_replacement_can_activate_after_login_token_expiry(self) -> None:
+        await self.record_dev_room()
+        callback = self.api.registered_callbacks["check_login_for_spam"]
+        self.assertEqual(await callback(DEV_PARTNER_A, "active-device", None, [], None), NOT_SPAM)
+        self.api.user_id = DEV_PARTNER_A
+        self.api.device_id = "active-device"
+        await self.policy.create_device_replacement(object(), {"device_id": "replacement"})
+        self.assertEqual(await callback(DEV_PARTNER_A, "replacement", None, [], None), NOT_SPAM)
+        self.policy.db.execute(
+            "UPDATE nymph_pending_device SET expires_at = ? WHERE user_id = ?",
+            (now_ms() - 1, DEV_PARTNER_A),
+        )
+
+        self.api.device_id = "replacement"
+        self.assertEqual(await self.policy.activate_device_replacement(object()), {"activated": True})
+        self.assertEqual(await callback(DEV_PARTNER_A, "active-device", None, [], None), Codes.FORBIDDEN)
+
+    async def test_device_replacement_requires_the_current_active_device(self) -> None:
+        await self.record_dev_room()
+        callback = self.api.registered_callbacks["check_login_for_spam"]
+        self.assertEqual(await callback(DEV_PARTNER_A, "active-device", None, [], None), NOT_SPAM)
+        self.api.user_id = DEV_PARTNER_A
+        self.api.device_id = "different-device"
+        with self.assertRaises(SynapseError) as error:
+            await self.policy.create_device_replacement(object(), {"device_id": "replacement"})
+        self.assertEqual(error.exception.code, 403)
+
+    async def test_recovery_verifier_is_authorized_by_active_device_but_cannot_replace_it(self) -> None:
+        callback = self.api.registered_callbacks["check_login_for_spam"]
+        active_device = "active-device"
+        verifier_device = "temporary-verifier"
+        self.assertEqual(await callback(DEV_PARTNER_A, active_device, None, [], None), NOT_SPAM)
+
+        self.api.user_id = DEV_PARTNER_A
+        self.api.device_id = active_device
+        authorization = await self.policy.create_recovery_verification(
+            object(),
+            {"device_id": verifier_device},
+        )
+        self.assertEqual(authorization["user_id"], DEV_PARTNER_A)
+        self.assertEqual(authorization["device_id"], verifier_device)
+        self.assertEqual(authorization["expires_in_ms"], 120_000)
+        self.assertEqual(await callback(DEV_PARTNER_A, verifier_device, None, [], None), NOT_SPAM)
+
+        self.api.device_id = verifier_device
+        with self.assertRaises(SynapseError) as error:
+            await self.policy.activate_device_replacement(object())
+        self.assertEqual(error.exception.code, 403)
+        self.assertEqual(await self.policy.cancel_device_replacement(object()), {"cancelled": True})
+
+        active = self.policy.db.execute(
+            "SELECT device_id FROM nymph_active_device WHERE user_id = ?",
+            (DEV_PARTNER_A,),
+        ).fetchone()[0]
+        self.assertEqual(active, active_device)
+        self.assertEqual(await callback(DEV_PARTNER_A, verifier_device, None, [], None), Codes.FORBIDDEN)
+
+    async def test_recovery_verifier_requires_the_current_active_device(self) -> None:
+        callback = self.api.registered_callbacks["check_login_for_spam"]
+        self.assertEqual(await callback(DEV_PARTNER_A, "active-device", None, [], None), NOT_SPAM)
+        self.api.user_id = DEV_PARTNER_A
+        self.api.device_id = "unrelated-device"
+
+        with self.assertRaises(SynapseError) as error:
+            await self.policy.create_recovery_verification(object(), {"device_id": "temporary-verifier"})
+        self.assertEqual(error.exception.code, 403)
+        self.assertEqual(self.api.login_token_count, 0)
 
 
 if __name__ == "__main__":

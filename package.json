@@ -11,8 +11,9 @@
     "android:debug": "npm run android:sync && cd android && gradlew.bat assembleDebug",
     "android:release": "node scripts/validate-production-env.mjs && npm run build && npx cap sync android && cd android && gradlew.bat assembleRelease",
     "preview": "vite preview --host 0.0.0.0",
-    "test": "node --experimental-strip-types --test src/matrix/MessagingClient.test.ts src/matrix/homeserver.test.ts src/matrix/recovery-export.test.ts",
-    "test:matrix:live": "playwright test --config=playwright.matrix.config.ts"
+    "test": "node --experimental-strip-types --test src/matrix/MessagingClient.test.ts src/matrix/homeserver.test.ts src/matrix/partner-identity.test.ts src/matrix/state-storage.test.ts src/matrix/recovery-export.test.ts",
+    "test:matrix:live": "playwright test --config=playwright.matrix.config.ts",
+    "test:matrix:dev-live": "playwright test --config=playwright.matrix.dev.config.ts"
   },
   "dependencies": {
     "@aparajita/capacitor-biometric-auth": "^10.0.0",

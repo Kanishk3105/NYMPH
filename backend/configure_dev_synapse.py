@@ -20,9 +20,14 @@ def main() -> None:
     partners = {
         os.environ["PARTNER_A_USER_ID"],
         os.environ["PARTNER_B_USER_ID"],
+        os.environ["DEV_PARTNER_A_USER_ID"],
+        os.environ["DEV_PARTNER_B_USER_ID"],
     }
-    if len(partners) != 2 or any(not user_id.endswith(":localhost") for user_id in partners):
-        raise RuntimeError("Development partner IDs must be two distinct @user:localhost IDs.")
+    if len(partners) != 4 or any(
+        not user_id.startswith("@") or not user_id.endswith(":localhost")
+        for user_id in partners
+    ):
+        raise RuntimeError("Legacy and development partner IDs must be four distinct @user:localhost IDs.")
 
     secret_path = pathlib.Path("/run/secrets/dev_registration_shared_secret")
     registration_secret = secret_path.read_text(encoding="utf-8").strip()
@@ -50,6 +55,8 @@ def main() -> None:
             "config": {
                 "partner_a_user_id": os.environ["PARTNER_A_USER_ID"],
                 "partner_b_user_id": os.environ["PARTNER_B_USER_ID"],
+                "dev_partner_a_user_id": os.environ["DEV_PARTNER_A_USER_ID"],
+                "dev_partner_b_user_id": os.environ["DEV_PARTNER_B_USER_ID"],
                 "homeserver_url": os.environ.get("DEV_HOMESERVER_URL", "http://localhost:8008"),
                 "app_origins": os.environ.get(
                     "DEV_APP_ORIGINS",

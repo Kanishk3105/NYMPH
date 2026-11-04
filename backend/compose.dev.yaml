@@ -7,6 +7,8 @@ services:
       SYNAPSE_REPORT_STATS: "no"
       PARTNER_A_USER_ID: ${PARTNER_A_USER_ID:?Set PARTNER_A_USER_ID in .env}
       PARTNER_B_USER_ID: ${PARTNER_B_USER_ID:?Set PARTNER_B_USER_ID in .env}
+      DEV_PARTNER_A_USER_ID: ${DEV_PARTNER_A_USER_ID:-@partner1-dev:localhost}
+      DEV_PARTNER_B_USER_ID: ${DEV_PARTNER_B_USER_ID:-@partner2-dev:localhost}
       DEV_APP_ORIGINS: ${DEV_APP_ORIGINS:-http://localhost:5173,http://127.0.0.1:5174,https://localhost}
       DEV_HOMESERVER_URL: ${DEV_HOMESERVER_URL:-http://localhost:8008}
       PYTHONPATH: /modules
@@ -14,6 +16,8 @@ services:
       - dev_registration_shared_secret
       - partner1_password
       - partner2_password
+      - partner1_dev_password
+      - partner2_dev_password
     volumes:
       - ./dev-data:/data
       - ./dev-modules:/modules:ro
@@ -41,3 +45,7 @@ secrets:
     file: ./dev-secrets/partner1_password
   partner2_password:
     file: ./dev-secrets/partner2_password
+  partner1_dev_password:
+    file: ./dev-secrets/partner1_dev_password
+  partner2_dev_password:
+    file: ./dev-secrets/partner2_dev_password

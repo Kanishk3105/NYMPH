@@ -117,13 +117,57 @@ Room creation and membership enforcement must be tested before using private con
 
 The local development setup provisions only `@partner1:localhost`, `@partner2:localhost`, and their private encrypted room. The production deployment scaffold is not a completed private two-person service. The app has a development Partner 1 password sign-in, a one-time QR invitation flow for Partner 2, and Matrix SDK device-verification/cross-signing controls. The PC live suite has reached invitation redemption, both clients' encrypted sync, and device-key lookup, but has not yet unlocked the existing Secret Storage or validated the rest of the Matrix protocol path; physical Android UI and storage behavior also remain untested. No production partner credentials are embedded in the frontend.
 
+### Additive development pair (prepared, not provisioned)
+
+The Stage 3H code supports a separate `@partner1-dev:localhost` / `@partner2-dev:localhost` pair and a separate private, encrypted, non-federatable room. The existing account IDs and room remain pinned to the legacy policy table; the dev pair uses its own table and cannot join or invite into the archived room. The app selects the dev identities only for development/Android-debug builds unless explicit Vite identity variables are supplied.
+
+The additive provisioning script is [`provision-dev-partners.ps1`](./provision-dev-partners.ps1). **It has not been run.** It is intentionally separate from `start-dev.ps1` and must not be run until the owner reviews the proposed diff and gives explicit provisioning approval. It first verifies the archived room ID against server-side policy, makes integrity-checked SQLite backups, hashes copied Synapse storage/config/secret files, and copies closed local Matrix test profiles when present. It aborts if a Chrome process is using those profiles. It then adds only the two `-dev` accounts and a new room, and writes ignored Vite local configuration. It does not delete or rewrite the archived identities, archived room, recovery audit snapshot, or crypto stores.
+
+The dev acceptance test has its own Playwright config and persistent profiles under `.matrix-e2e/dev-stage-3h/`. It does not use or alter the legacy live-test profiles. Playwright traces, screenshots, and video are disabled. After provisioning is separately approved and the dev Synapse server is running, run:
+
+```powershell
+npm test
+npm run test:matrix:dev-live
+```
+
+The dev test reads `partner1_dev_password`, `partner2_dev_password`, and the two dev device-ID files from the ignored `backend/dev-secrets/` directory. It requires two distinct process-only export passphrases, `NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_A` and `NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_B`, each at least 12 characters. Enter them through masked `Read-Host` prompts; do not put them in the command text, a `.env` file, or source. Example:
+
+```powershell
+$items = @(
+    @{ Name = 'NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_A'; Prompt = 'Partner A offline-export passphrase' },
+    @{ Name = 'NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_B'; Prompt = 'Partner B offline-export passphrase' }
+)
+try {
+    foreach ($item in $items) {
+        $secureValue = Read-Host $item.Prompt -AsSecureString
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
+        try {
+            [Environment]::SetEnvironmentVariable(
+                $item.Name,
+                [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer),
+                'Process'
+            )
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+            $secureValue.Dispose()
+        }
+    }
+    npm run test:matrix:dev-live
+} finally {
+    Remove-Item Env:NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_A -ErrorAction SilentlyContinue
+    Remove-Item Env:NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_B -ErrorAction SilentlyContinue
+}
+```
+
+The acceptance flow creates a distinct SDK recovery key for each new account only when no default Secret Storage key exists, stores only authenticated-encrypted exports in ignored local files, and requires a recovery restore on a separate temporary verifier before continuing. During new security bootstrap it creates a key backup only when none exists; an existing backup must validate and is never reset by this flow. The server authorizes the short-lived verifier only from the current active device, does not let it become active, and removes its pending authorization when it is revoked. The flow then verifies cross-signing continuity and SAS, exchanges/decrypts messages, restarts both clients, rejects third-user invites and pairing-token replay, and replaces Partner A's active device. A replacement revokes the old Matrix device before the new client starts crypto sync; the server's admission callback rejects new logins for the replaced device ID. This is a dev-only exception for a bounded recovery test, not permission for ordinary second devices.
+
 `block_non_admin_invites`, a private room, and a client-side member check are not enough to enforce an exact two-person allowlist. The local development module uses Synapse's supported spam-checker callbacks `user_may_create_room`, `user_may_invite`, `user_may_join_room`, and `check_event_for_spam`; the API is present in pinned Synapse 1.164.2. Its `on_new_event` callback records the newly created room ID after Synapse persists the validated creation event, so later membership checks are bound to that room. It also uses `ModuleApi.create_login_token` (available since 1.69.0) for the second, one-time login credential. The module limits its local policy state to one created room and checks private/invite-only/encrypted room settings. The more generic third-party `check_event_allowed` callback is documented as very experimental and is not used.
 
 In local development, `block_non_admin_invites` is disabled only because the bootstrap client must invite partner B; the module restricts that action to partner A inviting partner B. The production scaffold keeps non-admin invitations disabled. Policy unit tests cover invite/join restrictions and pairing-token expiry/reuse, and local API checks confirmed both accounts can log in, the room is encrypted and invite-only, a third-user invite is rejected, and partner B cannot create another room. An actual join attempt by a separately provisioned unauthorized account and a federation join have not been tested. The administrator remains trusted and can override any room policy. Registration remains disabled; account creation must be performed by an administrator through the local Synapse provisioning process, never by exposing admin credentials to either phone.
 
 Synapse device verification is distinct from app invitation redemption. The local pairing endpoint is not a replacement for Matrix device verification. The app uses the SDK's `VerificationRequest` flow for SAS emoji/decimal or QR verification, explicit confirmation, cross-signing bootstrap, key-change status, and device revocation controls. The PC live suite has not yet validated SAS or cross-signing between its isolated browser profiles. On Android, the app stores the Matrix session and a random 32-byte Rust crypto-store key in `@aparajita/capacitor-secure-storage`, which encrypts values with an Android Keystore-generated AES-GCM key. The Rust crypto store itself remains in persistent IndexedDB and uses that random key for its SDK-supported encrypted storage. The six-digit app PIN is not used as the crypto-store key. Device IDs are saved and passed back to the SDK so the same device identity and per-device store are restored after restart. Android persistence still requires physical-device restart-and-decrypt validation.
 
-The app also uses native biometrics/device credentials for the app lock, a native `FLAG_SECURE` window, and background relocking. These protections are not substitutes for verifying device identity. Synapse 1.164.2's supported module callbacks do not provide a device-login admission callback to atomically enforce one active authenticated device per partner; the present backend therefore does not meet the one-active-device requirement. Do not represent client-side device checks as server enforcement or use it for production device replacement until a supported server-side revocation/admission design is implemented and tested.
+The app also uses native biometrics/device credentials for the app lock, a native `FLAG_SECURE` window, and background relocking. These protections are not substitutes for verifying device identity. The development policy uses Synapse 1.164.2's `check_login_for_spam` callback to admit only each dev account's first device or explicitly authorized replacement. It stores one active device ID per dev account; after the new device authenticates and deletes the old Matrix device, an authenticated activation switches the server-side active ID. The old device's existing access tokens are revoked by Synapse device deletion, and subsequent logins with its ID are rejected. This design is local-development only and has not been validated against a running Synapse in this workspace; do not use it as production enforcement.
 
 The recovery-verification marker is account data containing only the default Secret Storage key ID, verification time, and the three public cross-signing key IDs. It is written only after the separate-device restore succeeds and the temporary test device is revoked. A changed default key or cross-signing identity invalidates the displayed verified status. Recovery keys, decrypted secrets, and export passphrases are never put in account data.
 
@@ -136,9 +180,9 @@ Before any Matrix recovery operation, preserve the Synapse persistent data and e
 ## Current limitations
 
 - The deployment scaffold has not been started against a real public hostname or an always-on server. It does not yet include or validate the local room-policy module.
-- Seven Synapse policy unit tests pass in the pinned Synapse container; the focused client and encrypted-recovery-export suite passes (10/10), and `npm run build` succeeds. A prior live run verified invitation creation, replay rejection, encrypted sync for both independent clients, and Partner B device-key visibility from both sessions. The metadata-only audit found default Secret Storage keys, all public cross-signing key types, and encrypted private cross-signing secret records for both accounts, but no server-side room-key backup. It does not prove that either recovery key is available or that an existing device can unlock the secrets. The live test now requires both account-specific recovery-key environment variables before login, validates each against its account's default key, and restores existing cross-signing keys only if they match the published identity. No recovery-key values are stored in the repository or printed. SAS verification, cross-signing completion, encrypted two-client delivery, offline/read receipts, restart recovery, and revocation have not passed as an end-to-end suite.
+- The legacy live test still targets only the archived accounts and requires their original recovery keys; do not use it for the dev migration. The additive dev provisioning script and acceptance test are code-only and have not been run. No dev accounts or room were created in this work. The current build and frontend unit tests pass, but Docker is unavailable, so the latest Synapse policy tests and the live Matrix acceptance test could not run. Therefore server-side room/device policy, new recovery setup, SAS, encrypted message exchange, restart persistence, and device revocation are not yet runtime-verified.
 - Android debug packaging was previously built, but this is not physical-device validation. Per the current testing strategy, no phone, USB, ADB-reverse, or emulator testing is being performed; native UI, biometric, Keystore persistence, background locking, and screenshot protection still require later device validation.
-- One-active-device-per-partner enforcement is not implemented server-side.
+- The one-active-device and recovery-verifier admission policy has focused unit tests, but they still need to run in the pinned Synapse container before the server-side enforcement can be treated as verified.
 - Photo/video/voice transfer, push notifications, server-side retention, and media deletion remain unimplemented. Push configuration and production signing credentials also require owner-provided deployment details.
 
 Do not present NYMPH as ready for daily two-phone use until the above security controls and real-device tests pass.

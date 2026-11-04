@@ -30,6 +30,8 @@ function New-LocalSecret {
 New-LocalSecret (Join-Path $secretDirectory 'registration_shared_secret')
 New-LocalSecret (Join-Path $secretDirectory 'partner1_password')
 New-LocalSecret (Join-Path $secretDirectory 'partner2_password')
+New-LocalSecret (Join-Path $secretDirectory 'partner1_dev_password')
+New-LocalSecret (Join-Path $secretDirectory 'partner2_dev_password')
 
 $compose = @(
     'compose',
