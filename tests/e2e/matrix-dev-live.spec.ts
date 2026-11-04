@@ -276,8 +276,12 @@ test('isolated dev partners recover, verify, exchange encrypted messages, restar
     expect(securityA.keyBackupVersion).toBeTruthy();
     expect(securityB.keyBackupVersion).toBeTruthy();
 
-    if (!sessionB.deviceId) throw new Error('Partner B login did not return a device ID.');
-    await call(pageA, 'requestPartnerVerification', sessionB.deviceId);
+    const partnerADeviceId = sessionA.deviceId;
+    const partnerBDeviceId = sessionB.deviceId;
+    if (!partnerADeviceId || !partnerBDeviceId) {
+      throw new Error('A partner login did not return a device ID.');
+    }
+    await call(pageA, 'requestPartnerVerification', partnerBDeviceId);
     const incoming = await waitForValue<{ id: string }>(
       pageB,
       'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
@@ -307,32 +311,48 @@ test('isolated dev partners recover, verify, exchange encrypted messages, restar
     await call(pageB, 'confirmSas', incoming.id);
     await waitForValue<boolean>(pageA, 'h => h.getSecurity()?.partnerVerified');
     await waitForValue<boolean>(pageB, 'h => h.getSecurity()?.partnerVerified');
+    const trustA = await call<{
+      partnerDevices: Array<{ deviceId: string; verified: boolean }>;
+    }>(pageA, 'refreshSecurity');
+    const trustB = await call<{
+      partnerDevices: Array<{ deviceId: string; verified: boolean }>;
+    }>(pageB, 'refreshSecurity');
+    expect(trustA.partnerDevices.find((device) => device.deviceId === partnerBDeviceId)?.verified).toBe(true);
+    expect(trustB.partnerDevices.find((device) => device.deviceId === partnerADeviceId)?.verified).toBe(true);
 
     const messageId = randomUUID();
+    const messageText = `Encrypted dev acceptance message ${messageId}`;
     await call(pageA, 'send', {
       version: 1,
       id: messageId,
       mode: 'romantic',
       kind: 'text',
-      text: `Encrypted dev acceptance message ${messageId}`,
+      text: messageText,
       sentAt: Date.now(),
     });
     await waitForValue(pageB, 'h => h.getEvents().some(event => event.id === args[0])', [messageId]);
-    const received = await call<Array<{ id: string; sender: string }>>(pageB, 'getEvents');
-    expect(received.find((event) => event.id === messageId)?.sender).toBe(partnerA);
+    const received = await call<Array<{ id: string; sender: string; text: string }>>(pageB, 'getEvents');
+    expect(received.find((event) => event.id === messageId)).toMatchObject({
+      sender: partnerA,
+      text: messageText,
+    });
 
     const replyId = randomUUID();
+    const replyText = `Encrypted dev acceptance reply ${replyId}`;
     await call(pageB, 'send', {
       version: 1,
       id: replyId,
       mode: 'romantic',
       kind: 'text',
-      text: `Encrypted dev acceptance reply ${replyId}`,
+      text: replyText,
       sentAt: Date.now(),
     });
     await waitForValue(pageA, 'h => h.getEvents().some(event => event.id === args[0])', [replyId]);
-    const returned = await call<Array<{ id: string; sender: string }>>(pageA, 'getEvents');
-    expect(returned.find((event) => event.id === replyId)?.sender).toBe(partnerB);
+    const returned = await call<Array<{ id: string; sender: string; text: string }>>(pageA, 'getEvents');
+    expect(returned.find((event) => event.id === replyId)).toMatchObject({
+      sender: partnerB,
+      text: replyText,
+    });
 
     await call(pageA, 'disconnect');
     await call(pageB, 'disconnect');

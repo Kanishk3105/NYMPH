@@ -39,7 +39,7 @@ The Caddy proxy rejects public requests to Synapse Admin API paths and room crea
 
 ## Local development
 
-For the local-only setup, use the fixed development IDs `@partner1:localhost` and `@partner2:localhost`. `localhost` is a development-only server name: it is not publicly resolvable, must not be used for production, and cannot later be renamed without migrating/recreating the Matrix identities and room.
+The original local-only environment uses `@partner1:localhost` and `@partner2:localhost`. For the Stage 3H additive migration these are the archived identities, not the new development pair. `start-dev.ps1` is the legacy environment bootstrapper; do not run it as part of the additive migration. `localhost` is a development-only server name: it is not publicly resolvable, must not be used for production, and cannot later be renamed without migrating/recreating the Matrix identities and room.
 
 Run the PowerShell setup script from the repository root:
 
@@ -51,9 +51,9 @@ It creates random local-only passwords and a registration secret under the ignor
 
 The base service binds only to `127.0.0.1:8008`. Synapse's development policy module permits one private, non-federatable, invite-only encrypted room, one invite from partner1 to partner2, and no other room members. It also exposes a short-lived, single-use pairing invitation endpoint. Redeeming an invitation yields a Synapse `m.login.token` that is itself one-time and short-lived; the QR payload never contains a permanent access token. This is local development code, not a production-ready invitation store or Android credential store.
 
-### Automated two-partner Matrix testing
+### Legacy archived-account live test (not for Stage 3H)
 
-The local end-to-end suite launches two separate persistent Chrome profiles with independent Matrix device IDs and IndexedDB-backed Rust crypto stores. It does not use two tabs, share a browser profile, create another room, or reset Synapse data. Partner 1 authenticates with the local development credential and creates a real short-lived pairing invitation; Partner 2 redeems it and receives a one-time Matrix login token.
+This legacy suite targets the archived `@partner1` / `@partner2` identities and their existing room. It launches two separate persistent Chrome profiles with independent Matrix device IDs and IndexedDB-backed Rust crypto stores. It does not use two tabs, share a browser profile, create another room, or reset Synapse data. Partner 1 authenticates with the local development credential and creates a real short-lived pairing invitation; Partner 2 redeems it and receives a one-time Matrix login token. Do not run this suite for the additive Stage 3H migration.
 
 Start the existing local server, then run:
 
@@ -115,7 +115,7 @@ Room creation and membership enforcement must be tested before using private con
 
 ## Two-partner policy and enrollment status
 
-The local development setup provisions only `@partner1:localhost`, `@partner2:localhost`, and their private encrypted room. The production deployment scaffold is not a completed private two-person service. The app has a development Partner 1 password sign-in, a one-time QR invitation flow for Partner 2, and Matrix SDK device-verification/cross-signing controls. The PC live suite has reached invitation redemption, both clients' encrypted sync, and device-key lookup, but has not yet unlocked the existing Secret Storage or validated the rest of the Matrix protocol path; physical Android UI and storage behavior also remain untested. No production partner credentials are embedded in the frontend.
+The legacy local development setup provisions only `@partner1:localhost`, `@partner2:localhost`, and their archived private encrypted room. The production deployment scaffold is not a completed private two-person service. The app has a development Partner 1 password sign-in, a one-time QR invitation flow for Partner 2, and Matrix SDK device-verification/cross-signing controls. The legacy PC live suite has reached invitation redemption, both clients' encrypted sync, and device-key lookup, but has not unlocked the archived Secret Storage; do not treat it as the Stage 3H acceptance test. Physical Android UI and storage behavior also remain untested. No production partner credentials are embedded in the frontend.
 
 ### Additive development pair (prepared, not provisioned)
 
@@ -123,7 +123,7 @@ The Stage 3H code supports a separate `@partner1-dev:localhost` / `@partner2-dev
 
 The additive provisioning script is [`provision-dev-partners.ps1`](./provision-dev-partners.ps1). **It has not been run.** It is intentionally separate from `start-dev.ps1` and must not be run until the owner reviews the proposed diff and gives explicit provisioning approval. It first verifies the archived room ID against server-side policy, makes integrity-checked SQLite backups, hashes copied Synapse storage/config/secret files, and copies closed local Matrix test profiles when present. It aborts if a Chrome process is using those profiles. It then adds only the two `-dev` accounts and a new room, and writes ignored Vite local configuration. It does not delete or rewrite the archived identities, archived room, recovery audit snapshot, or crypto stores.
 
-The dev acceptance test has its own Playwright config and persistent profiles under `.matrix-e2e/dev-stage-3h/`. It does not use or alter the legacy live-test profiles. Playwright traces, screenshots, and video are disabled. After provisioning is separately approved and the dev Synapse server is running, run:
+The dev acceptance test has its own Playwright config and persistent profiles under `.matrix-e2e/dev-stage-3h/`. It does not use or alter the legacy live-test profiles. Playwright traces, screenshots, and video are disabled. It checks each recovery export in a separate client, distinct Secret Storage key IDs and backup versions, SAS trust for both partner devices, exact decrypted message and reply contents, persistence after browser restart, third-user invite/pairing replay rejection, and active-device revocation. After provisioning is separately approved and the dev Synapse server is running, run:
 
 ```powershell
 npm test
