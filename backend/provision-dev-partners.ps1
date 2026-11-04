@@ -1,274 +1,431 @@
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+param(
+    [switch]$ConfirmProvisioning
+)
+
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
+$confirmationPhrase = 'PROVISION ISOLATED NYMPH DEV MATRIX'
+$repositoryRoot = Split-Path $PSScriptRoot -Parent
+$isolatedDirectory = Join-Path $PSScriptRoot 'dev-isolated'
+$secretDirectory = Join-Path $isolatedDirectory 'secrets'
+$environmentFile = Join-Path $PSScriptRoot '.env.dev.isolated'
+$composeFile = Join-Path $PSScriptRoot 'compose.dev.isolated.yaml'
+$homeserver = 'http://127.0.0.1:18008'
+$partnerA = '@partner1-dev:nymph-dev.localhost'
+$partnerB = '@partner2-dev:nymph-dev.localhost'
+$projectName = 'nymph-stage3h1-dev'
 $legacyRoomIdPath = Join-Path $PSScriptRoot 'dev-secrets\room_id'
-$homeserverConfigPath = Join-Path $PSScriptRoot 'dev-data\homeserver.yaml'
-$policyDatabasePath = Join-Path $PSScriptRoot 'dev-data\nymph-policy.sqlite3'
-$synapseDatabasePath = Join-Path $PSScriptRoot 'dev-data\homeserver.db'
-$secretDirectory = Join-Path $PSScriptRoot 'dev-secrets'
-$devAccountA = '@partner1-dev:localhost'
-$devAccountB = '@partner2-dev:localhost'
-$homeserver = 'http://127.0.0.1:8008'
+$legacyDataPath = Join-Path $PSScriptRoot 'dev-data'
+$legacySecretPath = Join-Path $PSScriptRoot 'dev-secrets'
+$legacySnapshotPath = Join-Path $PSScriptRoot 'dev-backups'
+$legacyProfiles = @(
+    (Join-Path $repositoryRoot '.matrix-e2e\partner-a-live-2'),
+    (Join-Path $repositoryRoot '.matrix-e2e\partner-b-live-2')
+)
 
-foreach ($requiredPath in @($legacyRoomIdPath, $homeserverConfigPath, $policyDatabasePath, $synapseDatabasePath)) {
-    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
-        throw "The existing local NYMPH environment is incomplete; required state is missing: $requiredPath"
+$proposedActions = @(
+    @{ Target = 'External user-selected backup directory'; Action = 'Create authenticated encrypted backup of isolated PostgreSQL, Synapse data, deployment secrets, and closed development crypto profiles; restore-test to a temporary directory' },
+    @{ Target = "$projectName isolated deployment"; Action = 'Create Partner A development account if missing; never reset an existing password' },
+    @{ Target = "$projectName isolated deployment"; Action = 'Create Partner B development account if missing; never reset an existing password' },
+    @{ Target = "$projectName isolated deployment"; Action = 'Create the one private, invite-only, encrypted, non-federatable development room if absent' },
+    @{ Target = "$projectName isolated deployment"; Action = 'Write isolated device-ID files and app-local development homeserver configuration if absent' },
+    @{ Target = 'External provisioning journal'; Action = 'Record completed operations and resources without secrets' }
+)
+
+if ($WhatIfPreference) {
+    foreach ($action in $proposedActions) {
+        Write-Output ("PLAN: {0}: {1}" -f $action.Target, $action.Action)
+        $null = $PSCmdlet.ShouldProcess($action.Target, $action.Action)
+    }
+    return
+}
+
+if (-not $ConfirmProvisioning) {
+    throw 'Provisioning is blocked. Review the plan, then pass -ConfirmProvisioning and type the exact phrase when prompted.'
+}
+$typedConfirmation = Read-Host "Type exactly '$confirmationPhrase' to authorize the isolated development migration"
+if ($typedConfirmation -cne $confirmationPhrase) {
+    throw 'The confirmation phrase did not match; no provisioning operation was attempted.'
+}
+
+foreach ($requiredPath in @($environmentFile, $composeFile, $legacyDataPath, $legacySecretPath, $legacySnapshotPath, $legacyRoomIdPath)) {
+    if (-not (Test-Path -LiteralPath $requiredPath)) {
+        throw "Required isolated deployment or legacy preservation state is missing: $requiredPath"
     }
 }
-
-$container = 'nymph-local-dev-synapse-1'
-$containerRunning = docker inspect --format '{{.State.Running}}' $container 2>$null
-if ($LASTEXITCODE -ne 0 -or $containerRunning -ne 'true') {
-    throw 'The existing local Synapse container must be running. This script will not initialize or recreate the original environment.'
-}
-
-function New-LocalSecret {
-    param([string]$Path)
-
-    if (Test-Path -LiteralPath $Path) {
-        return
-    }
-
-    $bytes = New-Object byte[] 48
-    $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try {
-        $generator.GetBytes($bytes)
-        $value = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-        [System.IO.File]::WriteAllText($Path, $value, [System.Text.UTF8Encoding]::new($false))
-    } finally {
-        $generator.Dispose()
-        [Array]::Clear($bytes, 0, $bytes.Length)
+$envValues = @{}
+foreach ($line in Get-Content -LiteralPath $environmentFile) {
+    if ($line -match '^\s*([A-Z0-9_]+)=(.*)$') {
+        $envValues[$matches[1]] = $matches[2].Trim()
     }
 }
-
-New-LocalSecret (Join-Path $secretDirectory 'partner1_dev_password')
-New-LocalSecret (Join-Path $secretDirectory 'partner2_dev_password')
-
-$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupDirectory = Join-Path $PSScriptRoot "dev-backups\stage-3h-before-provisioning-$timestamp"
-if (Test-Path -LiteralPath $backupDirectory) {
-    throw 'A backup directory already exists for this timestamp. Refusing to overwrite it.'
+if (
+    $envValues['MATRIX_SERVER_NAME'] -ne 'nymph-dev.localhost' -or
+    $envValues['DEV_HOMESERVER_URL'] -ne $homeserver -or
+    $envValues['DEV_PARTNER_A_USER_ID'] -ne $partnerA -or
+    $envValues['DEV_PARTNER_B_USER_ID'] -ne $partnerB
+) {
+    throw 'The isolated server name, client URL, or development account IDs do not match the approved isolated deployment.'
 }
-New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
-
-function Backup-SqliteDatabase {
-    param(
-        [string]$Source,
-        [string]$Destination
-    )
-
-    $python = 'import sqlite3,sys; src=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True); dst=sqlite3.connect(sys.argv[2]); src.backup(dst); result=dst.execute("PRAGMA integrity_check").fetchone()[0]; dst.close(); src.close(); print(result); sys.exit(0 if result=="ok" else 1)'
-    & python -c $python $Source $Destination
-    if ($LASTEXITCODE -ne 0) {
-        throw "The SQLite backup could not be verified: $Destination"
-    }
-}
-
-Backup-SqliteDatabase $synapseDatabasePath (Join-Path $backupDirectory 'homeserver.db')
-Backup-SqliteDatabase $policyDatabasePath (Join-Path $backupDirectory 'nymph-policy.sqlite3')
-
-$legacyRoomId = [System.IO.File]::ReadAllText($legacyRoomIdPath).Trim()
-$verifyLegacyPolicy = 'import sqlite3,sys; db=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True); row=db.execute("SELECT room_id FROM nymph_room_policy WHERE id=1").fetchone(); db.close(); sys.exit(0 if row and row[0]==sys.argv[2] else 1)'
-& python -c $verifyLegacyPolicy $policyDatabasePath $legacyRoomId
-if ($LASTEXITCODE -ne 0) {
-    throw 'The archived room ID does not match the existing server-side room policy. No account or room provisioning was attempted.'
-}
-
-function Copy-VerifiedFiles {
-    param(
-        [string]$SourceDirectory,
-        [string]$DestinationDirectory,
-        [string[]]$ExcludedNames = @()
-    )
-
-    $sourceRoot = (Resolve-Path -LiteralPath $SourceDirectory).Path.TrimEnd('\') + '\'
-    $files = Get-ChildItem -LiteralPath $SourceDirectory -File -Force -Recurse |
-        Where-Object { $ExcludedNames -notcontains $_.Name }
-    foreach ($file in $files) {
-        $relativePath = $file.FullName.Substring($sourceRoot.Length)
-        $destinationPath = Join-Path $DestinationDirectory $relativePath
-        $destinationParent = Split-Path -Parent $destinationPath
-        New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
-        Copy-Item -LiteralPath $file.FullName -Destination $destinationPath
-        $sourceHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
-        $backupHash = (Get-FileHash -LiteralPath $destinationPath -Algorithm SHA256).Hash
-        if ($sourceHash -ne $backupHash) {
-            throw "A persistent-state backup did not verify: $relativePath"
+$expectedSecretDirectory = [System.IO.Path]::GetFullPath($secretDirectory)
+foreach ($configuredSecretDirectory in @($env:DEV_SECRETS_DIR, $envValues['DEV_SECRETS_DIR'])) {
+    if ($configuredSecretDirectory) {
+        $resolvedSecretDirectory = [System.IO.Path]::GetFullPath($configuredSecretDirectory)
+        if ($resolvedSecretDirectory -ne $expectedSecretDirectory) {
+            throw 'DEV_SECRETS_DIR must resolve to the isolated development secrets directory.'
         }
     }
 }
 
-$excludedDatabaseFiles = @(
-    'homeserver.db',
-    'homeserver.db-wal',
-    'homeserver.db-shm',
-    'homeserver.db-journal',
-    'nymph-policy.sqlite3',
-    'nymph-policy.sqlite3-wal',
-    'nymph-policy.sqlite3-shm',
-    'nymph-policy.sqlite3-journal'
-)
-Copy-VerifiedFiles `
-    (Join-Path $PSScriptRoot 'dev-data') `
-    (Join-Path $backupDirectory 'dev-data') `
-    $excludedDatabaseFiles
-Copy-VerifiedFiles $secretDirectory (Join-Path $backupDirectory 'dev-secrets')
-
-$matrixProfiles = Join-Path (Split-Path $PSScriptRoot -Parent) '.matrix-e2e'
-if (Test-Path -LiteralPath $matrixProfiles -PathType Container) {
-    $profileRoot = (Resolve-Path -LiteralPath $matrixProfiles).Path.TrimEnd('\')
-    $activeProfileUsers = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
-        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profileRoot) }
-    if ($activeProfileUsers) {
-        throw 'Close Matrix test browsers before backing up their persistent crypto profiles. No account or room provisioning was attempted.'
+function Get-LegacyFingerprint {
+    $items = [System.Collections.Generic.List[string]]::new()
+    $paths = @($legacyDataPath, $legacySecretPath, $legacySnapshotPath) + $legacyProfiles
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $item = Get-Item -LiteralPath $path -Force
+        $files = if ($item.PSIsContainer) {
+            Get-ChildItem -LiteralPath $path -File -Force -Recurse
+        } else {
+            @($item)
+        }
+        foreach ($file in $files) {
+            $relative = $file.FullName.Substring($repositoryRoot.Length).TrimStart('\')
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+            $items.Add("$relative|$hash")
+        }
     }
-    Copy-VerifiedFiles $matrixProfiles (Join-Path $backupDirectory '.matrix-e2e')
+    return ($items | Sort-Object) -join "`n"
 }
 
-$compose = @(
-    'compose',
-    '--project-name', 'nymph-local-dev',
-    '--env-file', '.env.dev',
-    '-f', 'compose.dev.yaml'
+$legacyFingerprintBefore = Get-LegacyFingerprint
+$dockerInfo = & docker info --format '{{.ServerVersion}}' 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $dockerInfo) {
+    throw 'Docker Engine is unavailable; no isolated account or room provisioning was attempted.'
+}
+
+$composeArgs = @(
+    'compose', '--project-name', $projectName,
+    '--env-file', $environmentFile,
+    '-f', $composeFile
 )
+$expectedContainer = "$projectName-synapse-1"
+$container = & docker inspect --format '{{.State.Running}}|{{index .Config.Labels "com.docker.compose.project"}}' $expectedContainer 2>$null
+if ($LASTEXITCODE -ne 0 -or $container -ne "true|$projectName") {
+    throw 'The isolated Synapse service is not running under its dedicated project identity. Start only start-isolated-dev.ps1 first.'
+}
+$versionResponse = Invoke-WebRequest -Uri "$homeserver/_matrix/client/versions" -TimeoutSec 5 -UseBasicParsing
+if ($versionResponse.StatusCode -ne 200) {
+    throw 'The isolated Matrix client API is not ready.'
+}
+$versionResponse.Content | ConvertFrom-Json | Out-Null
 
-& docker @compose up -d synapse
-if ($LASTEXITCODE -ne 0) {
-    throw 'Could not load the additive development policy into the existing Synapse instance.'
+$backupDirectory = Join-Path $env:USERPROFILE 'NYMPH-Backups'
+$backupPath = Join-Path $backupDirectory (
+    'nymph-stage3h1-dev-{0}.enc' -f (Get-Date -Format 'yyyyMMdd-HHmmss')
+)
+$journalRunId = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), [Guid]::NewGuid().ToString('N')
+$journalPath = Join-Path $backupDirectory "nymph-stage3h1-provisioning-$journalRunId.json"
+if (-not (Test-Path -LiteralPath $backupDirectory -PathType Container)) {
+    if ($PSCmdlet.ShouldProcess($backupDirectory, 'Create external encrypted-backup and provisioning-journal directory')) {
+        New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
+    } else {
+        throw 'External backup directory creation was not authorized.'
+    }
+}
+if (Test-Path -LiteralPath $journalPath) {
+    throw 'The unique provisioning journal path already exists; refusing to overwrite it.'
+}
+$journal = [ordered]@{
+    format = 'nymph-stage3h1-provisioning'
+    version = 1
+    started_at = (Get-Date).ToUniversalTime().ToString('o')
+    project = $projectName
+    homeserver = $homeserver
+    server_name = 'nymph-dev.localhost'
+    operations = @()
+    resources = @(
+        @{ type = 'account'; id = $partnerA; status = 'not_started' },
+        @{ type = 'account'; id = $partnerB; status = 'not_started' },
+        @{ type = 'room'; id = $null; status = 'not_started' }
+    )
 }
 
-$ready = $false
-for ($attempt = 0; $attempt -lt 90; $attempt++) {
+function Save-ProvisioningJournal {
+    param([string]$Status, [string]$Operation)
+    if (-not $PSCmdlet.ShouldProcess($journalPath, "Record $Operation as $Status in the external provisioning journal")) {
+        throw 'Provisioning journal update was not authorized; stopping before the next operation.'
+    }
+    $journal.operations += [ordered]@{
+        operation = $Operation
+        status = $Status
+        completed_at = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+        $journal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $journalPath -Encoding UTF8
+    } else {
+        $journal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $journalPath -Encoding UTF8 -NoClobber
+    }
+}
+
+function Invoke-ProvisioningStep {
+    param(
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][string]$OperationName,
+        [Parameter(Mandatory)][scriptblock]$Operation
+    )
+    Save-ProvisioningJournal -Status 'started' -Operation $OperationName
+    if (-not $PSCmdlet.ShouldProcess($Target, $Action)) {
+        throw "Provisioning step was declined: $OperationName. No later steps will run."
+    }
     try {
-        $null = Invoke-RestMethod -Uri "$homeserver/_matrix/client/versions" -TimeoutSec 2
-        $ready = $true
-        break
+        & $Operation
+        Save-ProvisioningJournal -Status 'completed' -Operation $OperationName
     } catch {
-        Start-Sleep -Seconds 2
+        try {
+            Save-ProvisioningJournal -Status 'failed' -Operation $OperationName
+        } catch {
+            Write-Error 'Could not record a provisioning failure in the external journal.'
+        }
+        throw
     }
 }
-if (-not $ready) {
-    throw 'Synapse did not become ready after loading the additive policy. No new accounts were provisioned.'
-}
-
-$users = @(
-    @{ Localpart = 'partner1-dev'; Secret = 'partner1_dev_password' },
-    @{ Localpart = 'partner2-dev'; Secret = 'partner2_dev_password' }
-)
-foreach ($user in $users) {
-    & docker @compose exec -T synapse register_new_matrix_user `
-        --exists-ok `
-        --user $user.Localpart `
-        --password-file "/run/secrets/$($user.Secret)" `
-        --no-admin `
-        --config /data/homeserver.yaml `
-        $homeserver
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not provision the development-only account $($user.Localpart)."
-    }
-}
-
-$deviceIdPath = Join-Path $secretDirectory 'partner1_dev_device_id'
-if (Test-Path -LiteralPath $deviceIdPath) {
-    $deviceId = [System.IO.File]::ReadAllText($deviceIdPath).Trim()
-} else {
-    $deviceId = 'NYMPH_DEV_A_' + [Guid]::NewGuid().ToString('N')
-    [System.IO.File]::WriteAllText($deviceIdPath, $deviceId, [System.Text.UTF8Encoding]::new($false))
-}
-$partnerBDeviceIdPath = Join-Path $secretDirectory 'partner2_dev_device_id'
-if (Test-Path -LiteralPath $partnerBDeviceIdPath) {
-    $partnerBDeviceId = [System.IO.File]::ReadAllText($partnerBDeviceIdPath).Trim()
-} else {
-    $partnerBDeviceId = 'NYMPH_DEV_B_' + [Guid]::NewGuid().ToString('N')
-    [System.IO.File]::WriteAllText($partnerBDeviceIdPath, $partnerBDeviceId, [System.Text.UTF8Encoding]::new($false))
-}
-
-$password = [System.IO.File]::ReadAllText((Join-Path $secretDirectory 'partner1_dev_password')).Trim()
-$loginBody = @{
-    type = 'm.login.password'
-    identifier = @{ type = 'm.id.user'; user = $devAccountA }
-    password = $password
-    device_id = $deviceId
-    initial_device_display_name = 'NYMPH development Partner A'
-} | ConvertTo-Json -Depth 4 -Compress
-$session = Invoke-RestMethod -Uri "$homeserver/_matrix/client/v3/login" -Method Post -ContentType 'application/json' -Body $loginBody
-$headers = @{ Authorization = "Bearer $($session.access_token)" }
-$roomIdPath = Join-Path $secretDirectory 'dev_room_id'
 
 try {
-    $status = Invoke-RestMethod -Uri "$homeserver/_synapse/client/nymph/pairing/status" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}'
-    $roomId = $status.room_id
-    if (-not $roomId -and (Test-Path -LiteralPath $roomIdPath)) {
-        throw 'A development room ID exists locally but is not registered by the server; refusing to create another room.'
+    Invoke-ProvisioningStep `
+        -Target $backupPath `
+        -Action 'Create and restore-test an authenticated encrypted backup of isolated development state' `
+        -OperationName 'encrypted-pre-provision-backup' `
+        -Operation {
+            & (Join-Path $PSScriptRoot 'backup-isolated-dev.ps1') -Mode Create -BackupPath $backupPath -Confirm:$false
+            if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw 'Encrypted backup creation failed.' }
+            & (Join-Path $PSScriptRoot 'backup-isolated-dev.ps1') -Mode RestoreTest -BackupPath $backupPath -Confirm:$false
+            if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw 'Encrypted backup restore test failed.' }
+        }
+
+    foreach ($user in @(
+        @{ Id = $partnerA; Localpart = 'partner1-dev'; PasswordFile = 'partner1_dev_password' },
+        @{ Id = $partnerB; Localpart = 'partner2-dev'; PasswordFile = 'partner2_dev_password' }
+    )) {
+        $userPasswordPath = Join-Path $secretDirectory $user.PasswordFile
+        if (-not (Test-Path -LiteralPath $userPasswordPath -PathType Leaf)) {
+            if (-not $PSCmdlet.ShouldProcess($userPasswordPath, "Create an account credential for $($user.Id) after provisioning approval")) {
+                throw "Creation of the approved account credential was declined: $($user.Id)"
+            }
+            $passwordBytes = New-Object byte[] 48
+            $passwordGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try {
+                $passwordGenerator.GetBytes($passwordBytes)
+                $newPassword = [Convert]::ToBase64String($passwordBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+                [System.IO.File]::WriteAllText(
+                    $userPasswordPath,
+                    $newPassword,
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+            } finally {
+                $passwordGenerator.Dispose()
+                [Array]::Clear($passwordBytes, 0, $passwordBytes.Length)
+            }
+        }
+        if ([System.IO.File]::ReadAllText($userPasswordPath).Trim().Length -lt 32) {
+            throw "The approved account credential is invalid for $($user.Id)."
+        }
+        Invoke-ProvisioningStep `
+            -Target $user.Id `
+            -Action 'Create the isolated development account if missing; preserve any existing account password' `
+            -OperationName "ensure-account-$($user.Localpart)" `
+            -Operation {
+                $accountPassword = [System.IO.File]::ReadAllText($userPasswordPath).Trim()
+                try {
+                    $accountPassword | & docker @composeArgs exec -T synapse register_new_matrix_user `
+                        --exists-ok `
+                        --user $user.Localpart `
+                        --password-file /dev/stdin `
+                        --no-admin `
+                        --config /data/homeserver.yaml `
+                        $homeserver
+                } finally {
+                    $accountPassword = $null
+                }
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Could not ensure isolated account $($user.Localpart)."
+                }
+                $resource = $journal.resources | Where-Object { $_.id -eq $user.Id }
+                $resource.status = 'ensured'
+            }
     }
 
-    if (-not $roomId) {
-        $initialState = @(
-            @{ type = 'm.room.encryption'; state_key = ''; content = @{ algorithm = 'm.megolm.v1.aes-sha2' } },
-            @{ type = 'm.room.join_rules'; state_key = ''; content = @{ join_rule = 'invite' } },
-            @{ type = 'm.room.history_visibility'; state_key = ''; content = @{ history_visibility = 'joined' } },
-            @{
-                type = 'm.room.power_levels'
-                state_key = ''
-                content = @{
-                    users = @{ $devAccountB = 0 }
-                    users_default = 0
-                    events_default = 0
-                    state_default = 100
-                    invite = 100
-                    kick = 100
-                    ban = 100
-                    redact = 100
+    $deviceAPath = Join-Path $secretDirectory 'partner1_dev_device_id'
+    $deviceBPath = Join-Path $secretDirectory 'partner2_dev_device_id'
+    foreach ($device in @(
+        @{ Path = $deviceAPath; Prefix = 'NYMPH_DEV_A_' },
+        @{ Path = $deviceBPath; Prefix = 'NYMPH_DEV_B_' }
+    )) {
+        if (-not (Test-Path -LiteralPath $device.Path)) {
+            Invoke-ProvisioningStep `
+                -Target $device.Path `
+                -Action 'Create an isolated Matrix device-ID file if missing' `
+                -OperationName 'create-device-id-file' `
+                -Operation {
+                    $id = $device.Prefix + [Guid]::NewGuid().ToString('N')
+                    [System.IO.File]::WriteAllText($device.Path, $id, [System.Text.UTF8Encoding]::new($false))
+                }
+        }
+    }
+
+    $password = [System.IO.File]::ReadAllText((Join-Path $secretDirectory 'partner1_dev_password')).Trim()
+    $deviceId = [System.IO.File]::ReadAllText($deviceAPath).Trim()
+    $loginBody = @{
+        type = 'm.login.password'
+        identifier = @{ type = 'm.id.user'; user = $partnerA }
+        password = $password
+        device_id = $deviceId
+        initial_device_display_name = 'NYMPH isolated development setup'
+    } | ConvertTo-Json -Depth 4 -Compress
+    $script:session = $null
+    try {
+        Invoke-ProvisioningStep `
+            -Target $partnerA `
+            -Action 'Authenticate the isolated Partner A setup device' `
+            -OperationName 'authenticate-partner-a-setup-device' `
+            -Operation {
+                $script:session = Invoke-RestMethod -Uri "$homeserver/_matrix/client/v3/login" -Method Post -ContentType 'application/json' -Body $loginBody
+                if ($script:session.user_id -ne $partnerA -or $script:session.device_id -ne $deviceId) {
+                    throw 'Isolated setup authentication returned an unexpected account or device.'
                 }
             }
+
+        $headers = @{ Authorization = "Bearer $($script:session.access_token)" }
+        $session = $script:session
+        $roomStatus = Invoke-RestMethod -Uri "$homeserver/_synapse/client/nymph/pairing/status" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 5
+        $roomIdPath = Join-Path $secretDirectory 'dev_room_id'
+        $existingRoomId = if (Test-Path -LiteralPath $roomIdPath) {
+            [System.IO.File]::ReadAllText($roomIdPath).Trim()
+        } else {
+            $null
+        }
+        if ($roomStatus.room_id -and $existingRoomId -and $roomStatus.room_id -ne $existingRoomId) {
+            throw 'The isolated policy room and local room record disagree; refusing to create or replace a room.'
+        }
+        if (-not $roomStatus.room_id -and $existingRoomId) {
+            throw 'A local isolated room ID exists but the independent Synapse policy has no room; refusing to recreate it.'
+        }
+
+        if ($roomStatus.room_id) {
+            $journal.resources[-1].id = $roomStatus.room_id
+            $journal.resources[-1].status = 'already_present'
+            Save-ProvisioningJournal -Status 'completed' -Operation 'verify-existing-development-room'
+        } else {
+            Invoke-ProvisioningStep `
+                -Target "$projectName $partnerA / $partnerB" `
+                -Action 'Create one private invite-only encrypted non-federatable development room' `
+                -OperationName 'create-development-room' `
+                -Operation {
+                    $initialState = @(
+                        @{ type = 'm.room.encryption'; state_key = ''; content = @{ algorithm = 'm.megolm.v1.aes-sha2' } },
+                        @{ type = 'm.room.join_rules'; state_key = ''; content = @{ join_rule = 'invite' } },
+                        @{ type = 'm.room.history_visibility'; state_key = ''; content = @{ history_visibility = 'joined' } },
+                        @{
+                            type = 'm.room.power_levels'
+                            state_key = ''
+                            content = @{
+                                users = @{ $partnerB = 0 }
+                                users_default = 0
+                                events_default = 0
+                                state_default = 100
+                                invite = 100
+                                kick = 100
+                                ban = 100
+                                redact = 100
+                            }
+                        }
+                    )
+                    $roomBody = @{
+                        name = 'NYMPH Isolated Development'
+                        visibility = 'private'
+                        preset = 'private_chat'
+                        invite = @($partnerB)
+                        creation_content = @{ 'm.federate' = $false }
+                        initial_state = $initialState
+                    } | ConvertTo-Json -Depth 12 -Compress
+                    $created = Invoke-RestMethod -Uri "$homeserver/_matrix/client/v3/createRoom" -Method Post -Headers $headers -ContentType 'application/json' -Body $roomBody
+                    if (-not $created.room_id) {
+                        throw 'Synapse did not return the isolated room ID.'
+                    }
+                    $verified = Invoke-RestMethod -Uri "$homeserver/_synapse/client/nymph/pairing/status" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 5
+                    if ($verified.room_id -ne $created.room_id) {
+                        throw 'The isolated server policy did not record the room that was just created.'
+                    }
+                    [System.IO.File]::WriteAllText($roomIdPath, $created.room_id, [System.Text.UTF8Encoding]::new($false))
+                    $journal.resources[-1].id = $created.room_id
+                    $journal.resources[-1].status = 'created'
+                }
+        }
+
+        $roomStatus = Invoke-RestMethod -Uri "$homeserver/_synapse/client/nymph/pairing/status" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 5
+        $roomId = $roomStatus.room_id
+        if (-not $roomId) { throw 'The isolated policy has no configured room after reconciliation.' }
+        if (-not $existingRoomId -and -not (Test-Path -LiteralPath $roomIdPath)) {
+            if ($PSCmdlet.ShouldProcess($roomIdPath, 'Write the isolated development room ID record')) {
+                [System.IO.File]::WriteAllText($roomIdPath, $roomId, [System.Text.UTF8Encoding]::new($false))
+            }
+        }
+
+        $viteLines = @(
+            "VITE_MATRIX_HOMESERVER=$homeserver",
+            "VITE_MATRIX_PARTNER_A_USER_ID=$partnerA",
+            "VITE_MATRIX_PARTNER_B_USER_ID=$partnerB",
+            "VITE_MATRIX_PARTNER_A_DEVICE_ID=$deviceId",
+            "VITE_MATRIX_PARTNER_B_DEVICE_ID=$([System.IO.File]::ReadAllText($deviceBPath).Trim())"
         )
-        $roomBody = @{
-            name = 'NYMPH Development'
-            visibility = 'private'
-            preset = 'private_chat'
-            invite = @($devAccountB)
-            creation_content = @{ 'm.federate' = $false }
-            initial_state = $initialState
-        } | ConvertTo-Json -Depth 12 -Compress
-        $createdRoom = Invoke-RestMethod -Uri "$homeserver/_matrix/client/v3/createRoom" -Method Post -Headers $headers -ContentType 'application/json' -Body $roomBody
-        $roomId = $createdRoom.room_id
-    }
-
-    if (-not $roomId) {
-        throw 'The development room was not accepted by the server-side policy.'
-    }
-    $verifiedStatus = Invoke-RestMethod -Uri "$homeserver/_synapse/client/nymph/pairing/status" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}'
-    if ($verifiedStatus.room_id -ne $roomId) {
-        throw 'The server-side development room does not match the created room.'
-    }
-    [System.IO.File]::WriteAllText($roomIdPath, $roomId, [System.Text.UTF8Encoding]::new($false))
-
-    $viteConfiguration = @(
-        "VITE_MATRIX_PARTNER_A_USER_ID=$devAccountA",
-        "VITE_MATRIX_PARTNER_B_USER_ID=$devAccountB",
-        "VITE_MATRIX_PARTNER_A_DEVICE_ID=$deviceId",
-        "VITE_MATRIX_PARTNER_B_DEVICE_ID=$partnerBDeviceId"
-    ) -join "`n"
-    foreach ($mode in @('development', 'android')) {
-        $configurationPath = Join-Path (Split-Path $PSScriptRoot -Parent) ".env.$mode.local"
-        [System.IO.File]::WriteAllText($configurationPath, "$viteConfiguration`n", [System.Text.UTF8Encoding]::new($false))
-    }
-} finally {
-    try {
-        if ($headers) {
-            $null = Invoke-RestMethod -Uri "$homeserver/_matrix/client/v3/logout" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}'
+        foreach ($mode in @('development', 'android')) {
+            $configPath = Join-Path $repositoryRoot ".env.$mode.local"
+            $expected = ($viteLines -join "`n") + "`n"
+            if (Test-Path -LiteralPath $configPath) {
+                $current = [System.IO.File]::ReadAllText($configPath)
+                if ($current -ne $expected) {
+                    throw "Existing app-local Matrix configuration conflicts with the isolated deployment: $configPath"
+                }
+            } elseif ($PSCmdlet.ShouldProcess($configPath, 'Write isolated development app configuration')) {
+                [System.IO.File]::WriteAllText($configPath, $expected, [System.Text.UTF8Encoding]::new($false))
+            }
         }
     } finally {
+        $session = $script:session
+        if ($script:session -and $script:session.access_token) {
+            if ($PSCmdlet.ShouldProcess($partnerA, 'Log out isolated Partner A setup session')) {
+                try {
+                    $null = Invoke-RestMethod -Uri "$homeserver/_matrix/client/v3/logout" -Method Post -Headers @{ Authorization = "Bearer $($session.access_token)" } -ContentType 'application/json' -Body '{}' -TimeoutSec 5
+                } catch {
+                    throw 'Could not confirm logout of the isolated setup session.'
+                }
+            }
+        }
         $password = $null
         $loginBody = $null
         $headers = $null
-        $session = $null
+        $script:session = $null
     }
-}
 
-Write-Output 'Additive development accounts and room are ready.'
-Write-Output "Partner A: $devAccountA"
-Write-Output "Partner B: $devAccountB"
-Write-Output "Development room: $roomId"
-Write-Output "Verified pre-provisioning database/config backup: $backupDirectory"
-Write-Output 'Local password and device-ID files were not printed.'
+    $legacyFingerprintAfter = Get-LegacyFingerprint
+    if ($legacyFingerprintBefore -cne $legacyFingerprintAfter) {
+        throw 'Legacy environment fingerprint changed. Stop immediately; do not retry provisioning.'
+    }
+    Save-ProvisioningJournal -Status 'completed' -Operation 'verify-legacy-state-unchanged'
+    Write-Output 'Isolated development accounts and room are ready.'
+    Write-Output "Partner IDs: $partnerA and $partnerB"
+    Write-Output "Matrix server: $homeserver ($projectName)"
+    Write-Output 'No original Matrix account, room, database, config, or crypto profile was intentionally modified.'
+} catch {
+    try {
+        Save-ProvisioningJournal -Status 'failed' -Operation 'provisioning-run'
+    } catch {
+        Write-Error 'Provisioning failed and the external operation journal could not be updated.'
+    }
+    Write-Error 'Provisioning stopped. Do not retry until the isolated room/policy state and external journal are reviewed.'
+    Write-Output 'Safe rollback scope is limited to the isolated development project and the explicitly recorded development accounts/room.'
+    Write-Output 'Do not delete or alter any legacy account, room, database, config, secret, or crypto profile.'
+    throw
+}

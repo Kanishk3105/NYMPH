@@ -22,11 +22,11 @@ type Invitation = {
 
 const chromePath = process.env.NYMPH_CHROME_PATH ??
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-const matrixUrl = 'http://127.0.0.1:8008';
-const secretsDirectory = join(process.cwd(), 'backend', 'dev-secrets');
+const matrixUrl = 'http://127.0.0.1:18008';
+const secretsDirectory = join(process.cwd(), 'backend', 'dev-isolated', 'secrets');
 const profileRoot = join(process.cwd(), '.matrix-e2e', 'dev-stage-3h');
-const partnerA = '@partner1-dev:localhost';
-const partnerB = '@partner2-dev:localhost';
+const partnerA = '@partner1-dev:nymph-dev.localhost';
+const partnerB = '@partner2-dev:nymph-dev.localhost';
 
 async function call<T>(page: Page, method: string, ...args: unknown[]): Promise<T> {
   const result = page.evaluate(
@@ -234,7 +234,7 @@ test('isolated dev partners recover, verify, exchange encrypted messages, restar
     storageKeyB = deriveStorageKey(passwordB, 'nymph-dev-stage-3h-partner-b-v1');
     await call(pageA, 'connect', sessionA, storageKeyA);
     await call(pageB, 'connect', sessionB, storageKeyB);
-    expect(await call<number>(pageA, 'inviteStatus', sessionA, sessionA.roomId, '@unauthorized:localhost')).toBe(403);
+    expect(await call<number>(pageA, 'inviteStatus', sessionA, sessionA.roomId, '@unauthorized:nymph-dev.localhost')).toBe(403);
 
     const identityIdsA = await setupOrRestoreSecurity(
       pageA,

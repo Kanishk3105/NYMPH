@@ -92,6 +92,8 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
                 "dev_partner_a_user_id": DEV_PARTNER_A,
                 "dev_partner_b_user_id": DEV_PARTNER_B,
                 "homeserver_url": "http://localhost:8008",
+                "server_name": "localhost",
+                "legacy_pair_enabled": True,
                 "app_origins": "http://localhost:5173,https://localhost",
                 "state_path": str(Path(self.temp_dir.name) / "policy.sqlite3"),
             },
@@ -184,6 +186,52 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.policy.user_may_join_room(DEV_PARTNER_B, DEV_ROOM_ID, True), NOT_SPAM)
         self.assertEqual(await self.policy.user_may_join_room(PARTNER_A, DEV_ROOM_ID, True), Codes.FORBIDDEN)
         self.assertEqual(await self.policy.user_may_join_room("@third:localhost", DEV_ROOM_ID, True), Codes.FORBIDDEN)
+
+    async def test_isolated_policy_uses_only_dev_ids_and_its_own_policy_schema(self) -> None:
+        isolated_path = Path(self.temp_dir.name) / "isolated-policy.sqlite3"
+        isolated_config = {
+            "server_name": "nymph-dev.localhost",
+            "legacy_pair_enabled": False,
+            "dev_partner_a_user_id": "@partner1-dev:nymph-dev.localhost",
+            "dev_partner_b_user_id": "@partner2-dev:nymph-dev.localhost",
+            "homeserver_url": "http://127.0.0.1:18008",
+            "app_origins": "http://localhost:5173",
+            "state_path": str(isolated_path),
+        }
+        NymphPolicy.parse_config(isolated_config)
+        isolated = NymphPolicy(isolated_config, FakeApi())
+        try:
+            tables = {
+                row[0]
+                for row in isolated.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            self.assertNotIn("nymph_room_policy", tables)
+            self.assertIn("nymph_dev_room_policy", tables)
+            self.assertNotIn(PARTNER_A, isolated.dev_users)
+            self.assertEqual(isolated.current_room_id(), None)
+            self.assertEqual(
+                await isolated.user_may_join_room(PARTNER_A, DEV_ROOM_ID, True),
+                Codes.FORBIDDEN,
+            )
+        finally:
+            isolated.db.close()
+
+    def test_isolated_policy_rejects_archived_identity_configuration(self) -> None:
+        config = {
+            "server_name": "nymph-dev.localhost",
+            "legacy_pair_enabled": False,
+            "partner_a_user_id": PARTNER_A,
+            "partner_b_user_id": PARTNER_B,
+            "dev_partner_a_user_id": "@partner1-dev:nymph-dev.localhost",
+            "dev_partner_b_user_id": "@partner2-dev:nymph-dev.localhost",
+            "homeserver_url": "http://127.0.0.1:18008",
+            "app_origins": "http://localhost:5173",
+            "state_path": str(Path(self.temp_dir.name) / "rejected-policy.sqlite3"),
+        }
+        with self.assertRaises(ValueError):
+            NymphPolicy.parse_config(config)
 
     async def test_each_room_rejects_cross_pair_and_third_party_invites(self) -> None:
         await self.record_room()

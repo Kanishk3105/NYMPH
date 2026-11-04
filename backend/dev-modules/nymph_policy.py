@@ -136,53 +136,58 @@ class NymphPolicy:
     @staticmethod
     def parse_config(config: dict[str, Any]) -> dict[str, Any]:
         required = (
-            "partner_a_user_id",
-            "partner_b_user_id",
             "dev_partner_a_user_id",
             "dev_partner_b_user_id",
+            "server_name",
             "homeserver_url",
             "app_origins",
             "state_path",
         )
         if any(not isinstance(config.get(key), str) or not config[key] for key in required):
             raise ValueError("NYMPH policy requires both development IDs and local service URLs.")
-        user_ids = (
-            config["partner_a_user_id"],
-            config["partner_b_user_id"],
-            config["dev_partner_a_user_id"],
-            config["dev_partner_b_user_id"],
-        )
-        if len(set(user_ids)) != len(user_ids):
-            raise ValueError("NYMPH legacy and development partner IDs must be distinct.")
-        if user_ids[:2] != ("@partner1:localhost", "@partner2:localhost"):
+        server_name = config["server_name"]
+        if "/" in server_name or ":" in server_name:
+            raise ValueError("The development server name must be a hostname.")
+        legacy_enabled = config.get("legacy_pair_enabled", True)
+        if not isinstance(legacy_enabled, bool):
+            raise ValueError("legacy_pair_enabled must be a boolean.")
+        legacy_ids = (config.get("partner_a_user_id"), config.get("partner_b_user_id"))
+        if legacy_enabled and legacy_ids != ("@partner1:localhost", "@partner2:localhost"):
             raise ValueError("The archived development identities cannot be rebound by the policy.")
-        if user_ids[2:] != ("@partner1-dev:localhost", "@partner2-dev:localhost"):
-            raise ValueError("The additive development identities must use their dedicated IDs.")
+        if not legacy_enabled and any(legacy_ids):
+            raise ValueError("Archived account IDs must not be configured in an isolated development policy.")
+        dev_ids = (config["dev_partner_a_user_id"], config["dev_partner_b_user_id"])
+        if dev_ids != (f"@partner1-dev:{server_name}", f"@partner2-dev:{server_name}"):
+            raise ValueError("Development partner IDs must match their dedicated server name.")
+        user_ids = (*legacy_ids, *dev_ids) if legacy_enabled else dev_ids
+        if len(set(user_ids)) != len(user_ids):
+            raise ValueError("Legacy and development partner IDs must be distinct.")
         if not all(
-            user_id.startswith("@") and user_id.endswith(":localhost")
+            isinstance(user_id, str) and user_id.startswith("@") and ":" in user_id
             for user_id in user_ids
         ):
-            raise ValueError("The development-only policy accepts @user:localhost IDs.")
+            raise ValueError("NYMPH policy account IDs must be fully-qualified Matrix IDs.")
         homeserver = config["homeserver_url"]
         if not (
-            homeserver == "http://localhost:8008"
+            homeserver.startswith("http://127.0.0.1:")
+            or homeserver.startswith("http://localhost:")
             or homeserver.startswith("https://")
         ):
             raise ValueError("The development pairing endpoint must use localhost HTTP or HTTPS.")
         return config
 
     def __init__(self, config: dict[str, Any], api: ModuleApi) -> None:
-        self.pairs = {
-            "legacy": {
+        self.pairs = {}
+        if config.get("legacy_pair_enabled", True):
+            self.pairs["legacy"] = {
                 "partner_a": config["partner_a_user_id"],
                 "partner_b": config["partner_b_user_id"],
                 "table": "nymph_room_policy",
-            },
-            "dev": {
-                "partner_a": config["dev_partner_a_user_id"],
-                "partner_b": config["dev_partner_b_user_id"],
-                "table": "nymph_dev_room_policy",
-            },
+            }
+        self.pairs["dev"] = {
+            "partner_a": config["dev_partner_a_user_id"],
+            "partner_b": config["dev_partner_b_user_id"],
+            "table": "nymph_dev_room_policy",
         }
         all_users = [
             user_id
@@ -205,13 +210,14 @@ class NymphPolicy:
             for key in self.pairs
         }
         self.db = sqlite3.connect(config["state_path"], check_same_thread=False, isolation_level=None)
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS nymph_room_policy "
-            "(id INTEGER PRIMARY KEY CHECK (id = 1), room_id TEXT, creation_reserved_at INTEGER)"
-        )
-        self.db.execute(
-            "INSERT OR IGNORE INTO nymph_room_policy (id, room_id, creation_reserved_at) VALUES (1, NULL, NULL)"
-        )
+        if "legacy" in self.pairs:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS nymph_room_policy "
+                "(id INTEGER PRIMARY KEY CHECK (id = 1), room_id TEXT, creation_reserved_at INTEGER)"
+            )
+            self.db.execute(
+                "INSERT OR IGNORE INTO nymph_room_policy (id, room_id, creation_reserved_at) VALUES (1, NULL, NULL)"
+            )
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS nymph_dev_room_policy "
             "(id INTEGER PRIMARY KEY CHECK (id = 1), room_id TEXT, creation_reserved_at INTEGER)"
@@ -307,7 +313,7 @@ class NymphPolicy:
         return row[0] if row else None
 
     def current_room_id(self) -> str | None:
-        return self.room_id("legacy")
+        return self.room_id("legacy") if "legacy" in self.pairs else None
 
     def pair_for_user(self, user_id: str) -> tuple[str, dict[str, str]] | None:
         for pair_key, pair in self.pairs.items():

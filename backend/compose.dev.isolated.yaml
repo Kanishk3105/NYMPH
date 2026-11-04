@@ -1,0 +1,103 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.10-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_DB: synapse
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+    secrets:
+      - postgres_password
+    volumes:
+      - stage3h1_dev_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - stage3h1_dev
+    security_opt:
+      - no-new-privileges:true
+
+  synapse-generate:
+    image: ${SYNAPSE_IMAGE:-matrixdotorg/synapse:v1.164.2}
+    profiles: ["init"]
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME in .env.dev.isolated}
+      SYNAPSE_REPORT_STATS: "no"
+    volumes:
+      - stage3h1_dev_synapse_data:/data
+    command: generate
+    networks:
+      - stage3h1_dev
+
+  synapse:
+    image: ${SYNAPSE_IMAGE:-matrixdotorg/synapse:v1.164.2}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME in .env.dev.isolated}
+      SYNAPSE_REPORT_STATS: "no"
+      DEV_MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME}
+      DEV_HOMESERVER_URL: ${DEV_HOMESERVER_URL:?Set DEV_HOMESERVER_URL in .env.dev.isolated}
+      DEV_PARTNER_A_USER_ID: ${DEV_PARTNER_A_USER_ID:?Set DEV_PARTNER_A_USER_ID in .env.dev.isolated}
+      DEV_PARTNER_B_USER_ID: ${DEV_PARTNER_B_USER_ID:?Set DEV_PARTNER_B_USER_ID in .env.dev.isolated}
+      DEV_APP_ORIGINS: ${DEV_APP_ORIGINS:-http://localhost:5173,http://127.0.0.1:5174,https://localhost}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: synapse
+      POSTGRES_DB: synapse
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      REGISTRATION_SHARED_SECRET_FILE: /run/secrets/registration_shared_secret
+      PYTHONPATH: /modules
+    secrets:
+      - postgres_password
+      - registration_shared_secret
+    volumes:
+      - stage3h1_dev_synapse_data:/data
+      - ./dev-modules:/modules:ro
+      - ./tests:/tests:ro
+      - ./configure_isolated_dev_synapse.py:/opt/nymph/configure_synapse.py:ro
+    ports:
+      - "127.0.0.1:${DEV_MATRIX_PORT:-18008}:8008"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["python /opt/nymph/configure_synapse.py && exec /start.py run"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/_matrix/client/versions', timeout=2).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - stage3h1_dev
+      - stage3h1_dev_host_api
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  stage3h1_dev:
+    name: nymph-stage3h1-dev-network
+    internal: true
+  stage3h1_dev_host_api:
+    name: nymph-stage3h1-dev-api-network
+
+volumes:
+  stage3h1_dev_postgres_data:
+    name: nymph-stage3h1-dev-postgres-data
+  stage3h1_dev_synapse_data:
+    name: nymph-stage3h1-dev-synapse-data
+
+secrets:
+  postgres_password:
+    file: ${DEV_SECRETS_DIR:-./dev-isolated/secrets}/postgres_password
+  registration_shared_secret:
+    file: ${DEV_SECRETS_DIR:-./dev-isolated/secrets}/registration_shared_secret

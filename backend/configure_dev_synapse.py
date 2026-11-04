@@ -53,6 +53,8 @@ def main() -> None:
         {
             "module": "nymph_policy.NymphPolicy",
             "config": {
+                "server_name": "localhost",
+                "legacy_pair_enabled": True,
                 "partner_a_user_id": os.environ["PARTNER_A_USER_ID"],
                 "partner_b_user_id": os.environ["PARTNER_B_USER_ID"],
                 "dev_partner_a_user_id": os.environ["DEV_PARTNER_A_USER_ID"],

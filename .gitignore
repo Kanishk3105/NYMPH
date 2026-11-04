@@ -1,3 +1,6 @@
 node_modules
 .matrix-e2e/
 .env.*.local
+.env.dev.isolated
+backend/dev-isolated/
+backend/dev-backups/

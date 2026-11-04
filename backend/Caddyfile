@@ -1,5 +1,8 @@
 {$MATRIX_SERVER_NAME} {
-	@restricted path /_synapse/admin* /_matrix/client/*/admin* /_matrix/client/*/createRoom
+	@admin_api path /_synapse/admin /_synapse/admin/*
+	respond @admin_api 404
+
+	@restricted path /_matrix/client/*/admin* /_matrix/client/*/createRoom
 	respond @restricted 404
 
 	reverse_proxy synapse:8008

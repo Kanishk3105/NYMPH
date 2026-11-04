@@ -22,6 +22,7 @@ import type {
 import { MsgType, RelationType } from 'matrix-js-sdk/lib/@types/event.js';
 import type { ReactionEventContent, RoomMessageEventContent } from 'matrix-js-sdk/lib/@types/events.js';
 import { RoomMemberEvent } from 'matrix-js-sdk/lib/models/room-member.js';
+import { revokeRecoveryVerifier, writeRecoveryMarkerAfterCleanup } from './recovery-device-cleanup.ts';
 
 export type NymphMode = 'romantic' | 'flirty' | 'spicy' | 'kinky';
 export type NymphEventKind = 'text' | 'mood' | 'sticker' | 'reaction';
@@ -728,6 +729,16 @@ export async function connectMatrix(
       },
       async verifyRecoveryOnSeparateDevice(recoveryKey, password) {
         if (!password) throw new Error('Enter this Matrix account password to verify recovery on a separate device.');
+        await client.setAccountData(RECOVERY_VERIFICATION_EVENT, {
+          key_id: '',
+          verified_at: 0,
+          cross_signing_key_ids: {
+            master_key: '',
+            self_signing_key: '',
+            user_signing_key: '',
+          },
+        });
+        await refreshSecurity();
         const keyId = await client.secretStorage.getDefaultKeyId();
         if (!keyId) throw new Error(`No default Secret Storage key is configured for ${credentials.userId}.`);
         const keyInfo = await client.secretStorage.getKey(keyId);
@@ -788,6 +799,7 @@ export async function connectMatrix(
           let verificationClient: MatrixClient | undefined;
           let loginClient: MatrixClient | undefined;
           let recoveryAuthorization: { userId: string; deviceId: string } | undefined;
+          let temporaryAccessToken: string | undefined;
           let verificationFailure: unknown;
           let cleanupFailed = false;
           try {
@@ -842,6 +854,7 @@ export async function connectMatrix(
               throw new Error('The recovery verification login did not create an account device.');
             }
             temporaryDeviceId = session.device_id;
+            temporaryAccessToken = session.access_token;
             if (recoveryAuthorization && temporaryDeviceId !== recoveryAuthorization.deviceId) {
               throw new Error('The recovery verifier did not use its authorized temporary device ID.');
             }
@@ -927,6 +940,80 @@ export async function connectMatrix(
           } catch (error) {
             verificationFailure = error;
           } finally {
+            if (temporaryDeviceId && temporaryAccessToken && verificationClient) {
+              try {
+                await revokeRecoveryVerifier(
+                  client,
+                  verificationClient,
+                  {
+                    userId: credentials.userId,
+                    primaryDeviceId: client.getDeviceId() ?? '',
+                    temporaryDeviceId,
+                    password,
+                  },
+                  {
+                    cancelAuthorization: async () => {
+                      if (!recoveryAuthorization) return;
+                      const cancellation = await fetch(
+                        `${homeserver.origin}/_synapse/client/nymph/device/cancel`,
+                        {
+                          method: 'POST',
+                          headers: {
+                            Authorization: `Bearer ${credentials.accessToken}`,
+                            'Content-Type': 'application/json',
+                          },
+                          body: '{}',
+                          cache: 'no-store',
+                        },
+                      );
+                      await cancellation.arrayBuffer();
+                      if (!cancellation.ok) throw new Error('Recovery authorization cancellation failed.');
+                    },
+                    isAccessTokenRejected: async () => {
+                      const response = await fetch(
+                        `${homeserver.origin}/_matrix/client/v3/account/whoami`,
+                        {
+                          headers: { Authorization: `Bearer ${temporaryAccessToken}` },
+                          cache: 'no-store',
+                        },
+                      );
+                      await response.arrayBuffer();
+                      return response.status === 401;
+                    },
+                    isNewLoginRejected: async () => {
+                      const verifierDeviceId = temporaryDeviceId;
+                      if (!recoveryAuthorization || !verifierDeviceId) return true;
+                      const verifierLogin = sdk.createClient({ baseUrl: homeserver.origin });
+                      try {
+                        await verifierLogin.login('m.login.password', {
+                          identifier: { type: 'm.id.user', user: credentials.userId },
+                          password,
+                          device_id: verifierDeviceId,
+                        });
+                        await verifierLogin.logout(false);
+                        await client.deleteDevice(verifierDeviceId, {
+                          type: 'm.login.password',
+                          user: credentials.userId,
+                          password,
+                        });
+                        return false;
+                      } catch (error) {
+                        const loginError = error as { httpStatus?: number; errcode?: string };
+                        return loginError.httpStatus === 403 && loginError.errcode === 'M_FORBIDDEN';
+                      } finally {
+                        verifierLogin.stopClient();
+                      }
+                    },
+                  },
+                );
+                temporaryDeviceId = undefined;
+                recoveryAuthorization = undefined;
+                onStatus('Recovery verifier cleanup confirmed: authorization canceled, session terminated, device revoked, and reauthentication rejected.');
+              } catch {
+                cleanupFailed = true;
+                onStatus('Recovery verifier cleanup failed; recovery setup remains incomplete.');
+              }
+            }
             verificationClient?.stopClient();
             loginClient?.stopClient();
             verificationKey.fill(0);
@@ -963,21 +1050,27 @@ export async function connectMatrix(
             }
           }
 
-          if (cleanupFailed) {
-            throw new Error(
-              'The recovery test device could not be revoked. Remove the NYMPH recovery verification device from account settings before continuing.',
-            );
-          }
-          if (verificationFailure) throw verificationFailure;
-          await client.setAccountData(RECOVERY_VERIFICATION_EVENT, {
-            key_id: keyId,
-            verified_at: Date.now(),
-            cross_signing_key_ids: {
-              master_key: masterKeyId,
-              self_signing_key: selfSigningKeyId,
-              user_signing_key: userSigningKeyId,
+          await writeRecoveryMarkerAfterCleanup(
+            async () => {
+              if (cleanupFailed) {
+                throw new Error(
+                  'The recovery test device could not be revoked. Remove the NYMPH recovery verification device from account settings before continuing.',
+                );
+              }
+              if (verificationFailure) throw verificationFailure;
             },
-          });
+            async () => {
+              await client.setAccountData(RECOVERY_VERIFICATION_EVENT, {
+                key_id: keyId,
+                verified_at: Date.now(),
+                cross_signing_key_ids: {
+                  master_key: masterKeyId,
+                  self_signing_key: selfSigningKeyId,
+                  user_signing_key: userSigningKeyId,
+                },
+              });
+            },
+          );
           await refreshSecurity();
           return keyId;
         } finally {
