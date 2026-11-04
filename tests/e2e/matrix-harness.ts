@@ -245,6 +245,8 @@ const state: HarnessState = {
   async cancelVerification(id) {
     if (!this.client) throw new Error('Connect a Matrix client before cancelling verification.');
     await this.client.cancelVerification(id);
+    const index = this.verifications.findIndex((item) => item.id === id);
+    if (index >= 0) this.verifications[index] = { ...this.verifications[index], phase: 'Cancelled' };
   },
   async send(envelope) {
     if (!this.client) throw new Error('Connect a Matrix client before sending.');

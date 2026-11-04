@@ -69,8 +69,9 @@ $form.Controls.AddRange(@($label, $box, $saved, $ok, $cancel))
 $form.AcceptButton = $ok
 $form.CancelButton = $cancel
 $result = $form.ShowDialog()
+$savedConfirmed = $saved.Checked
 $form.Dispose()
-if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $saved.Checked) { exit 2 }
+if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $savedConfirmed) { exit 2 }
 [Console]::Out.Write('confirmed')
 `;
 
@@ -144,6 +145,48 @@ $form.Dispose()
 [Console]::Out.Write($passphrase)
 `;
 
+const recoveryKeyInputScript = `
+Add-Type -AssemblyName System.Windows.Forms
+$account = [Console]::In.ReadLine()
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Existing Matrix recovery key - $account"
+$form.Width = 560
+$form.Height = 190
+$form.StartPosition = 'CenterScreen'
+$label = New-Object System.Windows.Forms.Label
+$label.Text = 'Enter the existing recovery key from your offline copy. It is not displayed or saved by this dialog.'
+$label.Left = 12
+$label.Top = 12
+$label.Width = 520
+$label.Height = 36
+$key = New-Object System.Windows.Forms.TextBox
+$key.Left = 12
+$key.Top = 60
+$key.Width = 520
+$key.UseSystemPasswordChar = $true
+$ok = New-Object System.Windows.Forms.Button
+$ok.Text = 'Continue'
+$ok.Left = 440
+$ok.Top = 105
+$ok.Width = 90
+$ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = 'Cancel'
+$cancel.Left = 345
+$cancel.Top = 105
+$cancel.Width = 80
+$cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$form.Controls.AddRange(@($label, $key, $ok, $cancel))
+$form.AcceptButton = $ok
+$form.CancelButton = $cancel
+$result = $form.ShowDialog()
+$recoveryKey = $key.Text
+$key.Clear()
+$form.Dispose()
+if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $recoveryKey) { exit 2 }
+[Console]::Out.Write($recoveryKey)
+`;
+
 const protectRecoveryExportScript = `
 $path = [Console]::In.ReadLine()
 $acl = Get-Acl -LiteralPath $path
@@ -167,9 +210,10 @@ if (-not $verified.AreAccessRulesProtected -or $actual.Count -ne 2 -or $actual -
 `;
 
 function runLocalPowerShellDialog(script: string, input: string, failure: string): string {
+  const utf8 = '$utf8 = New-Object System.Text.UTF8Encoding($false); [Console]::InputEncoding = $utf8; [Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; ';
   const result = spawnSync(
     'powershell.exe',
-    ['-NoProfile', '-STA', '-Command', script],
+    ['-NoProfile', '-STA', '-Command', utf8 + script],
     { input, encoding: 'utf8', windowsHide: false, maxBuffer: 16 * 1024 },
   );
   if (result.error || result.status !== 0) throw new Error(failure);
@@ -193,6 +237,16 @@ function requestExportPassphrase(userId: string): string {
   );
   if (passphrase.length < 12) throw new Error(`Recovery-export passphrase is too short for ${userId}.`);
   return passphrase;
+}
+
+function requestExistingRecoveryKey(userId: string): string {
+  const recoveryKey = runLocalPowerShellDialog(
+    recoveryKeyInputScript,
+    `${userId}\n`,
+    `The existing recovery key was not provided for ${userId}.`,
+  );
+  if (!recoveryKey) throw new Error(`The existing recovery key was not provided for ${userId}.`);
+  return recoveryKey;
 }
 
 async function writeProtectedRecoveryExport(path: string, encryptedExport: string): Promise<void> {
@@ -236,6 +290,7 @@ async function prepareAndVerifyRecovery(
 ): Promise<{ recoveryKey: string; identityIds: string[] }> {
   let security = await call<RecoverySecurityState>(page, 'refreshSecurity');
   let recoveryKey: string;
+  let exportContents: Awaited<ReturnType<typeof decryptRecoveryExport>> | undefined;
 
   if (!security.defaultSecretStorageKeyId) {
     if (security.publicCrossSigningKeysPresent) {
@@ -251,7 +306,6 @@ async function prepareAndVerifyRecovery(
     if (!recoveryKey) throw new Error(`Matrix did not generate a recovery key for ${userId}.`);
     confirmRecoveryKeyOffline(userId, recoveryKey);
     await call<string>(page, 'commitSecretStorageSetup', recoveryKey);
-    await call(page, 'bootstrapSecurity', password);
     const keyId = (await call<RecoverySecurityState>(page, 'refreshSecurity')).defaultSecretStorageKeyId;
     if (!keyId) throw new Error(`Secret Storage was not committed for ${userId}.`);
     const encryptedExport = await encryptRecoveryExport(
@@ -259,24 +313,23 @@ async function prepareAndVerifyRecovery(
       passphrase,
     );
     await writeProtectedRecoveryExport(exportFile, encryptedExport);
+    await call(page, 'bootstrapSecurity', password);
   } else {
-    if (!(await fileExists(exportFile))) {
-      throw new Error(`Secret Storage exists for ${userId}, but its encrypted recovery export is missing; refusing to create a replacement key.`);
-    }
-    const encryptedExport = await readFile(exportFile, 'utf8');
-    const exportContents = await decryptRecoveryExport(encryptedExport, passphrase);
-    try {
+    if (await fileExists(exportFile)) {
+      const encryptedExport = await readFile(exportFile, 'utf8');
+      exportContents = await decryptRecoveryExport(encryptedExport, passphrase);
       if (
         exportContents.account !== userId ||
         exportContents.keyId !== security.defaultSecretStorageKeyId
       ) {
+        exportContents.recoveryKey = '';
         throw new Error(`The encrypted recovery export does not match ${userId}'s existing Secret Storage key.`);
       }
       recoveryKey = exportContents.recoveryKey;
-    } finally {
       exportContents.recoveryKey = '';
+    } else {
+      recoveryKey = requestExistingRecoveryKey(userId);
     }
-    await call(page, 'validateRecoveryExport', encryptedExport, passphrase, recoveryKey, userId);
 
     if (!security.crossSigningReady) {
       if (security.publicCrossSigningKeysPresent) {
@@ -290,9 +343,21 @@ async function prepareAndVerifyRecovery(
     }
   }
 
+  const keyId = await call<string>(page, 'verifyRecoveryOnSeparateDevice', recoveryKey, password);
+  if (!(await fileExists(exportFile))) {
+    const securityState = await call<RecoverySecurityState>(page, 'refreshSecurity');
+    if (!securityState.defaultSecretStorageKeyId) {
+      throw new Error(`Secret Storage is not configured for ${userId}.`);
+    }
+    const encryptedExport = await encryptRecoveryExport(
+      { account: userId, keyId: securityState.defaultSecretStorageKeyId, recoveryKey },
+      passphrase,
+    );
+    await writeProtectedRecoveryExport(exportFile, encryptedExport);
+  }
   const encryptedExport = await readFile(exportFile, 'utf8');
   await call(page, 'validateRecoveryExport', encryptedExport, passphrase, recoveryKey, userId);
-  const keyId = await call<string>(page, 'verifyRecoveryOnSeparateDevice', recoveryKey, password);
+  exportContents = undefined;
   security = await call<RecoverySecurityState>(page, 'refreshSecurity');
   if (
     keyId !== security.defaultSecretStorageKeyId ||
@@ -480,9 +545,14 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     )).toBe(403);
 
     exportPassphraseA = requestExportPassphrase(partnerA);
-    do {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       exportPassphraseB = requestExportPassphrase(partnerB);
-    } while (exportPassphraseB === exportPassphraseA);
+      if (exportPassphraseB !== exportPassphraseA) break;
+      exportPassphraseB = '';
+    }
+    if (!exportPassphraseB) {
+      throw new Error('Each partner must use a distinct recovery-export passphrase.');
+    }
     const recoveryA = await prepareAndVerifyRecovery(
       pageA,
       partnerA,
@@ -538,8 +608,8 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     await call(pageB, 'acceptVerification', incoming.id);
     const outgoing = await waitForValue<{ id: string }>(
       pageA,
-      'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
-      [partnerB],
+      'h => h.getVerifications().find(item => item.userId === args[0] && item.id !== args[1])',
+      [partnerB, canceledOutgoing.id],
     );
     await call(pageA, 'startSasVerification', outgoing.id);
     await call(pageB, 'startSasVerification', incoming.id);
