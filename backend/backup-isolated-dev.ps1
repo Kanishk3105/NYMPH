@@ -22,13 +22,14 @@ $postgresContainer = "$projectName-postgres-1"
 if ($WhatIfPreference) {
     $actions = if ($Mode -eq 'Create') {
         @(
-            @{ Target = 'External backup path'; Action = 'Stage isolated dev resources in a temporary directory' },
-            @{ Target = $synapseContainer; Action = 'Stop only the isolated Synapse service for a consistent data-volume snapshot, then restart it' },
-            @{ Target = $postgresContainer; Action = 'Create logical PostgreSQL dump from isolated database' },
-            @{ Target = $synapseContainer; Action = 'Copy isolated Synapse volume and secrets' },
-            @{ Target = 'Closed isolated browser profiles'; Action = 'Include development crypto profiles in the encrypted backup' },
+            @{ Target = 'External backup path'; Action = 'Create a new encrypted file without overwriting an existing backup' },
+            @{ Target = $synapseContainer; Action = 'Stop only isolated Synapse for a consistent snapshot; restart it in finally' },
+            @{ Target = $postgresContainer; Action = 'Create and remove a logical PostgreSQL dump; keep PostgreSQL running' },
+            @{ Target = $synapseContainer; Action = 'Copy isolated Synapse data, service secrets, and deployment configuration' },
+            @{ Target = 'Closed isolated browser profiles'; Action = 'Include profiles if present and record their inventory' },
             @{ Target = $BackupPath; Action = 'Encrypt backup with scrypt and AES-256-GCM' },
-            @{ Target = 'Temporary staging data'; Action = 'Overwrite and remove plaintext staging data where supported' }
+            @{ Target = $BackupPath; Action = 'Authenticate ciphertext without writing a decrypted verification copy' },
+            @{ Target = 'Temporary staging data'; Action = 'Restrict ACLs, overwrite plaintext files, remove the tree, and verify absence' }
         )
     } else {
         @(
@@ -45,34 +46,151 @@ if ($WhatIfPreference) {
     return
 }
 
-function Get-PlaintextPassphrase {
-    $secure = Read-Host 'Offline backup passphrase (12+ characters)' -AsSecureString
-    $pointer = [IntPtr]::Zero
+function Read-SecurePassphraseOnce {
+    param([Parameter(Mandatory)][string]$Message)
+
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'NYMPH local backup passphrase'
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ShowInTaskbar = $true
+    $form.TopMost = $true
+    $form.ClientSize = [System.Drawing.Size]::new(440, 150)
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Message
+    $label.Location = [System.Drawing.Point]::new(16, 16)
+    $label.Size = [System.Drawing.Size]::new(408, 42)
+    $form.Controls.Add($label)
+
+    $entry = New-Object System.Windows.Forms.TextBox
+    $entry.Location = [System.Drawing.Point]::new(16, 64)
+    $entry.Size = [System.Drawing.Size]::new(408, 24)
+    $entry.UseSystemPasswordChar = $true
+    $entry.MaxLength = 2048
+    $entry.ShortcutsEnabled = $true
+    $form.Controls.Add($entry)
+
+    $validation = New-Object System.Windows.Forms.Label
+    $validation.Location = [System.Drawing.Point]::new(16, 94)
+    $validation.Size = [System.Drawing.Size]::new(270, 24)
+    $validation.ForeColor = [System.Drawing.Color]::Firebrick
+    $form.Controls.Add($validation)
+
+    $continue = New-Object System.Windows.Forms.Button
+    $continue.Text = 'Continue'
+    $continue.Location = [System.Drawing.Point]::new(292, 100)
+    $continue.Size = [System.Drawing.Size]::new(80, 30)
+    $continue.Add_Click({
+        if ($entry.Text.Length -lt 12) {
+            $validation.Text = 'Use at least 12 characters.'
+            return
+        }
+        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.Close()
+    }.GetNewClosure())
+    $form.Controls.Add($continue)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.Location = [System.Drawing.Point]::new(376, 100)
+    $cancel.Size = [System.Drawing.Size]::new(48, 30)
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.Controls.Add($cancel)
+    $form.AcceptButton = $continue
+    $form.CancelButton = $cancel
+    $form.Add_Shown({ $entry.Focus() }.GetNewClosure())
+
+    $secure = $null
     try {
-        if ($secure.Length -lt 12) {
-            throw 'Backup passphrase must contain at least 12 characters.'
+        if ($form.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+            throw 'Passphrase entry was cancelled.'
         }
-        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+        $secure = New-Object System.Security.SecureString
+        foreach ($character in $entry.Text.ToCharArray()) {
+            $secure.AppendChar($character)
+        }
+        $secure.MakeReadOnly()
+        return $secure
+    } catch {
+        if ($secure) {
+            $secure.Dispose()
+        }
+        throw
     } finally {
-        if ($pointer -ne [IntPtr]::Zero) {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+        $entry.Clear()
+        $form.Dispose()
+    }
+}
+
+function Get-SecurePassphrase {
+    $first = Read-SecurePassphraseOnce -Message 'Enter 12+ characters in the masked field. Paste is supported; nothing is saved.'
+    try {
+        $confirmation = Read-SecurePassphraseOnce -Message 'Re-enter the same passphrase in the masked field. Nothing is saved.'
+        try {
+            if (-not (Test-SecurePassphraseMatch $first $confirmation)) {
+                throw 'The passphrases did not match. No backup changes were made.'
+            }
+        } finally {
+            $confirmation.Dispose()
         }
-        $secure.Dispose()
+        return $first
+    } catch {
+        $first.Dispose()
+        throw
+    }
+}
+
+function Test-SecurePassphraseMatch {
+    param(
+        [Parameter(Mandatory)][System.Security.SecureString]$First,
+        [Parameter(Mandatory)][System.Security.SecureString]$Second
+    )
+
+    if ($First.Length -ne $Second.Length) {
+        return $false
+    }
+    $firstPointer = [IntPtr]::Zero
+    $secondPointer = [IntPtr]::Zero
+    try {
+        $firstPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($First)
+        $secondPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Second)
+        for ($index = 0; $index -lt $First.Length; $index++) {
+            if ([Runtime.InteropServices.Marshal]::ReadInt16($firstPointer, $index * 2) -ne
+                [Runtime.InteropServices.Marshal]::ReadInt16($secondPointer, $index * 2)) {
+                return $false
+            }
+        }
+        return $true
+    } finally {
+        if ($firstPointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($firstPointer)
+        }
+        if ($secondPointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secondPointer)
+        }
     }
 }
 
 function Invoke-BackupCipher {
     param(
-        [Parameter(Mandatory)][ValidateSet('encrypt', 'decrypt')][string]$Operation,
+        [Parameter(Mandatory)][ValidateSet('encrypt', 'decrypt', 'verify')][string]$Operation,
         [Parameter(Mandatory)][string]$InputPath,
-        [Parameter(Mandatory)][string]$OutputPath,
-        [Parameter(Mandatory)][string]$Passphrase
+        [string]$OutputPath,
+        [Parameter(Mandatory)][System.Security.SecureString]$Passphrase
     )
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = 'node'
-    $startInfo.Arguments = '"{0}" {1} "{2}" "{3}"' -f $scriptPath, $Operation, $InputPath, $OutputPath
+    if ($Operation -eq 'verify') {
+        $startInfo.Arguments = '"{0}" verify "{1}"' -f $scriptPath, $InputPath
+    } else {
+        $startInfo.Arguments = '"{0}" {1} "{2}" "{3}"' -f $scriptPath, $Operation, $InputPath, $OutputPath
+    }
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
@@ -80,21 +198,48 @@ function Invoke-BackupCipher {
     $startInfo.RedirectStandardError = $true
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
-    if (-not $process.Start()) {
-        throw 'Could not start the authenticated backup encryption utility.'
-    }
-    $process.StandardInput.WriteLine($Passphrase)
-    $process.StandardInput.Close()
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
-    $stdout = $stdoutTask.GetAwaiter().GetResult()
-    $stderr = $stderrTask.GetAwaiter().GetResult()
-    if ($process.ExitCode -ne 0) {
-        throw "Authenticated backup $Operation failed: $($stderr.Trim())"
-    }
-    if ($stdout -notmatch "^$Operation complete") {
-        throw "Authenticated backup $Operation did not report completion."
+    $pointer = [IntPtr]::Zero
+    $characters = New-Object char[] $Passphrase.Length
+    $utf8Bytes = $null
+    try {
+        if (-not $process.Start()) {
+            throw 'Could not start the authenticated backup encryption utility.'
+        }
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Passphrase)
+        [Runtime.InteropServices.Marshal]::Copy($pointer, $characters, 0, $characters.Length)
+        $utf8Bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($characters)
+        $stdin = $process.StandardInput.BaseStream
+        $stdin.Write($utf8Bytes, 0, $utf8Bytes.Length)
+        $stdin.WriteByte(10)
+        $stdin.Flush()
+        $process.StandardInput.Close()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            if ($Operation -eq 'decrypt' -and $stderr -match '^Backup decrypt failed \[stage=([a-z0-9 -]+); exception=([A-Za-z0-9_]+)(; code=([A-Z0-9_]+))?\]\.') {
+                $diagnosticCode = if ($matches[4]) { "; code=$($matches[4])" } else { '' }
+                throw "Authenticated backup decrypt failed: stage=$($matches[1]); exception=$($matches[2])$diagnosticCode."
+            }
+            if ($Operation -eq 'decrypt') {
+                throw "Authenticated backup decrypt helper failed with exit code $($process.ExitCode); sensitive exception details were suppressed."
+            }
+            throw "Authenticated backup $Operation failed: $($stderr.Trim())"
+        }
+        if ($stdout -notmatch "^$Operation complete") {
+            throw "Authenticated backup $Operation did not report completion."
+        }
+    } finally {
+        [Array]::Clear($characters, 0, $characters.Length)
+        if ($utf8Bytes) {
+            [Array]::Clear($utf8Bytes, 0, $utf8Bytes.Length)
+        }
+        if ($pointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+        }
+        $process.Dispose()
     }
 }
 
@@ -105,6 +250,9 @@ function Remove-PlaintextTree {
         return
     }
     foreach ($file in Get-ChildItem -LiteralPath $Path -File -Force -Recurse) {
+        if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            continue
+        }
         $stream = [System.IO.File]::Open(
             $file.FullName,
             [System.IO.FileMode]::Open,
@@ -127,35 +275,68 @@ function Remove-PlaintextTree {
         }
     }
     Remove-Item -LiteralPath $Path -Recurse -Force
+    if (Test-Path -LiteralPath $Path) {
+        throw 'Plaintext staging directory remains after cleanup.'
+    }
 }
 
-function Remove-PlaintextFile {
+function Protect-PlaintextDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $systemAccount = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        $null = $acl.RemoveAccessRuleSpecific($rule)
+    }
+    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    foreach ($identity in @($currentUser, $systemAccount)) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+            $identity,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [Security.AccessControl.PropagationFlags]::None,
+            $allow
+        )
+        $acl.AddAccessRule($rule)
+    }
+    $acl.SetOwner($currentUser)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Protect-EncryptedBackupFile {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return
+        throw 'Encrypted backup file is missing before ACL protection.'
     }
-    $stream = [System.IO.File]::Open(
-        $Path,
-        [System.IO.FileMode]::Open,
-        [System.IO.FileAccess]::ReadWrite,
-        [System.IO.FileShare]::None
-    )
-    try {
-        $buffer = New-Object byte[] 65536
-        $remaining = $stream.Length
-        $stream.Position = 0
-        while ($remaining -gt 0) {
-            $count = [Math]::Min($buffer.Length, $remaining)
-            $stream.Write($buffer, 0, $count)
-            $remaining -= $count
-        }
-        $stream.Flush($true)
-        [Array]::Clear($buffer, 0, $buffer.Length)
-    } finally {
-        $stream.Dispose()
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $systemAccount = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        $null = $acl.RemoveAccessRuleSpecific($rule)
     }
-    Remove-Item -LiteralPath $Path -Force
+    foreach ($identity in @($currentUser, $systemAccount)) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+            $identity,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.AccessControlType]::Allow
+        )
+        $acl.AddAccessRule($rule)
+    }
+    $acl.SetOwner($currentUser)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+    $verifiedAcl = Get-Acl -LiteralPath $Path
+    $identities = @($verifiedAcl.Access | ForEach-Object {
+        $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+    })
+    if (-not $verifiedAcl.AreAccessRulesProtected -or $identities.Count -ne 2 -or
+        $identities -notcontains $currentUser.Value -or $identities -notcontains $systemAccount.Value) {
+        throw 'Encrypted backup file ACL is not restricted to the current user and SYSTEM.'
+    }
 }
 
 function Assert-OutsideRepository {
@@ -228,16 +409,10 @@ function Invoke-DisposablePostgresRestore {
     $volumeCreated = $false
     $containerCreated = $false
     try {
-        if (-not $PSCmdlet.ShouldProcess($volumeName, 'Create a disposable isolated PostgreSQL restore volume')) {
-            throw 'Disposable PostgreSQL restore volume creation was not authorized.'
-        }
         $null = & docker volume create $volumeName
         if ($LASTEXITCODE -ne 0) { throw 'Could not create the disposable PostgreSQL restore volume.' }
         $volumeCreated = $true
 
-        if (-not $PSCmdlet.ShouldProcess($containerName, 'Start an isolated PostgreSQL restore-test container without published ports')) {
-            throw 'Disposable PostgreSQL restore container startup was not authorized.'
-        }
         $null = & docker run --detach `
             --name $containerName `
             --network none `
@@ -260,18 +435,14 @@ function Invoke-DisposablePostgresRestore {
         }
         if (-not $ready) { throw 'The disposable PostgreSQL restore-test container did not become ready.' }
 
-        if (-not $PSCmdlet.ShouldProcess($containerName, 'Copy the authenticated PostgreSQL dump into the disposable container')) {
-            throw 'Copying the PostgreSQL dump into the disposable container was not authorized.'
-        }
         & docker cp $DumpPath "${containerName}:/tmp/nymph-dev.dump"
         if ($LASTEXITCODE -ne 0) { throw 'Could not copy the PostgreSQL dump to the disposable container.' }
 
-        if (-not $PSCmdlet.ShouldProcess($containerName, 'Restore the PostgreSQL dump in the disposable database')) {
-            throw 'Restoring the PostgreSQL dump in the disposable database was not authorized.'
-        }
         & docker exec $containerName pg_restore --exit-on-error -U synapse -d synapse /tmp/nymph-dev.dump
         if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL rejected the restored database dump.' }
 
+        & docker exec $containerName psql -v ON_ERROR_STOP=1 -U synapse -d synapse -c 'CREATE EXTENSION IF NOT EXISTS amcheck' *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not enable amcheck in the disposable restored database.' }
         & docker exec $containerName pg_amcheck --database=synapse --username=synapse
         if ($LASTEXITCODE -ne 0) { throw 'PostgreSQL consistency checks failed on the restored database.' }
         $validation = & docker exec $containerName psql -U synapse -d synapse -tAc "SELECT (SELECT count(*) FROM pg_catalog.pg_tables WHERE schemaname = 'public') || '|' || (SELECT count(*) FROM users) || '|' || (SELECT count(*) FROM rooms)"
@@ -289,21 +460,13 @@ function Invoke-DisposablePostgresRestore {
         $volumeCleanupFailed = $false
         try {
             if ($containerCreated) {
-                if ($PSCmdlet.ShouldProcess($containerName, 'Remove the disposable PostgreSQL restore-test container')) {
-                    & docker rm --force $containerName *> $null
-                    $containerCleanupFailed = $LASTEXITCODE -ne 0
-                } else {
-                    $containerCleanupFailed = $true
-                }
+                & docker rm --force $containerName *> $null
+                $containerCleanupFailed = $LASTEXITCODE -ne 0
             }
         } finally {
             if ($volumeCreated) {
-                if ($PSCmdlet.ShouldProcess($volumeName, 'Remove the disposable PostgreSQL restore-test volume')) {
-                    & docker volume rm $volumeName *> $null
-                    $volumeCleanupFailed = $LASTEXITCODE -ne 0
-                } else {
-                    $volumeCleanupFailed = $true
-                }
+                & docker volume rm $volumeName *> $null
+                $volumeCleanupFailed = $LASTEXITCODE -ne 0
             }
         }
         if ($containerCleanupFailed -or $volumeCleanupFailed) {
@@ -321,16 +484,10 @@ function Invoke-DisposableSynapseRestore {
     $volumeCreated = $false
     $containerCreated = $false
     try {
-        if (-not $PSCmdlet.ShouldProcess($volumeName, 'Create a disposable isolated Synapse restore volume')) {
-            throw 'Disposable Synapse restore volume creation was not authorized.'
-        }
         $null = & docker volume create $volumeName
         if ($LASTEXITCODE -ne 0) { throw 'Could not create the disposable Synapse restore volume.' }
         $volumeCreated = $true
 
-        if (-not $PSCmdlet.ShouldProcess($containerName, 'Create a no-network Synapse restore-test container')) {
-            throw 'Disposable Synapse restore container creation was not authorized.'
-        }
         $null = & docker create `
             --name $containerName `
             --network none `
@@ -341,15 +498,9 @@ function Invoke-DisposableSynapseRestore {
         if ($LASTEXITCODE -ne 0) { throw 'Could not create the disposable Synapse restore-test container.' }
         $containerCreated = $true
 
-        if (-not $PSCmdlet.ShouldProcess($containerName, 'Copy authenticated Synapse data into the disposable volume')) {
-            throw 'Copying Synapse data into the disposable volume was not authorized.'
-        }
         & docker cp "$SynapseDataPath\." "${containerName}:/data/"
         if ($LASTEXITCODE -ne 0) { throw 'Could not copy Synapse data into the disposable volume.' }
 
-        if (-not $PSCmdlet.ShouldProcess($containerName, 'Start isolated Synapse data readability validation')) {
-            throw 'Starting the disposable Synapse data validator was not authorized.'
-        }
         $null = & docker start $containerName
         if ($LASTEXITCODE -ne 0) { throw 'Could not start the disposable Synapse data validator.' }
         $validation = @'
@@ -369,28 +520,20 @@ if policy.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
 policy.close()
 print("Restored Synapse config, signing key, and policy database are readable and internally consistent.")
 '@
-        & docker exec $containerName python -c $validation
+        $validation | & docker exec -i $containerName python -
         if ($LASTEXITCODE -ne 0) { throw 'Disposable Synapse data validation failed.' }
     } finally {
         $containerCleanupFailed = $false
         $volumeCleanupFailed = $false
         try {
             if ($containerCreated) {
-                if ($PSCmdlet.ShouldProcess($containerName, 'Remove the disposable Synapse restore-test container')) {
-                    & docker rm --force $containerName *> $null
-                    $containerCleanupFailed = $LASTEXITCODE -ne 0
-                } else {
-                    $containerCleanupFailed = $true
-                }
+                & docker rm --force $containerName *> $null
+                $containerCleanupFailed = $LASTEXITCODE -ne 0
             }
         } finally {
             if ($volumeCreated) {
-                if ($PSCmdlet.ShouldProcess($volumeName, 'Remove the disposable Synapse restore-test volume')) {
-                    & docker volume rm $volumeName *> $null
-                    $volumeCleanupFailed = $LASTEXITCODE -ne 0
-                } else {
-                    $volumeCleanupFailed = $true
-                }
+                & docker volume rm $volumeName *> $null
+                $volumeCleanupFailed = $LASTEXITCODE -ne 0
             }
         }
         if ($containerCleanupFailed -or $volumeCleanupFailed) {
@@ -417,8 +560,11 @@ if ($Mode -eq 'Create') {
         throw 'The isolated deployment environment and secrets must exist before backup.'
     }
 
-    $activeProfileUsers = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
-        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profileRoot) }
+    $activeProfileUsers = Microsoft.PowerShell.Management\Get-WmiObject Win32_Process -Filter "Name='chrome.exe'" |
+        Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine.IndexOf($profileRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        }
     if ($activeProfileUsers) {
         throw 'Close isolated Matrix test browsers before backing up their crypto profiles.'
     }
@@ -438,21 +584,24 @@ if ($Mode -eq 'Create') {
         throw 'The isolated PostgreSQL service is not running under its dedicated Compose project.'
     }
 
-    $passphrase = Get-PlaintextPassphrase
-    $compose = @(
-        'compose', '--project-name', $projectName,
-        '--env-file', $environmentFile,
-        '-f', (Join-Path $PSScriptRoot 'compose.dev.isolated.yaml')
-    )
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) "nymph-stage3h1-backup-$timestamp"
-    $stagingArchive = "$stagingRoot.tar"
+    if (-not $PSCmdlet.ShouldProcess(
+        $BackupPath,
+        'Create an authenticated encrypted backup of only the isolated NYMPH development environment'
+    )) {
+        Write-Warning 'Backup creation cancelled before any resource or file changes.'
+        return
+    }
+    $passphrase = $null
+    $backupVerified = $false
+    $encryptedBackupCreated = $false
+    $stagingContainer = Join-Path ([System.IO.Path]::GetTempPath()) ('nymph-stage3h1-backup-' + [Guid]::NewGuid().ToString('N'))
+    $stagingRoot = Join-Path $stagingContainer 'payload'
+    $stagingArchive = Join-Path $stagingContainer 'backup.tar'
     $synapseStoppedForSnapshot = $false
     try {
+        $passphrase = Get-SecurePassphrase
         if (-not (Test-Path -LiteralPath $backupDirectory -PathType Container)) {
-            if ($PSCmdlet.ShouldProcess($backupDirectory, 'Create external encrypted-backup directory')) {
-                New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
-            }
+            New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
         }
         if (-not (Test-Path -LiteralPath $backupDirectory -PathType Container)) {
             throw 'The external backup directory is not available.'
@@ -460,51 +609,50 @@ if ($Mode -eq 'Create') {
         if (Test-Path -LiteralPath $BackupPath) {
             throw 'Refusing to overwrite an existing encrypted backup.'
         }
-        if ($PSCmdlet.ShouldProcess($stagingRoot, 'Create temporary plaintext backup staging area')) {
-            New-Item -ItemType Directory -Path $stagingRoot | Out-Null
-        }
+        New-Item -ItemType Directory -Path $stagingRoot | Out-Null
         if (-not (Test-Path -LiteralPath $stagingRoot -PathType Container)) {
             throw 'Backup staging area was not created.'
         }
-        if ($PSCmdlet.ShouldProcess($synapseContainer, 'Stop only the isolated Synapse service for a consistent snapshot')) {
-            & docker stop $synapseContainer *> $null
-            if ($LASTEXITCODE -ne 0) { throw 'Could not stop the isolated Synapse service for backup.' }
-            $synapseStoppedForSnapshot = $true
-        } else {
-            throw 'Stopping the isolated Synapse service for a consistent backup was not authorized.'
-        }
+        Protect-PlaintextDirectory -Path $stagingContainer
+        & docker stop $synapseContainer *> $null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not stop the isolated Synapse service for backup.' }
+        $synapseStoppedForSnapshot = $true
         $stagedSynapseData = Join-Path $stagingRoot 'synapse-data'
-        if ($PSCmdlet.ShouldProcess($stagedSynapseData, 'Copy isolated Synapse data volume to temporary staging')) {
-            & docker cp "${synapseContainer}:/data" $stagedSynapseData
-            if ($LASTEXITCODE -ne 0) { throw 'Could not stage isolated Synapse data.' }
-        }
+        & docker cp "${synapseContainer}:/data" $stagedSynapseData
+        if ($LASTEXITCODE -ne 0) { throw 'Could not stage isolated Synapse data.' }
         $stagedDump = Join-Path $stagingRoot 'postgres.dump'
-        if ($PSCmdlet.ShouldProcess($stagedDump, 'Create a logical dump from isolated development PostgreSQL')) {
-            try {
-                $dumpScript = 'PGPASSWORD="$(tr -d "\r\n" < /run/secrets/postgres_password)" pg_dump -U synapse -Fc -f /tmp/nymph-dev.dump synapse'
-                $encodedDumpScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($dumpScript))
-                & docker exec $postgresContainer sh -c "echo $encodedDumpScript | base64 -d | sh -e"
-                if ($LASTEXITCODE -ne 0) { throw 'Could not create isolated PostgreSQL dump.' }
-                & docker cp "${postgresContainer}:/tmp/nymph-dev.dump" $stagedDump
-                if ($LASTEXITCODE -ne 0) { throw 'Could not copy isolated PostgreSQL dump into staging.' }
-            } finally {
-                & docker exec $postgresContainer rm -f /tmp/nymph-dev.dump
-                if ($LASTEXITCODE -ne 0) { throw 'Could not remove temporary PostgreSQL dump from the isolated container.' }
-            }
+        try {
+            $dumpScript = 'PGPASSWORD="$(tr -d "\r\n" < /run/secrets/postgres_password)" pg_dump -U synapse -Fc -f /tmp/nymph-dev.dump synapse'
+            $encodedDumpScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($dumpScript))
+            & docker exec $postgresContainer sh -c "echo $encodedDumpScript | base64 -d | sh -e"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create isolated PostgreSQL dump.' }
+            & docker cp "${postgresContainer}:/tmp/nymph-dev.dump" $stagedDump
+            if ($LASTEXITCODE -ne 0) { throw 'Could not copy isolated PostgreSQL dump into staging.' }
+        } finally {
+            & docker exec $postgresContainer rm -f /tmp/nymph-dev.dump
+            if ($LASTEXITCODE -ne 0) { throw 'Could not remove temporary PostgreSQL dump from the isolated container.' }
         }
         if (Test-Path -LiteralPath $secretDirectory -PathType Container) {
-            if ($PSCmdlet.ShouldProcess((Join-Path $stagingRoot 'secrets'), 'Stage isolated account and service credentials')) {
-                Copy-Item -LiteralPath $secretDirectory -Destination (Join-Path $stagingRoot 'secrets') -Recurse
-            }
+            Copy-Item -LiteralPath $secretDirectory -Destination (Join-Path $stagingRoot 'secrets') -Recurse
         }
-        if ($PSCmdlet.ShouldProcess((Join-Path $stagingRoot 'deployment.env'), 'Stage isolated deployment configuration')) {
-            Copy-Item -LiteralPath $environmentFile -Destination (Join-Path $stagingRoot 'deployment.env')
-        }
+        Copy-Item -LiteralPath $environmentFile -Destination (Join-Path $stagingRoot 'deployment.env')
+        $stagedDeployment = Join-Path $stagingRoot 'deployment'
+        New-Item -ItemType Directory -Path $stagedDeployment | Out-Null
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'compose.dev.isolated.yaml') -Destination (Join-Path $stagedDeployment 'compose.dev.isolated.yaml')
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'configure_isolated_dev_synapse.py') -Destination (Join-Path $stagedDeployment 'configure_isolated_dev_synapse.py')
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'dev-modules') -Destination (Join-Path $stagedDeployment 'dev-modules') -Recurse
         if (Test-Path -LiteralPath $profileRoot -PathType Container) {
-            if ($PSCmdlet.ShouldProcess((Join-Path $stagingRoot 'crypto-profiles'), 'Stage closed isolated Matrix crypto profiles')) {
-                Copy-Item -LiteralPath $profileRoot -Destination (Join-Path $stagingRoot 'crypto-profiles') -Recurse
-            }
+            Copy-Item -LiteralPath $profileRoot -Destination (Join-Path $stagingRoot 'crypto-profiles') -Recurse
         }
+        $profileFiles = if (Test-Path -LiteralPath (Join-Path $stagingRoot 'crypto-profiles')) {
+            @(Get-ChildItem -LiteralPath (Join-Path $stagingRoot 'crypto-profiles') -File -Force -Recurse).Count
+        } else {
+            0
+        }
+        [PSCustomObject]@{
+            isolatedCryptoProfileDirectoryPresent = Test-Path -LiteralPath $profileRoot -PathType Container
+            isolatedCryptoProfileFileCount = $profileFiles
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stagingRoot 'backup-inventory.json') -Encoding UTF8
 
         $entries = @(
             Get-ChildItem -LiteralPath $stagingRoot -File -Force -Recurse |
@@ -515,52 +663,48 @@ if ($Mode -eq 'Create') {
                     }
                 }
         )
-        if ($PSCmdlet.ShouldProcess((Join-Path $stagingRoot 'manifest.json'), 'Write non-secret backup integrity manifest')) {
-            [PSCustomObject]@{
-                format = 'nymph-isolated-dev-backup'
-                version = 1
-                files = $entries
-            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stagingRoot 'manifest.json') -Encoding UTF8
+        [PSCustomObject]@{
+            format = 'nymph-isolated-dev-backup'
+            version = 1
+            files = $entries
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stagingRoot 'manifest.json') -Encoding UTF8
+        Assert-Manifest -Root $stagingRoot
+        & tar.exe -cf $stagingArchive -C $stagingRoot .
+        if ($LASTEXITCODE -ne 0) { throw 'Could not create temporary backup archive.' }
+        Invoke-BackupCipher -Operation encrypt -InputPath $stagingArchive -OutputPath $BackupPath -Passphrase $passphrase
+        $encryptedBackupCreated = Test-Path -LiteralPath $BackupPath -PathType Leaf
+        if (-not $encryptedBackupCreated -or (Get-Item -LiteralPath $BackupPath).Length -le 0) {
+            throw 'The encrypted backup file is missing or empty.'
         }
-        if ($PSCmdlet.ShouldProcess($stagingArchive, 'Create a temporary backup archive')) {
-            & tar.exe -cf $stagingArchive -C $stagingRoot .
-            if ($LASTEXITCODE -ne 0) { throw 'Could not create temporary backup archive.' }
-        }
-        if ($PSCmdlet.ShouldProcess($BackupPath, 'Encrypt isolated development backup with scrypt and AES-256-GCM')) {
-            Invoke-BackupCipher -Operation encrypt -InputPath $stagingArchive -OutputPath $BackupPath -Passphrase $passphrase
-        }
+        Invoke-BackupCipher -Operation verify -InputPath $BackupPath -Passphrase $passphrase
+        Protect-EncryptedBackupFile -Path $BackupPath
+        $backupVerified = $true
         if (-not $WhatIfPreference -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
             Write-Output "Encrypted isolated development backup created: $BackupPath"
         }
     } finally {
-        $passphrase = $null
+        if ($passphrase) {
+            $passphrase.Dispose()
+            $passphrase = $null
+        }
         try {
-            try {
-                if (Test-Path -LiteralPath $stagingArchive -PathType Leaf) {
-                    if ($PSCmdlet.ShouldProcess($stagingArchive, 'Overwrite and remove plaintext archive')) {
-                        Remove-PlaintextFile $stagingArchive
-                    } else {
-                        throw 'Plaintext backup archive cleanup was not authorized.'
-                    }
-                }
-            } finally {
-                if (Test-Path -LiteralPath $stagingRoot -PathType Container) {
-                    if ($PSCmdlet.ShouldProcess($stagingRoot, 'Overwrite and remove plaintext staging tree')) {
-                        Remove-PlaintextTree $stagingRoot
-                    } else {
-                        throw 'Plaintext backup staging cleanup was not authorized.'
-                    }
-                }
+            if (Test-Path -LiteralPath $stagingContainer -PathType Container) {
+                Remove-PlaintextTree $stagingContainer
             }
         } finally {
-            if ($synapseStoppedForSnapshot) {
-                if ($PSCmdlet.ShouldProcess($synapseContainer, 'Restart the isolated Synapse service after backup')) {
+            try {
+                if ($synapseStoppedForSnapshot) {
                     & docker start $synapseContainer *> $null
                     if ($LASTEXITCODE -ne 0) {
                         throw 'The isolated Synapse service did not restart after backup; inspect it before continuing.'
                     }
-                } else {
-                    throw 'The isolated Synapse service remains stopped because its restart was not authorized.'
+                }
+            } finally {
+                if (-not $backupVerified -and $encryptedBackupCreated -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
+                    Remove-Item -LiteralPath $BackupPath -Force
+                    if (Test-Path -LiteralPath $BackupPath) {
+                        throw 'An unverified encrypted backup remains at the destination.'
+                    }
                 }
             }
         }
@@ -573,6 +717,9 @@ if ($Mode -eq 'Create') {
     if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
         throw 'The encrypted backup file does not exist.'
     }
+    if ((Get-Item -LiteralPath $BackupPath).Length -le 0) {
+        throw 'The encrypted backup file is empty.'
+    }
     foreach ($requiredCommand in @('docker', 'node', 'tar.exe')) {
         if (-not (Get-Command $requiredCommand -ErrorAction SilentlyContinue)) {
             throw "Required restore-test command is unavailable: $requiredCommand"
@@ -582,45 +729,71 @@ if ($Mode -eq 'Create') {
     if ($LASTEXITCODE -ne 0 -or -not $engine) {
         throw 'Docker Engine is unavailable; no backup restoration was attempted.'
     }
-    $restoreRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('nymph-stage3h1-restore-' + [Guid]::NewGuid().ToString('N'))
-    $stagingArchive = "$restoreRoot.tar"
-    $passphrase = Get-PlaintextPassphrase
+    if (-not $PSCmdlet.ShouldProcess(
+        $BackupPath,
+        'Authenticate and restore-test only into newly created disposable NYMPH resources'
+    )) {
+        Write-Warning 'RestoreTest cancelled before creating any disposable resources.'
+        return
+    }
+    $restoreContainer = Join-Path ([System.IO.Path]::GetTempPath()) ('nymph-stage3h1-restore-' + [Guid]::NewGuid().ToString('N'))
+    $restoreRoot = Join-Path $restoreContainer 'payload'
+    $stagingArchive = Join-Path $restoreContainer 'restored.tar'
+    $passphrase = $null
+    $restoreStage = 'passphrase entry'
     try {
-        if ($PSCmdlet.ShouldProcess($restoreRoot, 'Create isolated temporary restore-test directory')) {
-            New-Item -ItemType Directory -Path $restoreRoot | Out-Null
+        $passphrase = Get-SecurePassphrase
+        New-Item -ItemType Directory -Path $restoreRoot | Out-Null
+        Protect-PlaintextDirectory -Path $restoreContainer
+        $restoreStage = 'encrypted backup authentication/decryption'
+        Invoke-BackupCipher -Operation decrypt -InputPath $BackupPath -OutputPath $stagingArchive -Passphrase $passphrase
+        $restoreStage = 'archive extraction'
+        & tar.exe -xf $stagingArchive -C $restoreRoot
+        if ($LASTEXITCODE -ne 0) { throw 'Could not extract the authenticated backup into the temporary restore area.' }
+        $restoreStage = 'integrity manifest verification'
+        Assert-Manifest -Root $restoreRoot
+        if (-not (Test-Path -LiteralPath (Join-Path $restoreRoot 'postgres.dump')) -or
+            -not (Test-Path -LiteralPath (Join-Path $restoreRoot 'synapse-data\homeserver.yaml')) -or
+            -not (Test-Path -LiteralPath (Join-Path $restoreRoot 'deployment.env')) -or
+            -not (Test-Path -LiteralPath (Join-Path $restoreRoot 'deployment\compose.dev.isolated.yaml')) -or
+            -not (Test-Path -LiteralPath (Join-Path $restoreRoot 'deployment\configure_isolated_dev_synapse.py')) -or
+            -not (Test-Path -LiteralPath (Join-Path $restoreRoot 'secrets\postgres_password')) -or
+            -not (Test-Path -LiteralPath (Join-Path $restoreRoot 'secrets\registration_shared_secret'))) {
+            throw 'Restored backup is missing required isolated Matrix state.'
         }
-        if ($PSCmdlet.ShouldProcess($stagingArchive, 'Authenticate and decrypt backup to temporary staging')) {
-            Invoke-BackupCipher -Operation decrypt -InputPath $BackupPath -OutputPath $stagingArchive -Passphrase $passphrase
+        $inventory = Get-Content -LiteralPath (Join-Path $restoreRoot 'backup-inventory.json') -Raw | ConvertFrom-Json
+        if ($inventory.isolatedCryptoProfileDirectoryPresent -and
+            [int]$inventory.isolatedCryptoProfileFileCount -gt 0 -and
+            -not (Test-Path -LiteralPath (Join-Path $restoreRoot 'crypto-profiles'))) {
+            throw 'The backup inventory reports crypto profiles but the profile data is missing.'
         }
-        if ($PSCmdlet.ShouldProcess($restoreRoot, 'Restore encrypted archive into isolated temporary directory')) {
-            & tar.exe -xf $stagingArchive -C $restoreRoot
-            if ($LASTEXITCODE -ne 0) { throw 'Could not extract the authenticated backup into the temporary restore area.' }
-            Assert-Manifest -Root $restoreRoot
-            if (-not (Test-Path -LiteralPath (Join-Path $restoreRoot 'postgres.dump')) -or
-                -not (Test-Path -LiteralPath (Join-Path $restoreRoot 'synapse-data\homeserver.yaml'))) {
-                throw 'Restored backup is missing required isolated Matrix state.'
-            }
-            Invoke-DisposablePostgresRestore -DumpPath (Join-Path $restoreRoot 'postgres.dump')
-            Invoke-DisposableSynapseRestore -SynapseDataPath (Join-Path $restoreRoot 'synapse-data')
-        }
+        $restoreStage = 'disposable PostgreSQL restoration and validation'
+        Invoke-DisposablePostgresRestore -DumpPath (Join-Path $restoreRoot 'postgres.dump')
+        $restoreStage = 'disposable Synapse data validation'
+        Invoke-DisposableSynapseRestore -SynapseDataPath (Join-Path $restoreRoot 'synapse-data')
+        $restoreStage = 'restore completion'
         Write-Output 'Encrypted backup authenticated and restored into an isolated temporary directory; no Docker service or original file was modified.'
+    } catch {
+        $exceptionType = $_.Exception.GetType().Name
+        $detail = if ($_.Exception.Message -match '^Authenticated backup decrypt (?:failed: stage=[a-z0-9 -]+; exception=[A-Za-z0-9_]+(?:; code=[A-Z0-9_]+)?|helper failed with exit code [0-9]+)\.') {
+            $_.Exception.Message
+        } else {
+            'Sensitive exception details were suppressed.'
+        }
+        throw "RestoreTest failed at stage '$restoreStage' (exception=$exceptionType). $detail"
     } finally {
-        $passphrase = $null
         try {
-            if (Test-Path -LiteralPath $stagingArchive -PathType Leaf) {
-                if ($PSCmdlet.ShouldProcess($stagingArchive, 'Overwrite and remove temporary decrypted archive')) {
-                    Remove-PlaintextFile $stagingArchive
-                } else {
-                    throw 'Temporary decrypted backup archive cleanup was not authorized.'
+            if (Test-Path -LiteralPath $restoreContainer -PathType Container) {
+                try {
+                    Remove-PlaintextTree $restoreContainer
+                } catch {
+                    throw "RestoreTest cleanup failed for temporary plaintext directory '$restoreContainer' (exception=$($_.Exception.GetType().Name))."
                 }
             }
         } finally {
-            if (Test-Path -LiteralPath $restoreRoot -PathType Container) {
-                if ($PSCmdlet.ShouldProcess($restoreRoot, 'Overwrite and remove temporary plaintext restore tree')) {
-                    Remove-PlaintextTree $restoreRoot
-                } else {
-                    throw 'Temporary plaintext restore cleanup was not authorized.'
-                }
+            if ($passphrase) {
+                $passphrase.Dispose()
+                $passphrase = $null
             }
         }
     }

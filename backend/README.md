@@ -51,59 +51,37 @@ It creates random local-only passwords and a registration secret under the ignor
 
 The base service binds only to `127.0.0.1:8008`. Synapse's development policy module permits one private, non-federatable, invite-only encrypted room, one invite from partner1 to partner2, and no other room members. It also exposes a short-lived, single-use pairing invitation endpoint. Redeeming an invitation yields a Synapse `m.login.token` that is itself one-time and short-lived; the QR payload never contains a permanent access token. This is local development code, not a production-ready invitation store or Android credential store.
 
-### Legacy archived-account live test (not for Stage 3H)
+### Stage 3I isolated Matrix browser acceptance test
 
-This legacy suite targets the archived `@partner1` / `@partner2` identities and their existing room. It launches two separate persistent Chrome profiles with independent Matrix device IDs and IndexedDB-backed Rust crypto stores. It does not use two tabs, share a browser profile, create another room, or reset Synapse data. Partner 1 authenticates with the local development credential and creates a real short-lived pairing invitation; Partner 2 redeems it and receives a one-time Matrix login token. Do not run this suite for the additive Stage 3H migration.
+The canonical Playwright configuration is `playwright.matrix.config.ts`; both `npm run test:matrix:live` and the compatibility alias `npm run test:matrix:dev-live` select only `tests/e2e/matrix-dev-live.spec.ts`. The legacy archived-account spec is skipped and excluded by the canonical config. Do not run `start-dev.ps1` for this suite.
 
-Start the existing local server, then run:
+The test configuration and browser harness read only `backend/.env.dev.isolated` and require this exact deployment:
+
+- Homeserver URL: `http://127.0.0.1:18008`
+- Matrix server name: `nymph-dev.localhost`
+- Partner A: `@partner1-dev:nymph-dev.localhost`
+- Partner B: `@partner2-dev:nymph-dev.localhost`
+
+Missing or mismatched isolated settings fail closed; there is no legacy endpoint or identity fallback. Configuration validation and Playwright discovery do not require credentials and do not contact Synapse.
+
+After the isolated partner accounts, private room, Secret Storage, cross-signing, and encrypted recovery exports already exist, an explicitly authorized live run needs process-local variables:
+
+- `NYMPH_E2E_PARTNER1_PASSWORD`, `NYMPH_E2E_PARTNER2_PASSWORD`
+- `NYMPH_E2E_PARTNER1_RECOVERY_KEY`, `NYMPH_E2E_PARTNER2_RECOVERY_KEY`
+- `NYMPH_E2E_PARTNER1_RECOVERY_EXPORT_PASSPHRASE`, `NYMPH_E2E_PARTNER2_RECOVERY_EXPORT_PASSPHRASE`
+
+Matrix recovery keys and encrypted-export passphrases are different credential types. Each encrypted export is read from the isolated secrets directory, decrypted with its own passphrase, and checked against its account and supplied recovery key. The acceptance test never generates keys, bootstraps a missing identity, reads legacy credentials, or prints secret values. Supply credentials through the local process environment only; do not put them in source, environment files, shell command text, or chat history.
+
+Each partner uses a distinct persistent Chrome user-data directory, device ID, IndexedDB database, and encrypted Rust crypto store under `.matrix-e2e/isolated-stage-3i/`. Those directories must be preserved for restart-persistence validation. The test runs serially with one worker, waits up to 120 seconds for Matrix operations, and disables traces, screenshots, and video. It validates existing recovery and cross-signing state, invitation replay rejection, SAS comparison and confirmation, device trust, encrypted messages in all four modes, restart recovery, and revocation of a test-only device. The device-revocation check does not revoke either configured partner device.
+
+Code-only checks:
 
 ```powershell
-.\backend\start-dev.ps1
-npm test
-npm run test:matrix:live
+npm run validate:matrix-e2e-config
+npm run test:matrix:live -- --list
 ```
 
-Chrome is required. Set `NYMPH_CHROME_PATH` if it is not installed at `C:\Program Files\Google\Chrome\Application\chrome.exe`. The test reads the two ignored local password files but never prints their contents. Separate browser profiles and encrypted IndexedDB stores persist under the ignored `.matrix-e2e/partner-a-live-2` and `.matrix-e2e/partner-b-live-2` directories so restart recovery can be exercised. Preserve these directories between runs; deleting them resets the local test clients' crypto state.
-
-The test requires both original account recovery keys. It fails before login unless these process environment variables are non-empty:
-
-- Partner A (`@partner1:localhost`): `NYMPH_E2E_PARTNER1_RECOVERY_KEY`
-- Partner B (`@partner2:localhost`): `NYMPH_E2E_PARTNER2_RECOVERY_KEY`
-
-The local account-provisioning script does not create client-side Secret Storage or recovery keys; it only creates the Synapse account passwords and registration secret. After an account's first sign-in, its security setup generates a unique recovery key only if that account has no default Secret Storage key. The key is held in memory, masked in the setup UI, and must be re-entered before upload. The UI offers copy and a passphrase-encrypted offline export (PBKDF2-SHA-256 and AES-256-GCM); the export passphrase is never stored. After Secret Storage and cross-signing are configured, the user must enter the recovery key again. A separate temporary Matrix device independently decrypts all three existing cross-signing secrets, restores them, and checks their IDs against the published identity. The test device is revoked before setup is marked verified in account data. If verification or revocation fails, setup is not marked complete. Ordinary login never replaces existing Secret Storage. If an existing recovery key was not saved elsewhere, do not generate a replacement or reset Secret Storage; recovery remains blocked until that key or a usable existing device is found.
-
-To enter both values without putting them in command history, source files, or `.env` files, use a masked PowerShell prompt in the same PowerShell window that runs the test:
-
-```powershell
-$recoveryKeyVariables = @(
-    @{ Name = 'NYMPH_E2E_PARTNER1_RECOVERY_KEY'; Prompt = 'Partner A original Matrix recovery key' },
-    @{ Name = 'NYMPH_E2E_PARTNER2_RECOVERY_KEY'; Prompt = 'Partner B original Matrix recovery key' }
-)
-try {
-    foreach ($item in $recoveryKeyVariables) {
-        $secureValue = Read-Host $item.Prompt -AsSecureString
-        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
-        try {
-            [Environment]::SetEnvironmentVariable(
-                $item.Name,
-                [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer),
-                'Process'
-            )
-        } finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
-            $secureValue.Dispose()
-        }
-    }
-    npm run test:matrix:live
-} finally {
-    Remove-Item Env:NYMPH_E2E_PARTNER1_RECOVERY_KEY -ErrorAction SilentlyContinue
-    Remove-Item Env:NYMPH_E2E_PARTNER2_RECOVERY_KEY -ErrorAction SilentlyContinue
-}
-```
-
-The test reports only whether each variable is present and whether each account unlocked; it does not print recovery keys or decoded key material. Each key is supplied only to its corresponding independent browser context and validated against that account's default Secret Storage key metadata. The built harness uses `http://127.0.0.1:5174`, allowlisted separately from the desktop app origin.
-
-The live test uses the production `connectMatrix` implementation and existing encrypted room. It checks each supplied recovery key against the corresponding default key ID, decrypts all three existing cross-signing secrets, confirms the public identity is already published, and only then asks the SDK to restore the existing identity. It stops before cross-signing if either account fails any check; it does not reset Secret Storage or generate replacement keys. The acceptance flow then exercises invitation replay rejection, SAS comparison and confirmation, pre-verification send rejection, encrypted messages in all four modes, replies, reactions, typing, read receipts, reconnection/offline delivery, browser-profile restart history recovery, and device revocation. Pairing, replay rejection, both clients' encrypted sync, and Partner B device-key visibility have passed. Neither existing Secret Storage has been unlocked in the live test, so cross-signing, SAS, encrypted message exchange, restart recovery, and revocation remain unverified. Synapse policy unit tests separately cover expired invitations and unauthorized membership. This is a PC/browser integration test, not Android Keystore or physical-device validation.
+These are safe without Matrix credentials. The live acceptance test itself is intentionally not run as part of code review or ordinary validation; it performs authenticated Matrix operations and requires separate explicit authorization.
 
 Android debug builds use `http://localhost:8008` only in Vite's `android` mode by default, with cleartext allowed only for `localhost` in the debug Network Security Config. Stage 3H.1 app-local configuration overrides this with the isolated endpoint on port 18008. Release networking denies cleartext. The Capacitor WebView origin is `https://localhost`; the custom pairing endpoint's development allowlist includes that exact origin. The isolated browser integration harness uses `http://127.0.0.1:5174`, which is separately allowlisted for local testing. Synapse 1.164.2's built-in Matrix API uses a wildcard CORS response; CORS is not an authentication boundary.
 
@@ -115,7 +93,7 @@ Room creation and membership enforcement must be tested before using private con
 
 ## Two-partner policy and enrollment status
 
-The legacy local development setup provisions only `@partner1:localhost`, `@partner2:localhost`, and their archived private encrypted room. The production deployment scaffold is not a completed private two-person service. The app has a development Partner 1 password sign-in, a one-time QR invitation flow for Partner 2, and Matrix SDK device-verification/cross-signing controls. The legacy PC live suite has reached invitation redemption, both clients' encrypted sync, and device-key lookup, but has not unlocked the archived Secret Storage; do not treat it as the Stage 3H acceptance test. Physical Android UI and storage behavior also remain untested. No production partner credentials are embedded in the frontend.
+The legacy local development setup provisions only `@partner1:localhost`, `@partner2:localhost`, and their archived private encrypted room. The production deployment scaffold is not a completed private two-person service. The app has a development Partner 1 password sign-in, a one-time QR invitation flow for Partner 2, and Matrix SDK device-verification/cross-signing controls. The archived-account Playwright suite is disabled and excluded from the canonical config; do not run it against the legacy service. Physical Android UI and storage behavior also remain untested. No production partner credentials are embedded in the frontend.
 
 ### Stage 3H.1 isolated development environment (prepared, not provisioned)
 
@@ -125,14 +103,23 @@ The isolated environment files are [`compose.dev.isolated.yaml`](./compose.dev.i
 
 The Stage 3H.1 provisioner is [`provision-dev-partners.ps1`](./provision-dev-partners.ps1). It has not been run. Its `-WhatIf` path only prints a plan; actual provisioning additionally requires `-ConfirmProvisioning`, typing exactly `PROVISION ISOLATED NYMPH DEV MATRIX`, and accepting each `ShouldProcess` confirmation. The plan includes the encrypted pre-provision backup, two account reconciliations, one encrypted invite-only room, app-local configuration, and an external operation journal. Existing development accounts are not password-reset; inconsistent existing room state causes a stop rather than room recreation. Failure reporting scopes rollback only to explicitly journaled development resources and never to the archived environment.
 
-The backup utility, [`backup-isolated-dev.ps1`](./backup-isolated-dev.ps1), encrypts a staged backup with Node's scrypt-derived AES-256-GCM implementation, requires a passphrase entered at a masked prompt before any backup mutation, authenticates the encrypted file, and verifies a per-file SHA-256 manifest. Run it from an interactive PowerShell terminal; the passphrase must be at least 12 characters. For example:
+The backup utility, [`backup-isolated-dev.ps1`](./backup-isolated-dev.ps1), encrypts a staged backup with Node's scrypt-derived AES-256-GCM implementation, authenticates the ciphertext without writing a decrypted verification copy, and verifies a per-file SHA-256 manifest. Before changing resources, it presents one complete `ShouldProcess` confirmation; declining it exits without mutations. Its passphrase is entered twice for confirmation in a local Windows Forms dialog with a masked, paste-enabled field, and must be at least 12 characters. Nothing is stored in Credential Manager. The utility does not set PowerShell aliases; running with `-NoProfile` also avoids unrelated alias prompts from a caller's PowerShell profile. The restore test runs `pg_amcheck`, validates the restored schema, and confirms that the pre-provision database still has zero accounts and rooms. The commands below assume the backup file is `C:\Users\kanis\NYMPH-Backups\nymph-stage3h1-dev-runtime.enc`; run **only one matching pair**, and do not run RestoreTest unless Create completed successfully.
+
+From the repository root (`C:\NYMPH`):
 
 ```powershell
-.\backend\backup-isolated-dev.ps1 -Mode Create -BackupPath "$HOME\NYMPH-Backups\nymph-stage3h1-dev-runtime.enc" -Confirm
-.\backend\backup-isolated-dev.ps1 -Mode RestoreTest -BackupPath "$HOME\NYMPH-Backups\nymph-stage3h1-dev-runtime.enc" -Confirm
+powershell.exe -NoProfile -File .\backend\backup-isolated-dev.ps1 -Mode Create -BackupPath "$HOME\NYMPH-Backups\nymph-stage3h1-dev-runtime.enc"
+powershell.exe -NoProfile -File .\backend\backup-isolated-dev.ps1 -Mode RestoreTest -BackupPath "$HOME\NYMPH-Backups\nymph-stage3h1-dev-runtime.enc"
 ```
 
-Each command prompts for the passphrase without echoing it; enter the same passphrase for the restore test. Review each `ShouldProcess` confirmation; choose `A` only if you approve the listed backup/restore operations. `RestoreTest` decrypts into a fresh temporary directory, restores the PostgreSQL dump into a disposable container and volume, and restores Synapse data into a separate no-network disposable volume for config, signing-key, and policy-database checks. The service data and legacy files are never used as restore targets. Disposable restore containers and volumes are removed by the script; if cleanup fails, it reports the exact resource names for manual inspection. Plaintext staging is overwritten before deletion where the filesystem permits; overwrite is not guaranteed secure erasure on SSDs, snapshots, or copy-on-write storage. Keep encrypted backups outside the repository and retain the passphrase offline; do not put it in a command, source file, or log. The runtime backup and restore have not yet completed.
+From the backend directory (`C:\NYMPH\backend`):
+
+```powershell
+powershell.exe -NoProfile -File .\backup-isolated-dev.ps1 -Mode Create -BackupPath "$HOME\NYMPH-Backups\nymph-stage3h1-dev-runtime.enc"
+powershell.exe -NoProfile -File .\backup-isolated-dev.ps1 -Mode RestoreTest -BackupPath "$HOME\NYMPH-Backups\nymph-stage3h1-dev-runtime.enc"
+```
+
+The passphrase must be entered directly into the masked Windows dialog; it is never passed in command arguments, written to a file, or printed. Create asks twice to catch entry mistakes; RestoreTest asks for the same passphrase again. The resulting encrypted file ACL is restricted to the current Windows user and SYSTEM. `-WhatIf` prints the plan; a normal run has one approval prompt for the complete operation rather than one prompt per step. RestoreTest uses newly generated disposable containers and volumes only; it never uses the original development storage or legacy resources. It installs PostgreSQL's `amcheck` extension only in the disposable restored database before checking it. Disposable resources are removed unconditionally if created, and cleanup failures identify only those unique resource names. Staging files are overwritten and deletion is verified, but Windows filesystems, SSD wear-leveling, snapshots, and copy-on-write storage do not guarantee secure erasure. Closed crypto profiles are included when the isolated profile directory exists; the encrypted inventory records if none existed. Keep encrypted backups outside the repository and retain the passphrase offline.
 
 To inspect the deployment plan without side effects:
 
@@ -144,49 +131,13 @@ To inspect the deployment plan without side effects:
 
 For later use only, after reviewing the deployment and receiving explicit approval, start the isolated infrastructure and then run the separately approved provisioner. No production hosting or account migration is part of this development setup.
 
-The dev acceptance test has its own Playwright config and persistent profiles under `.matrix-e2e/dev-stage-3h/`. It does not use or alter the legacy live-test profiles. Playwright traces, screenshots, and video are disabled. It checks each recovery export in a separate client, distinct Secret Storage key IDs and backup versions, SAS trust for both partner devices, exact decrypted message and reply contents, persistence after browser restart, third-user invite/pairing replay rejection, and active-device revocation. After provisioning is separately approved and the dev Synapse server is running, run:
-
-```powershell
-npm test
-npm run test:matrix:dev-live
-```
-
-The dev test reads `partner1_dev_password`, `partner2_dev_password`, and the two dev device-ID files from the ignored `backend/dev-isolated/secrets/` directory. It requires two distinct process-only export passphrases, `NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_A` and `NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_B`, each at least 12 characters. Enter them through masked `Read-Host` prompts; do not put them in the command text, a `.env` file, or source. Example:
-
-```powershell
-$items = @(
-    @{ Name = 'NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_A'; Prompt = 'Partner A offline-export passphrase' },
-    @{ Name = 'NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_B'; Prompt = 'Partner B offline-export passphrase' }
-)
-try {
-    foreach ($item in $items) {
-        $secureValue = Read-Host $item.Prompt -AsSecureString
-        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
-        try {
-            [Environment]::SetEnvironmentVariable(
-                $item.Name,
-                [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer),
-                'Process'
-            )
-        } finally {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
-            $secureValue.Dispose()
-        }
-    }
-    npm run test:matrix:dev-live
-} finally {
-    Remove-Item Env:NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_A -ErrorAction SilentlyContinue
-    Remove-Item Env:NYMPH_DEV_RECOVERY_EXPORT_PASSPHRASE_B -ErrorAction SilentlyContinue
-}
-```
-
-The acceptance flow creates a distinct SDK recovery key for each new account only when no default Secret Storage key exists, stores only authenticated-encrypted exports in ignored local files, and requires a recovery restore on a separate temporary verifier before continuing. During new security bootstrap it creates a key backup only when none exists; an existing backup must validate and is never reset by this flow. The server authorizes the short-lived verifier only from the current active device, does not let it become active, and removes its pending authorization when it is revoked. The flow then verifies cross-signing continuity and SAS, exchanges/decrypts messages, restarts both clients, rejects third-user invites and pairing-token replay, and replaces Partner A's active device. A replacement revokes the old Matrix device before the new client starts crypto sync; the server's admission callback rejects new logins for the replaced device ID. This is a dev-only exception for a bounded recovery test, not permission for ordinary second devices.
+The isolated Matrix browser acceptance suite is documented above under “Stage 3I isolated Matrix browser acceptance test.” Its credentials come only from the named process environment variables; it does not read local partner passwords or automatically provision accounts. Keep the live command disabled until the separate runtime authorization is given.
 
 `block_non_admin_invites`, a private room, and a client-side member check are not enough to enforce an exact two-person allowlist. The local development module uses Synapse's supported spam-checker callbacks `user_may_create_room`, `user_may_invite`, `user_may_join_room`, and `check_event_for_spam`; the API is present in pinned Synapse 1.164.2. Its `on_new_event` callback records the newly created room ID after Synapse persists the validated creation event, so later membership checks are bound to that room. It also uses `ModuleApi.create_login_token` (available since 1.69.0) for the second, one-time login credential. The module limits its local policy state to one created room and checks private/invite-only/encrypted room settings. The more generic third-party `check_event_allowed` callback is documented as very experimental and is not used.
 
 In local development, `block_non_admin_invites` is disabled only because the bootstrap client must invite partner B; the module restricts that action to partner A inviting partner B. The production scaffold keeps non-admin invitations disabled. Policy unit tests cover invite/join restrictions and pairing-token expiry/reuse, and local API checks confirmed both accounts can log in, the room is encrypted and invite-only, a third-user invite is rejected, and partner B cannot create another room. An actual join attempt by a separately provisioned unauthorized account and a federation join have not been tested. The administrator remains trusted and can override any room policy. Registration remains disabled; account creation must be performed by an administrator through the local Synapse provisioning process, never by exposing admin credentials to either phone.
 
-Synapse device verification is distinct from app invitation redemption. The local pairing endpoint is not a replacement for Matrix device verification. The app uses the SDK's `VerificationRequest` flow for SAS emoji/decimal or QR verification, explicit confirmation, cross-signing bootstrap, key-change status, and device revocation controls. The PC live suite has not yet validated SAS or cross-signing between its isolated browser profiles. On Android, the app stores the Matrix session and a random 32-byte Rust crypto-store key in `@aparajita/capacitor-secure-storage`, which encrypts values with an Android Keystore-generated AES-GCM key. The Rust crypto store itself remains in persistent IndexedDB and uses that random key for its SDK-supported encrypted storage. The six-digit app PIN is not used as the crypto-store key. Device IDs are saved and passed back to the SDK so the same device identity and per-device store are restored after restart. Android persistence still requires physical-device restart-and-decrypt validation.
+Synapse device verification is distinct from app invitation redemption. The local pairing endpoint is not a replacement for Matrix device verification. The app uses the SDK's `VerificationRequest` flow for SAS emoji/decimal or QR verification, explicit confirmation, cross-signing bootstrap, key-change status, and device revocation controls. The Stage 3I PC live suite is prepared to validate SAS and cross-signing between isolated browser profiles but has not been run. On Android, the app stores the Matrix session and a random 32-byte Rust crypto-store key in `@aparajita/capacitor-secure-storage`, which encrypts values with an Android Keystore-generated AES-GCM key. The Rust crypto store itself remains in persistent IndexedDB and uses that random key for its SDK-supported encrypted storage. The six-digit app PIN is not used as the crypto-store key. Device IDs are saved and passed back to the SDK so the same device identity and per-device store are restored after restart. Android persistence still requires physical-device restart-and-decrypt validation.
 
 The app also uses native biometrics/device credentials for the app lock, a native `FLAG_SECURE` window, and background relocking. These protections are not substitutes for verifying device identity. The development policy uses Synapse 1.164.2's `check_login_for_spam` callback to admit only each dev account's first device or explicitly authorized replacement. It stores one active device ID per dev account; after the new device authenticates and deletes the old Matrix device, an authenticated activation switches the server-side active ID. The old device's existing access tokens are revoked by Synapse device deletion, and subsequent logins with its ID are rejected. This design is local-development only and has not been validated against a running Synapse in this workspace; do not use it as production enforcement.
 

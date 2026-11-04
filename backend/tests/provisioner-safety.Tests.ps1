@@ -104,10 +104,23 @@ Describe 'Isolated Stage 3H provisioner safety gates' {
     It 'prompts before backup mutations and blocks the complete production Synapse Admin API prefix' {
         $backup = Get-Content -LiteralPath (Join-Path $backendPath 'backup-isolated-dev.ps1') -Raw
         $caddy = Get-Content -LiteralPath (Join-Path $backendPath 'Caddyfile') -Raw
-        $promptPosition = $backup.IndexOf('$passphrase = Get-PlaintextPassphrase')
+        $promptPosition = $backup.IndexOf('$passphrase = Get-SecurePassphrase')
         $stopPosition = $backup.IndexOf('& docker stop $synapseContainer')
         $promptPosition | Should BeGreaterThan -1
         $stopPosition | Should BeGreaterThan $promptPosition
+        $backup | Should Match 'UseSystemPasswordChar = \$true'
+        $backup | Should Match 'ShortcutsEnabled = \$true'
+        $backup | Should Not Match 'Read-Host'
+        $backup | Should Not Match 'Set-Alias'
+        ([regex]::Matches($backup, '\$PSCmdlet\.ShouldProcess\(').Count) | Should Be 3
+        $backup | Should Match "'encrypt', 'decrypt', 'verify'"
+        $backup | Should Match 'Invoke-BackupCipher -Operation verify'
+        $backup | Should Match 'Protect-EncryptedBackupFile -Path \$BackupPath'
+        $backup | Should Match 'Microsoft\.PowerShell\.Management\\Get-WmiObject Win32_Process'
+        $backup | Should Match 'CREATE EXTENSION IF NOT EXISTS amcheck'
+        $backup | Should Match 'pg_amcheck --database=synapse'
+        $backup | Should Match '\$validation \| & docker exec -i \$containerName python -'
+        $backup | Should Match 'unexpected accounts or rooms'
         $caddy | Should Match '@admin_api path /_synapse/admin /_synapse/admin/\*'
         $caddy | Should Match 'respond @admin_api 404'
     }
