@@ -5,6 +5,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+$script:provisioningShouldProcess = $PSCmdlet
+$script:activeProvisioningOperation = 'preflight'
 
 $confirmationPhrase = 'PROVISION ISOLATED NYMPH DEV MATRIX'
 $repositoryRoot = Split-Path $PSScriptRoot -Parent
@@ -13,6 +15,7 @@ $secretDirectory = Join-Path $isolatedDirectory 'secrets'
 $environmentFile = Join-Path $PSScriptRoot '.env.dev.isolated'
 $composeFile = Join-Path $PSScriptRoot 'compose.dev.isolated.yaml'
 $homeserver = 'http://127.0.0.1:18008'
+$synapseContainerHomeserver = 'http://127.0.0.1:8008'
 $partnerA = '@partner1-dev:nymph-dev.localhost'
 $partnerB = '@partner2-dev:nymph-dev.localhost'
 $projectName = 'nymph-stage3h1-dev'
@@ -111,8 +114,17 @@ $composeArgs = @(
     '-f', $composeFile
 )
 $expectedContainer = "$projectName-synapse-1"
-$container = & docker inspect --format '{{.State.Running}}|{{index .Config.Labels "com.docker.compose.project"}}' $expectedContainer 2>$null
-if ($LASTEXITCODE -ne 0 -or $container -ne "true|$projectName") {
+$containerRunning = & docker inspect --format '{{.State.Running}}' $expectedContainer 2>$null
+if ($LASTEXITCODE -ne 0 -or $containerRunning -ne 'true') {
+    throw 'The isolated Synapse service is not running under its dedicated project identity. Start only start-isolated-dev.ps1 first.'
+}
+$containerLabelsJson = & docker inspect --format '{{json .Config.Labels}}' $expectedContainer 2>$null
+if ($LASTEXITCODE -ne 0 -or -not $containerLabelsJson) {
+    throw 'Could not verify the isolated Synapse container project identity.'
+}
+$containerLabels = $containerLabelsJson | ConvertFrom-Json
+if ($containerLabels.'com.docker.compose.project' -ne $projectName -or
+    $containerLabels.'com.docker.compose.project.config_files' -ne [System.IO.Path]::GetFullPath($composeFile)) {
     throw 'The isolated Synapse service is not running under its dedicated project identity. Start only start-isolated-dev.ps1 first.'
 }
 $versionResponse = Invoke-WebRequest -Uri "$homeserver/_matrix/client/versions" -TimeoutSec 5 -UseBasicParsing
@@ -154,7 +166,7 @@ $journal = [ordered]@{
 
 function Save-ProvisioningJournal {
     param([string]$Status, [string]$Operation)
-    if (-not $PSCmdlet.ShouldProcess($journalPath, "Record $Operation as $Status in the external provisioning journal")) {
+    if (-not $script:provisioningShouldProcess.ShouldProcess($journalPath, "Record $Operation as $Status in the external provisioning journal")) {
         throw 'Provisioning journal update was not authorized; stopping before the next operation.'
     }
     $journal.operations += [ordered]@{
@@ -162,10 +174,22 @@ function Save-ProvisioningJournal {
         status = $Status
         completed_at = (Get-Date).ToUniversalTime().ToString('o')
     }
+    $journalJson = $journal | ConvertTo-Json -Depth 8
     if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
-        $journal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $journalPath -Encoding UTF8
+        [System.IO.File]::WriteAllText($journalPath, $journalJson, [System.Text.UTF8Encoding]::new($false))
     } else {
-        $journal | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $journalPath -Encoding UTF8 -NoClobber
+        $journalStream = [System.IO.File]::Open(
+            $journalPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        try {
+            $journalBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($journalJson)
+            $journalStream.Write($journalBytes, 0, $journalBytes.Length)
+        } finally {
+            $journalStream.Dispose()
+        }
     }
 }
 
@@ -176,20 +200,23 @@ function Invoke-ProvisioningStep {
         [Parameter(Mandatory)][string]$OperationName,
         [Parameter(Mandatory)][scriptblock]$Operation
     )
+    $script:activeProvisioningOperation = $OperationName
     Save-ProvisioningJournal -Status 'started' -Operation $OperationName
-    if (-not $PSCmdlet.ShouldProcess($Target, $Action)) {
+    if (-not $script:provisioningShouldProcess.ShouldProcess($Target, $Action)) {
         throw "Provisioning step was declined: $OperationName. No later steps will run."
     }
     try {
         & $Operation
         Save-ProvisioningJournal -Status 'completed' -Operation $OperationName
     } catch {
+        $operationFailureType = $_.Exception.GetType().Name
         try {
             Save-ProvisioningJournal -Status 'failed' -Operation $OperationName
         } catch {
-            Write-Error 'Could not record a provisioning failure in the external journal.'
+            $journalFailureType = $_.Exception.GetType().Name
+            throw "Provisioning step '$OperationName' failed (exception=$operationFailureType; journal_update_exception=$journalFailureType)."
         }
-        throw
+        throw "Provisioning step '$OperationName' failed (exception=$operationFailureType)."
     }
 }
 
@@ -245,7 +272,7 @@ try {
                         --password-file /dev/stdin `
                         --no-admin `
                         --config /data/homeserver.yaml `
-                        $homeserver
+                        $synapseContainerHomeserver
                 } finally {
                     $accountPassword = $null
                 }
@@ -419,13 +446,17 @@ try {
     Write-Output "Matrix server: $homeserver ($projectName)"
     Write-Output 'No original Matrix account, room, database, config, or crypto profile was intentionally modified.'
 } catch {
+    $failureType = $_.Exception.GetType().Name
+    $failureOperation = $script:activeProvisioningOperation
+    $journalFailureType = 'none'
     try {
         Save-ProvisioningJournal -Status 'failed' -Operation 'provisioning-run'
     } catch {
-        Write-Error 'Provisioning failed and the external operation journal could not be updated.'
+        $journalFailureType = $_.Exception.GetType().Name
     }
-    Write-Error 'Provisioning stopped. Do not retry until the isolated room/policy state and external journal are reviewed.'
+    Write-Output "Provisioning stopped at '$failureOperation' (exception=$failureType; journal_update_exception=$journalFailureType)."
+    Write-Output 'Do not retry until the isolated room/policy state and external journal are reviewed.'
     Write-Output 'Safe rollback scope is limited to the isolated development project and the explicitly recorded development accounts/room.'
     Write-Output 'Do not delete or alter any legacy account, room, database, config, secret, or crypto profile.'
-    throw
+    throw "Provisioning failed at '$failureOperation' (exception=$failureType; journal_update_exception=$journalFailureType)."
 }

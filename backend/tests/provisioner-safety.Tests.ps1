@@ -101,6 +101,28 @@ Describe 'Isolated Stage 3H provisioner safety gates' {
         $provisioner | Should Match 'Get-LegacyFingerprint'
     }
 
+    It 'uses the parent ShouldProcess context inside provisioning helper functions' {
+        $provisioner = Get-Content -LiteralPath $provisionerPath -Raw
+        $provisioner | Should Match '\$script:provisioningShouldProcess = \$PSCmdlet'
+        $provisioner | Should Match '\$script:provisioningShouldProcess\.ShouldProcess\(\$journalPath'
+        $provisioner | Should Match '\$script:provisioningShouldProcess\.ShouldProcess\(\$Target'
+    }
+
+    It 'creates the first journal file without relying on unsupported Set-Content parameters' {
+        $provisioner = Get-Content -LiteralPath $provisionerPath -Raw
+        $provisioner | Should Match '\[System\.IO\.FileMode\]::CreateNew'
+        $provisioner | Should Match '\[System\.IO\.File\]::WriteAllText\(\$journalPath'
+        $provisioner | Should Not Match 'Set-Content[^\r\n]*-NoClobber'
+        $provisioner | Should Match "Provisioning stopped at"
+    }
+
+    It 'uses the container-local Synapse API for account creation' {
+        $provisioner = Get-Content -LiteralPath $provisionerPath -Raw
+        $provisioner | Should Match "\$synapseContainerHomeserver = 'http://127\.0\.0\.1:8008'"
+        $provisioner | Should Match '--config /data/homeserver\.yaml `\s+\$synapseContainerHomeserver'
+        $provisioner | Should Not Match '--config /data/homeserver\.yaml `\s+\$homeserver'
+    }
+
     It 'prompts before backup mutations and blocks the complete production Synapse Admin API prefix' {
         $backup = Get-Content -LiteralPath (Join-Path $backendPath 'backup-isolated-dev.ps1') -Raw
         $caddy = Get-Content -LiteralPath (Join-Path $backendPath 'Caddyfile') -Raw
