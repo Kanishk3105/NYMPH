@@ -15,15 +15,6 @@ type Session = {
   deviceId?: string;
 };
 
-type Invitation = {
-  version: 1;
-  token: string;
-  homeserver: string;
-  room_id: string;
-  partner_user_id: string;
-  expires_at: number;
-};
-
 const matrixConfig = loadIsolatedMatrixConfig();
 const chromePath = process.env.NYMPH_CHROME_PATH ??
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
@@ -221,22 +212,6 @@ async function writeProtectedRecoveryExport(path: string, encryptedExport: strin
   }
 }
 
-function requiredCredential(name: string): string {
-  const value = process.env[name];
-  if (!value || !value.trim()) {
-    throw new Error(`Missing required local process environment variable ${name}.`);
-  }
-  return value;
-}
-
-function requiredExportPassphrase(name: string): string {
-  const value = requiredCredential(name);
-  if (value.length < 12) {
-    throw new Error(`${name} must contain at least 12 characters.`);
-  }
-  return value;
-}
-
 async function readIsolatedFile(name: string): Promise<string> {
   const value = (await readFile(join(secretDirectory, name), 'utf8')).trim();
   if (!value) throw new Error(`Required isolated development credential file ${name} is empty.`);
@@ -257,10 +232,10 @@ async function prepareAndVerifyRecovery(
   userId: string,
   password: string,
   exportFile: string,
-): Promise<{ recoveryKey: string; passphrase: string; identityIds: string[] }> {
+  passphrase: string,
+): Promise<{ recoveryKey: string; identityIds: string[] }> {
   let security = await call<RecoverySecurityState>(page, 'refreshSecurity');
   let recoveryKey: string;
-  let passphrase: string;
 
   if (!security.defaultSecretStorageKeyId) {
     if (security.publicCrossSigningKeysPresent) {
@@ -277,7 +252,6 @@ async function prepareAndVerifyRecovery(
     confirmRecoveryKeyOffline(userId, recoveryKey);
     await call<string>(page, 'commitSecretStorageSetup', recoveryKey);
     await call(page, 'bootstrapSecurity', password);
-    passphrase = requestExportPassphrase(userId);
     const keyId = (await call<RecoverySecurityState>(page, 'refreshSecurity')).defaultSecretStorageKeyId;
     if (!keyId) throw new Error(`Secret Storage was not committed for ${userId}.`);
     const encryptedExport = await encryptRecoveryExport(
@@ -289,7 +263,6 @@ async function prepareAndVerifyRecovery(
     if (!(await fileExists(exportFile))) {
       throw new Error(`Secret Storage exists for ${userId}, but its encrypted recovery export is missing; refusing to create a replacement key.`);
     }
-    passphrase = requestExportPassphrase(userId);
     const encryptedExport = await readFile(exportFile, 'utf8');
     const exportContents = await decryptRecoveryExport(encryptedExport, passphrase);
     try {
@@ -333,7 +306,7 @@ async function prepareAndVerifyRecovery(
   if (identityIds.length !== 3 || new Set(identityIds).size !== 3) {
     throw new Error(`The published cross-signing identity is incomplete for ${userId}.`);
   }
-  return { recoveryKey, passphrase, identityIds };
+  return { recoveryKey, identityIds };
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -431,34 +404,19 @@ async function openPartnerProfile(
   return { context, page };
 }
 
-test('isolated Partner A and B complete real encrypted Matrix acceptance flow', async () => {
-  test.setTimeout(720_000);
+test('isolated partners join the existing room, recover crypto, verify trust, and exchange encrypted messages', async () => {
+  test.setTimeout(1_200_000);
 
-  const passwordA = requiredCredential('NYMPH_E2E_PARTNER1_PASSWORD');
-  const passwordB = requiredCredential('NYMPH_E2E_PARTNER2_PASSWORD');
-  const recoveryKeyA = requiredCredential('NYMPH_E2E_PARTNER1_RECOVERY_KEY').trim();
-  const recoveryKeyB = requiredCredential('NYMPH_E2E_PARTNER2_RECOVERY_KEY').trim();
-  const exportPassphraseA = requiredExportPassphrase(
-    'NYMPH_E2E_PARTNER1_RECOVERY_EXPORT_PASSPHRASE',
-  );
-  const exportPassphraseB = requiredExportPassphrase(
-    'NYMPH_E2E_PARTNER2_RECOVERY_EXPORT_PASSPHRASE',
-  );
-  if (
-    passwordA === passwordB ||
-    exportPassphraseA === exportPassphraseB ||
-    recoveryKeyA === exportPassphraseA ||
-    recoveryKeyB === exportPassphraseB
-  ) {
-    throw new Error('Keep each partner login, Matrix recovery key, and recovery-export passphrase distinct.');
-  }
+  let passwordA = await readIsolatedFile('partner1_dev_password');
+  let passwordB = await readIsolatedFile('partner2_dev_password');
+  if (passwordA === passwordB) throw new Error('Partner login credentials must be independent.');
 
   const partnerA = matrixConfig.partnerA;
   const partnerB = matrixConfig.partnerB;
   const passwordDeviceA = await readIsolatedFile('partner1_dev_device_id');
   const passwordDeviceB = await readIsolatedFile('partner2_dev_device_id');
-  const recoveryExportA = await readIsolatedFile('partner1_dev_recovery.enc');
-  const recoveryExportB = await readIsolatedFile('partner2_dev_recovery.enc');
+  const recoveryExportAPath = join(secretDirectory, 'partner1_dev_recovery.enc');
+  const recoveryExportBPath = join(secretDirectory, 'partner2_dev_recovery.enc');
 
   let contextA: BrowserContext | undefined;
   let contextB: BrowserContext | undefined;
@@ -468,6 +426,12 @@ test('isolated Partner A and B complete real encrypted Matrix acceptance flow', 
   let sessionB: Session | undefined;
   let storageKeyA: number[] = [];
   let storageKeyB: number[] = [];
+  let recoveryKeyA = '';
+  let recoveryKeyB = '';
+  let exportPassphraseA = '';
+  let exportPassphraseB = '';
+  let identityIdsA: string[] = [];
+  let identityIdsB: string[] = [];
 
   try {
     ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
@@ -482,7 +446,7 @@ test('isolated Partner A and B complete real encrypted Matrix acceptance flow', 
       'NYMPH isolated Partner A',
       passwordDeviceA,
     );
-    const passwordSessionB = await call<Session>(
+    sessionB = await call<Session>(
       pageB,
       'passwordLogin',
       partnerB,
@@ -491,64 +455,79 @@ test('isolated Partner A and B complete real encrypted Matrix acceptance flow', 
       passwordDeviceB,
     );
     expect(sessionA.userId).toBe(partnerA);
-    expect(passwordSessionB.userId).toBe(partnerB);
-    expect(sessionA.deviceId).not.toBe(passwordSessionB.deviceId);
-
-    const roomStatus = await call<{ room_id: string }>(pageA, 'roomStatus', sessionA);
-    if (!roomStatus.room_id.startsWith('!')) {
-      throw new Error('The isolated homeserver does not have the expected existing private room.');
-    }
-    sessionA.roomId = roomStatus.room_id;
-
-    const invitation = await call<Invitation>(pageA, 'createInvitation', sessionA);
-    if (
-      invitation.homeserver !== matrixConfig.homeserverUrl ||
-      invitation.partner_user_id !== partnerB ||
-      invitation.room_id !== sessionA.roomId ||
-      invitation.token.length < 40 ||
-      invitation.expires_at <= Date.now()
-    ) {
-      throw new Error('The isolated one-time pairing invitation did not match the configured partner and room.');
-    }
-    const qrPayload = await call<string>(pageA, 'encodeInvitationQr', invitation);
-    sessionB = await call<Session>(pageB, 'redeemInvitation', qrPayload, passwordDeviceB);
     expect(sessionB.userId).toBe(partnerB);
-    expect(sessionB.deviceId).toBe(passwordSessionB.deviceId);
-    expect(sessionB.roomId).toBe(sessionA.roomId);
-    expect(await call<number>(pageB, 'replayInvitation', invitation)).toBe(403);
+    expect(sessionA.deviceId).not.toBe(sessionB.deviceId);
+    expect(sessionA.homeserver).toBe(matrixConfig.homeserverUrl);
+    expect(sessionB.homeserver).toBe(matrixConfig.homeserverUrl);
+    sessionA.roomId = expectedRoomId;
+    sessionB.roomId = expectedRoomId;
 
     storageKeyA = deriveStorageKey(passwordA, partnerA);
     storageKeyB = deriveStorageKey(passwordB, partnerB);
-    await call(pageA, 'connect', sessionA, storageKeyA);
     await call(pageB, 'connect', sessionB, storageKeyB);
+    await call(pageA, 'connect', sessionA, storageKeyA);
+    const roomStatus = await call<{ room_id: string }>(pageA, 'roomStatus', sessionA);
+    expect(roomStatus.room_id).toBe(expectedRoomId);
 
-    await call(pageA, 'validateRecoveryExport', recoveryExportA, exportPassphraseA, recoveryKeyA, partnerA);
-    await call(pageB, 'validateRecoveryExport', recoveryExportB, exportPassphraseB, recoveryKeyB, partnerB);
-    await call(pageA, 'unlockExistingSecretStorage', recoveryKeyA, passwordA);
-    const identityIdsA = await call<string[]>(pageA, 'crossSigningIdentityIds');
-    await call(pageB, 'unlockExistingSecretStorage', recoveryKeyB, passwordB);
-    const identityIdsB = await call<string[]>(pageB, 'crossSigningIdentityIds');
-    expect(await call<string>(pageA, 'verifyRecoveryOnSeparateDevice', recoveryKeyA, passwordA)).toBeTruthy();
-    expect(await call<string>(pageB, 'verifyRecoveryOnSeparateDevice', recoveryKeyB, passwordB)).toBeTruthy();
+    const joinedMembers = await call<string[]>(pageA, 'joinedMembers', sessionA, expectedRoomId);
+    expect(joinedMembers).toEqual([partnerA, partnerB].sort());
+    expect(await call<number>(
+      pageA,
+      'inviteStatus',
+      sessionA,
+      expectedRoomId,
+      '@third-dev:nymph-dev.localhost',
+    )).toBe(403);
+
+    exportPassphraseA = requestExportPassphrase(partnerA);
+    do {
+      exportPassphraseB = requestExportPassphrase(partnerB);
+    } while (exportPassphraseB === exportPassphraseA);
+    const recoveryA = await prepareAndVerifyRecovery(
+      pageA,
+      partnerA,
+      passwordA,
+      recoveryExportAPath,
+      exportPassphraseA,
+    );
+    recoveryKeyA = recoveryA.recoveryKey;
+    identityIdsA = recoveryA.identityIds;
+    const recoveryB = await prepareAndVerifyRecovery(
+      pageB,
+      partnerB,
+      passwordB,
+      recoveryExportBPath,
+      exportPassphraseB,
+    );
+    recoveryKeyB = recoveryB.recoveryKey;
+    identityIdsB = recoveryB.identityIds;
+    expect(recoveryKeyA).not.toBe(recoveryKeyB);
+    expect(exportPassphraseA).not.toBe(exportPassphraseB);
     expect(identityIdsA).toHaveLength(3);
     expect(identityIdsB).toHaveLength(3);
     expect(new Set([...identityIdsA, ...identityIdsB]).size).toBe(6);
 
-    const securityA = await call<{
-      crossSigningReady: boolean;
-      defaultSecretStorageKeyId: string | null;
-      partnerDevices: Array<{ deviceId: string; verified: boolean }>;
-    }>(pageA, 'refreshSecurity');
-    const securityB = await call<{
-      crossSigningReady: boolean;
-      defaultSecretStorageKeyId: string | null;
-      partnerDevices: Array<{ deviceId: string; verified: boolean }>;
-    }>(pageB, 'refreshSecurity');
-    expect(securityA.crossSigningReady).toBe(true);
-    expect(securityB.crossSigningReady).toBe(true);
-    expect(securityA.defaultSecretStorageKeyId).toBeTruthy();
-    expect(securityB.defaultSecretStorageKeyId).toBeTruthy();
-    expect(securityA.defaultSecretStorageKeyId).not.toBe(securityB.defaultSecretStorageKeyId);
+    await call(pageA, 'requestPartnerVerification', sessionB.deviceId);
+    const canceledIncoming = await waitForValue<{ id: string }>(
+      pageB,
+      'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
+      [partnerA],
+    );
+    const canceledOutgoing = await waitForValue<{ id: string }>(
+      pageA,
+      'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
+      [partnerB],
+    );
+    await call(pageA, 'cancelVerification', canceledOutgoing.id);
+    await waitForValue<boolean>(
+      pageB,
+      'h => h.getVerifications().some(item => item.id === args[0] && item.phase !== "Requested")',
+      [canceledIncoming.id],
+    );
+    expect((await call<RecoverySecurityState & { partnerVerified: boolean }>(
+      pageA,
+      'refreshSecurity',
+    )).partnerVerified).toBe(false);
 
     await call(pageA, 'requestPartnerVerification', sessionB.deviceId);
     const incoming = await waitForValue<{ id: string }>(
@@ -559,7 +538,7 @@ test('isolated Partner A and B complete real encrypted Matrix acceptance flow', 
     await call(pageB, 'acceptVerification', incoming.id);
     const outgoing = await waitForValue<{ id: string }>(
       pageA,
-      'h => h.getVerifications().find(item => item.userId === args[0])',
+      'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
       [partnerB],
     );
     await call(pageA, 'startSasVerification', outgoing.id);
@@ -580,20 +559,110 @@ test('isolated Partner A and B complete real encrypted Matrix acceptance flow', 
     await call(pageB, 'confirmSas', incoming.id);
     await waitForValue<boolean>(pageA, 'h => h.getSecurity()?.partnerVerified');
     await waitForValue<boolean>(pageB, 'h => h.getSecurity()?.partnerVerified');
-    expect(
-      (await call<typeof securityA>(pageA, 'refreshSecurity')).partnerDevices
-        .find((device) => device.deviceId === sessionB?.deviceId)?.verified,
-    ).toBe(true);
-    expect(
-      (await call<typeof securityB>(pageB, 'refreshSecurity')).partnerDevices
-        .find((device) => device.deviceId === sessionA?.deviceId)?.verified,
-    ).toBe(true);
+
+    const securityA = await call<RecoverySecurityState & {
+      partnerVerified: boolean;
+      partnerDevices: Array<{ deviceId: string; verified: boolean }>;
+    }>(pageA, 'refreshSecurity');
+    const securityB = await call<RecoverySecurityState & {
+      partnerVerified: boolean;
+      partnerDevices: Array<{ deviceId: string; verified: boolean }>;
+    }>(pageB, 'refreshSecurity');
+    expect(securityA.crossSigningReady).toBe(true);
+    expect(securityB.crossSigningReady).toBe(true);
+    expect(securityA.partnerVerified).toBe(true);
+    expect(securityB.partnerVerified).toBe(true);
+    expect(securityA.partnerDevices.find((device) => device.deviceId === sessionB?.deviceId)?.verified).toBe(true);
+    expect(securityB.partnerDevices.find((device) => device.deviceId === sessionA?.deviceId)?.verified).toBe(true);
 
     const messageIds: string[] = [];
-    for (const mode of ['romantic', 'flirty', 'spicy', 'kinky'] as const) {
+    const firstMessage = {
+      version: 1 as const,
+      id: randomUUID(),
+      mode: 'romantic' as const,
+      kind: 'text' as const,
+      text: 'Hey, missing you ❤️',
+      sentAt: Date.now(),
+    };
+    const firstEventId = await call<string>(pageA, 'send', firstMessage);
+    await waitForValue<boolean>(
+      pageB,
+      'h => h.getEvents().some(event => event.eventId === args[0])',
+      [firstEventId],
+    );
+    const receivedFirst = await call<Array<{
+      eventId: string; sender: string; mode: string; text: string; kind: string;
+    }>>(pageB, 'getEvents');
+    expect(receivedFirst.find((event) => event.eventId === firstEventId)).toMatchObject({
+      sender: partnerA,
+      mode: 'romantic',
+      kind: 'text',
+      text: 'Hey, missing you ❤️',
+    });
+    messageIds.push(firstEventId);
+
+    await call(pageB, 'markRead', firstEventId);
+    await waitForValue<boolean>(
+      pageA,
+      'h => h.getReadEventIds().includes(args[0])',
+      [firstEventId],
+    );
+
+    const reply = {
+      version: 1 as const,
+      id: randomUUID(),
+      mode: 'romantic' as const,
+      kind: 'text' as const,
+      text: 'Missing you too 🥺💋',
+      sentAt: Date.now(),
+      replyToEventId: firstEventId,
+    };
+    const replyEventId = await call<string>(pageB, 'send', reply);
+    await waitForValue<boolean>(
+      pageA,
+      'h => h.getEvents().some(event => event.eventId === args[0])',
+      [replyEventId],
+    );
+    const receivedReply = await call<Array<{
+      eventId: string; sender: string; mode: string; text: string; replyToEventId?: string;
+    }>>(pageA, 'getEvents');
+    expect(receivedReply.find((event) => event.eventId === replyEventId)).toMatchObject({
+      sender: partnerB,
+      mode: 'romantic',
+      text: 'Missing you too 🥺💋',
+      replyToEventId: firstEventId,
+    });
+    messageIds.push(replyEventId);
+
+    const reactionEventId = await call<string>(pageB, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'romantic',
+      kind: 'reaction',
+      text: '❤️',
+      sentAt: Date.now(),
+      reactionTo: firstEventId,
+    });
+    await waitForValue<boolean>(
+      pageA,
+      'h => h.getEvents().some(event => event.eventId === args[0])',
+      [reactionEventId],
+    );
+    const reactions = await call<Array<{
+      eventId: string; sender: string; mode: string; kind: string; reactionTo?: string;
+    }>>(pageA, 'getEvents');
+    expect(reactions.find((event) => event.eventId === reactionEventId)).toMatchObject({
+      sender: partnerB,
+      mode: 'romantic',
+      kind: 'reaction',
+      reactionTo: firstEventId,
+    });
+    messageIds.push(reactionEventId);
+
+    for (const mode of ['flirty', 'spicy', 'kinky'] as const) {
       const id = randomUUID();
-      const text = `Isolated encrypted ${mode} acceptance ${id}`;
-      await call(pageA, 'send', {
+      const text = `NYMPH ${mode} mode acceptance ${id}`;
+      const eventId = await call<string>(pageA, 'send', {
         version: 1,
         id,
         mode,
@@ -603,40 +672,37 @@ test('isolated Partner A and B complete real encrypted Matrix acceptance flow', 
       });
       await waitForValue<boolean>(
         pageB,
-        'h => h.getEvents().some(event => event.id === args[0])',
-        [id],
+        'h => h.getEvents().some(event => event.eventId === args[0])',
+        [eventId],
       );
-      const received = await call<Array<{ id: string; sender: string; mode: string; text: string }>>(
+      const received = await call<Array<{ eventId: string; sender: string; mode: string; text: string }>>(
         pageB,
         'getEvents',
       );
-      const message = received.find((event) => event.id === id);
-      expect(message?.sender).toBe(partnerA);
-      expect(message?.mode).toBe(mode);
-      expect(message?.text).toBe(text);
-      messageIds.push(id);
+      expect(received.find((event) => event.eventId === eventId)).toMatchObject({
+        sender: partnerA,
+        mode,
+        text,
+      });
+      messageIds.push(eventId);
     }
 
-    const replyId = randomUUID();
-    const replyText = `Isolated encrypted reply ${replyId}`;
-    await call(pageB, 'send', {
+    await call(pageB, 'disconnect');
+    const offlineEventId = await call<string>(pageA, 'send', {
       version: 1,
-      id: replyId,
-      mode: 'flirty',
+      id: randomUUID(),
+      mode: 'romantic',
       kind: 'text',
-      text: replyText,
+      text: 'Offline delivery acceptance',
       sentAt: Date.now(),
     });
-    await waitForValue<boolean>(pageA, 'h => h.getEvents().some(event => event.id === args[0])', [replyId]);
-    const replyEvents = await call<Array<{ id: string; sender: string; mode: string; text: string }>>(
-      pageA,
-      'getEvents',
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    await waitForValue<boolean>(
+      pageB,
+      'h => h.getEvents().some(event => event.eventId === args[0])',
+      [offlineEventId],
     );
-    expect(replyEvents.find((event) => event.id === replyId)).toMatchObject({
-      sender: partnerB,
-      mode: 'flirty',
-      text: replyText,
-    });
+    messageIds.push(offlineEventId);
 
     await call(pageA, 'disconnect');
     await call(pageB, 'disconnect');
@@ -647,15 +713,38 @@ test('isolated Partner A and B complete real encrypted Matrix acceptance flow', 
 
     ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
     ({ context: contextB, page: pageB } = await openPartnerProfile('partner-b'));
-    await call(pageA, 'connect', sessionA, storageKeyA);
     await call(pageB, 'connect', sessionB, storageKeyB);
-    for (const id of [...messageIds, replyId]) {
-      await waitForValue<boolean>(pageA, 'h => h.getEvents().some(event => event.id === args[0])', [id]);
-      await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.id === args[0])', [id]);
+    await call(pageA, 'connect', sessionA, storageKeyA);
+    for (const eventId of messageIds) {
+      await waitForValue<boolean>(
+        pageA,
+        'h => h.getEvents().some(event => event.eventId === args[0])',
+        [eventId],
+      );
+      await waitForValue<boolean>(
+        pageB,
+        'h => h.getEvents().some(event => event.eventId === args[0])',
+        [eventId],
+      );
     }
     expect(await call<string[]>(pageA, 'crossSigningIdentityIds')).toEqual(identityIdsA);
     expect(await call<string[]>(pageB, 'crossSigningIdentityIds')).toEqual(identityIdsB);
 
+    const revokedSession = await call<Session>(
+      pageA,
+      'passwordLogin',
+      partnerA,
+      passwordA,
+      'NYMPH revoked-device acceptance',
+    );
+    if (!revokedSession.deviceId || revokedSession.deviceId === sessionA.deviceId) {
+      throw new Error('The temporary revocation test did not create an independent Matrix device.');
+    }
+    await call(pageA, 'revokeDevice', revokedSession.deviceId, passwordA);
+    expect(await call<number>(pageA, 'whoamiStatus', revokedSession)).toBe(401);
+
+    const finalMembers = await call<string[]>(pageA, 'joinedMembers', sessionA, expectedRoomId);
+    expect(finalMembers).toEqual([partnerA, partnerB].sort());
   } finally {
     if (pageA) await call(pageA, 'disconnect');
     if (pageB) await call(pageB, 'disconnect');
@@ -663,5 +752,11 @@ test('isolated Partner A and B complete real encrypted Matrix acceptance flow', 
     await contextB?.close();
     storageKeyA.fill(0);
     storageKeyB.fill(0);
+    recoveryKeyA = '';
+    recoveryKeyB = '';
+    exportPassphraseA = '';
+    exportPassphraseB = '';
+    passwordA = '';
+    passwordB = '';
   }
 });
