@@ -1,7 +1,9 @@
 import { test, expect, chromium, type BrowserContext, type Page } from '@playwright/test';
 import { randomUUID, scryptSync } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { decryptRecoveryExport, encryptRecoveryExport } from '../../src/matrix/recovery-export.ts';
 import { loadIsolatedMatrixConfig } from './matrix-runtime-config.mjs';
 
 type Session = {
@@ -28,6 +30,196 @@ const chromePath = process.env.NYMPH_CHROME_PATH ??
 const secretDirectory = join(process.cwd(), 'backend', 'dev-isolated', 'secrets');
 const profileRoot = join(process.cwd(), '.matrix-e2e', 'isolated-stage-3i');
 const matrixOperationTimeout = 120_000;
+const expectedRoomId = '!Fcs8AEBEJCozGtC_scKDI55dHg-E1Xy6Biiz29O_Pjw';
+
+const recoveryKeyConfirmationScript = `
+Add-Type -AssemblyName System.Windows.Forms
+$account = [Console]::In.ReadLine()
+$recoveryKey = [Console]::In.ReadLine()
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Save Matrix recovery key - $account"
+$form.Width = 680
+$form.Height = 300
+$form.StartPosition = 'CenterScreen'
+$label = New-Object System.Windows.Forms.Label
+$label.Text = 'Copy this recovery key to secure offline storage. Continue only after you have saved it.'
+$label.AutoSize = $true
+$label.Left = 12
+$label.Top = 12
+$box = New-Object System.Windows.Forms.TextBox
+$box.Multiline = $true
+$box.ReadOnly = $true
+$box.ScrollBars = 'Vertical'
+$box.Text = $recoveryKey
+$box.Left = 12
+$box.Top = 42
+$box.Width = 640
+$box.Height = 100
+$saved = New-Object System.Windows.Forms.CheckBox
+$saved.Text = 'I saved this recovery key offline and can retrieve it later.'
+$saved.AutoSize = $true
+$saved.Left = 12
+$saved.Top = 155
+$ok = New-Object System.Windows.Forms.Button
+$ok.Text = 'Confirm saved key'
+$ok.Left = 480
+$ok.Top = 205
+$ok.Width = 170
+$ok.Enabled = $false
+$saved.Add_CheckedChanged({ $ok.Enabled = $saved.Checked })
+$ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = 'Cancel'
+$cancel.Left = 390
+$cancel.Top = 205
+$cancel.Width = 80
+$cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$form.Controls.AddRange(@($label, $box, $saved, $ok, $cancel))
+$form.AcceptButton = $ok
+$form.CancelButton = $cancel
+$result = $form.ShowDialog()
+$form.Dispose()
+if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $saved.Checked) { exit 2 }
+[Console]::Out.Write('confirmed')
+`;
+
+const recoveryPassphraseScript = `
+Add-Type -AssemblyName System.Windows.Forms
+$account = [Console]::In.ReadLine()
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Encrypted recovery export passphrase - $account"
+$form.Width = 560
+$form.Height = 270
+$form.StartPosition = 'CenterScreen'
+$label = New-Object System.Windows.Forms.Label
+$label.Text = 'Choose a unique passphrase of at least 12 characters. Store it separately from the encrypted export.'
+$label.Left = 12
+$label.Top = 12
+$label.Width = 520
+$label.Height = 36
+$firstLabel = New-Object System.Windows.Forms.Label
+$firstLabel.Text = 'Passphrase'
+$firstLabel.Left = 12
+$firstLabel.Top = 65
+$firstLabel.Width = 100
+$first = New-Object System.Windows.Forms.TextBox
+$first.Left = 120
+$first.Top = 62
+$first.Width = 400
+$first.UseSystemPasswordChar = $true
+$confirmLabel = New-Object System.Windows.Forms.Label
+$confirmLabel.Text = 'Confirm'
+$confirmLabel.Left = 12
+$confirmLabel.Top = 105
+$confirmLabel.Width = 100
+$confirm = New-Object System.Windows.Forms.TextBox
+$confirm.Left = 120
+$confirm.Top = 102
+$confirm.Width = 400
+$confirm.UseSystemPasswordChar = $true
+$ok = New-Object System.Windows.Forms.Button
+$ok.Text = 'Use passphrase'
+$ok.Left = 380
+$ok.Top = 165
+$ok.Width = 140
+$ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = 'Cancel'
+$cancel.Left = 290
+$cancel.Top = 165
+$cancel.Width = 80
+$cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$form.Controls.AddRange(@($label, $firstLabel, $first, $confirmLabel, $confirm, $ok, $cancel))
+$form.AcceptButton = $ok
+$form.CancelButton = $cancel
+while ($true) {
+    $result = $form.ShowDialog()
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+        $form.Dispose()
+        exit 2
+    }
+    if ($first.Text.Length -ge 12 -and $first.Text -ceq $confirm.Text) { break }
+    [System.Windows.Forms.MessageBox]::Show(
+        'The passphrase must be at least 12 characters and both entries must match.',
+        'Passphrase not accepted',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    ) | Out-Null
+}
+$passphrase = $first.Text
+$first.Clear()
+$confirm.Clear()
+$form.Dispose()
+[Console]::Out.Write($passphrase)
+`;
+
+const protectRecoveryExportScript = `
+$path = [Console]::In.ReadLine()
+$acl = Get-Acl -LiteralPath $path
+$acl.SetAccessRuleProtection($true, $false)
+$acl.Access | ForEach-Object { $null = $acl.RemoveAccessRuleSpecific($_) }
+$userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+foreach ($sid in @($userSid, $systemSid)) {
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $sid,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.AddAccessRule($rule)
+}
+Set-Acl -LiteralPath $path -AclObject $acl
+$verified = Get-Acl -LiteralPath $path
+$actual = @($verified.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique)
+if (-not $verified.AreAccessRulesProtected -or $actual.Count -ne 2 -or $actual -notcontains $userSid.Value -or $actual -notcontains $systemSid.Value) { exit 3 }
+[Console]::Out.Write('protected')
+`;
+
+function runLocalPowerShellDialog(script: string, input: string, failure: string): string {
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-STA', '-Command', script],
+    { input, encoding: 'utf8', windowsHide: false, maxBuffer: 16 * 1024 },
+  );
+  if (result.error || result.status !== 0) throw new Error(failure);
+  return result.stdout.replace(/\r?\n$/, '');
+}
+
+function confirmRecoveryKeyOffline(userId: string, recoveryKey: string): void {
+  const result = runLocalPowerShellDialog(
+    recoveryKeyConfirmationScript,
+    `${userId}\n${recoveryKey}\n`,
+    `Recovery-key confirmation was not completed for ${userId}.`,
+  );
+  if (result !== 'confirmed') throw new Error(`Recovery-key confirmation was not completed for ${userId}.`);
+}
+
+function requestExportPassphrase(userId: string): string {
+  const passphrase = runLocalPowerShellDialog(
+    recoveryPassphraseScript,
+    `${userId}\n`,
+    `A local recovery-export passphrase was not provided for ${userId}.`,
+  );
+  if (passphrase.length < 12) throw new Error(`Recovery-export passphrase is too short for ${userId}.`);
+  return passphrase;
+}
+
+async function writeProtectedRecoveryExport(path: string, encryptedExport: string): Promise<void> {
+  await writeFile(path, encryptedExport, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+  try {
+    const result = spawnSync(
+      'powershell.exe',
+      ['-NoProfile', '-STA', '-Command', protectRecoveryExportScript],
+      { input: `${path}\n`, encoding: 'utf8', windowsHide: true, maxBuffer: 16 * 1024 },
+    );
+    if (result.error || result.status !== 0 || result.stdout !== 'protected') {
+      throw new Error('Recovery-export file permissions could not be restricted to this Windows user and SYSTEM.');
+    }
+  } catch (error) {
+    await unlink(path);
+    throw error;
+  }
+}
 
 function requiredCredential(name: string): string {
   const value = process.env[name];
@@ -49,6 +241,109 @@ async function readIsolatedFile(name: string): Promise<string> {
   const value = (await readFile(join(secretDirectory, name), 'utf8')).trim();
   if (!value) throw new Error(`Required isolated development credential file ${name} is empty.`);
   return value;
+}
+
+type RecoverySecurityState = {
+  crossSigningReady: boolean;
+  defaultSecretStorageKeyId: string | null;
+  publicCrossSigningKeysPresent: boolean;
+  privateCrossSigningSecretsStored: boolean;
+  keyBackupVersion: string | null;
+  recoverySetupVerified: boolean;
+};
+
+async function prepareAndVerifyRecovery(
+  page: Page,
+  userId: string,
+  password: string,
+  exportFile: string,
+): Promise<{ recoveryKey: string; passphrase: string; identityIds: string[] }> {
+  let security = await call<RecoverySecurityState>(page, 'refreshSecurity');
+  let recoveryKey: string;
+  let passphrase: string;
+
+  if (!security.defaultSecretStorageKeyId) {
+    if (security.publicCrossSigningKeysPresent) {
+      throw new Error(
+        `An existing cross-signing identity is published for ${userId} without Secret Storage; refusing to replace it.`,
+      );
+    }
+    if (await fileExists(exportFile)) {
+      throw new Error(`A recovery export already exists for ${userId}, but Secret Storage is not configured; refusing to overwrite state.`);
+    }
+
+    recoveryKey = await call<string>(page, 'prepareSecretStorageSetup');
+    if (!recoveryKey) throw new Error(`Matrix did not generate a recovery key for ${userId}.`);
+    confirmRecoveryKeyOffline(userId, recoveryKey);
+    await call<string>(page, 'commitSecretStorageSetup', recoveryKey);
+    await call(page, 'bootstrapSecurity', password);
+    passphrase = requestExportPassphrase(userId);
+    const keyId = (await call<RecoverySecurityState>(page, 'refreshSecurity')).defaultSecretStorageKeyId;
+    if (!keyId) throw new Error(`Secret Storage was not committed for ${userId}.`);
+    const encryptedExport = await encryptRecoveryExport(
+      { account: userId, keyId, recoveryKey },
+      passphrase,
+    );
+    await writeProtectedRecoveryExport(exportFile, encryptedExport);
+  } else {
+    if (!(await fileExists(exportFile))) {
+      throw new Error(`Secret Storage exists for ${userId}, but its encrypted recovery export is missing; refusing to create a replacement key.`);
+    }
+    passphrase = requestExportPassphrase(userId);
+    const encryptedExport = await readFile(exportFile, 'utf8');
+    const exportContents = await decryptRecoveryExport(encryptedExport, passphrase);
+    try {
+      if (
+        exportContents.account !== userId ||
+        exportContents.keyId !== security.defaultSecretStorageKeyId
+      ) {
+        throw new Error(`The encrypted recovery export does not match ${userId}'s existing Secret Storage key.`);
+      }
+      recoveryKey = exportContents.recoveryKey;
+    } finally {
+      exportContents.recoveryKey = '';
+    }
+    await call(page, 'validateRecoveryExport', encryptedExport, passphrase, recoveryKey, userId);
+
+    if (!security.crossSigningReady) {
+      if (security.publicCrossSigningKeysPresent) {
+        if (!security.privateCrossSigningSecretsStored) {
+          throw new Error(`Existing cross-signing secrets are unavailable for ${userId}; refusing to replace the identity.`);
+        }
+        await call(page, 'unlockExistingSecretStorage', recoveryKey, password);
+      } else {
+        await call(page, 'bootstrapSecurity', password);
+      }
+    }
+  }
+
+  const encryptedExport = await readFile(exportFile, 'utf8');
+  await call(page, 'validateRecoveryExport', encryptedExport, passphrase, recoveryKey, userId);
+  const keyId = await call<string>(page, 'verifyRecoveryOnSeparateDevice', recoveryKey, password);
+  security = await call<RecoverySecurityState>(page, 'refreshSecurity');
+  if (
+    keyId !== security.defaultSecretStorageKeyId ||
+    !security.crossSigningReady ||
+    !security.recoverySetupVerified ||
+    !security.keyBackupVersion
+  ) {
+    throw new Error(`Independent recovery or room-key backup validation did not complete for ${userId}.`);
+  }
+  const identityIds = await call<string[]>(page, 'crossSigningIdentityIds');
+  if (identityIds.length !== 3 || new Set(identityIds).size !== 3) {
+    throw new Error(`The published cross-signing identity is incomplete for ${userId}.`);
+  }
+  return { recoveryKey, passphrase, identityIds };
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await readFile(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function deriveStorageKey(password: string, userId: string): number[] {

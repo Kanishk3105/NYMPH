@@ -38,9 +38,12 @@ type HarnessState = {
   acceptVerification(id: string): Promise<void>;
   startSasVerification(id: string): Promise<void>;
   confirmSas(id: string): Promise<void>;
+  cancelVerification(id: string): Promise<void>;
   send(envelope: NymphEnvelope): Promise<string>;
   setTyping(isTyping: boolean): Promise<void>;
   markRead(eventId: string): Promise<void>;
+  joinedMembers(session: HarnessSession, roomId: string): Promise<string[]>;
+  revokeDevice(deviceId: string, password: string): Promise<void>;
   refreshSecurity(): Promise<unknown>;
   logout(session: HarnessSession): Promise<void>;
   whoamiStatus(session: HarnessSession): Promise<number>;
@@ -239,6 +242,10 @@ const state: HarnessState = {
     if (!this.client) throw new Error('Connect a Matrix client before confirming SAS.');
     await this.client.confirmSas(id);
   },
+  async cancelVerification(id) {
+    if (!this.client) throw new Error('Connect a Matrix client before cancelling verification.');
+    await this.client.cancelVerification(id);
+  },
   async send(envelope) {
     if (!this.client) throw new Error('Connect a Matrix client before sending.');
     return this.client.send(envelope);
@@ -250,6 +257,25 @@ const state: HarnessState = {
   async markRead(eventId) {
     if (!this.client) throw new Error('Connect a Matrix client before marking a receipt.');
     await this.client.markRead(eventId);
+  },
+  async joinedMembers(session, roomId) {
+    const response = await fetch(
+      `${apiBase}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/joined_members`,
+      {
+        headers: { Authorization: `****** },
+        cache: 'no-store',
+      },
+    );
+    if (!response.ok) throw new Error(`Room membership request failed (${response.status}).`);
+    const body = await response.json() as { joined?: Record<string, unknown> };
+    if (!body.joined || typeof body.joined !== 'object') {
+      throw new Error('The homeserver returned invalid room membership data.');
+    }
+    return Object.keys(body.joined).sort();
+  },
+  async revokeDevice(deviceId, password) {
+    if (!this.client) throw new Error('Connect a Matrix client before revoking a device.');
+    await this.client.revokeDevice(deviceId, password);
   },
   async refreshSecurity() {
     if (!this.client) throw new Error('Connect a Matrix client before checking security.');
