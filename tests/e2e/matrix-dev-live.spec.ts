@@ -3,7 +3,8 @@ import { randomUUID, scryptSync } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { decryptRecoveryExport, encryptRecoveryExport } from '../../src/matrix/recovery-export.ts';
+import { RecoveryExportPassphraseSession } from '../../src/matrix/recovery-export-session.ts';
+import type { RecoveryExportPassphrasePurpose } from '../../src/matrix/recovery-export-session.ts';
 import { loadIsolatedMatrixConfig } from './matrix-runtime-config.mjs';
 
 type Session = {
@@ -84,8 +85,8 @@ if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $savedConfirmed
 const recoveryPassphraseScript = `
 Add-Type -AssemblyName System.Windows.Forms
 $account = [Console]::In.ReadLine()
-$otherPassphrase = [Console]::In.ReadLine()
-$existingExport = [Console]::In.ReadLine() -eq 'true'
+$purpose = [Console]::In.ReadLine()
+$existingExport = $purpose -eq 'existing'
 $form = New-Object System.Windows.Forms.Form
 if ($existingExport) {
     $form.Text = "Existing recovery export passphrase - $account"
@@ -121,6 +122,7 @@ $first.Width = 400
 $first.UseSystemPasswordChar = $true
 $confirmLabel = New-Object System.Windows.Forms.Label
 $confirmLabel.Text = 'Confirm'
+$confirmLabel.Visible = -not $existingExport
 $confirmLabel.Left = 12
 $confirmLabel.Top = 105
 $confirmLabel.Width = 100
@@ -129,6 +131,7 @@ $confirm.Left = 120
 $confirm.Top = 102
 $confirm.Width = 400
 $confirm.UseSystemPasswordChar = $true
+$confirm.Visible = -not $existingExport
 $ok = New-Object System.Windows.Forms.Button
 $ok.Text = 'Use passphrase'
 $ok.Left = 380
@@ -150,9 +153,14 @@ while ($true) {
         $form.Dispose()
         exit 2
     }
-    if ($first.Text.Length -ge 12 -and $first.Text -ceq $confirm.Text -and $first.Text -cne $otherPassphrase) { break }
+    if ($first.Text.Length -ge 12 -and ($existingExport -or $first.Text -ceq $confirm.Text)) { break }
+    $message = if ($existingExport) {
+        'Enter the original export passphrase. It must contain at least 12 characters.'
+    } else {
+        'Use a passphrase of at least 12 characters and confirm it exactly.'
+    }
     [System.Windows.Forms.MessageBox]::Show(
-        'Use at least 12 characters, confirm exactly, and choose a passphrase different from the other partner.',
+        $message,
         'Passphrase not accepted',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -251,12 +259,11 @@ function confirmRecoveryKeyOffline(userId: string, recoveryKey: string): void {
 
 function requestExportPassphrase(
   userId: string,
-  otherPartnerPassphrase = '',
-  existingExport = false,
+  purpose: RecoveryExportPassphrasePurpose,
 ): string {
   const passphrase = runLocalPowerShellDialog(
     recoveryPassphraseScript,
-    `${userId}\n${otherPartnerPassphrase}\n${existingExport}\n`,
+    `${userId}\n${purpose}\n`,
     `A local recovery-export passphrase was not provided for ${userId}.`,
   );
   if (passphrase.length < 12) throw new Error(`Recovery-export passphrase is too short for ${userId}.`);
@@ -310,11 +317,10 @@ async function prepareAndVerifyRecovery(
   userId: string,
   password: string,
   exportFile: string,
-  passphrase: string,
+  passphraseSession: RecoveryExportPassphraseSession,
 ): Promise<{ recoveryKey: string; identityIds: string[] }> {
   let security = await call<RecoverySecurityState>(page, 'refreshSecurity');
   let recoveryKey: string;
-  let exportContents: Awaited<ReturnType<typeof decryptRecoveryExport>> | undefined;
 
   if (!security.defaultSecretStorageKeyId) {
     if (security.publicCrossSigningKeysPresent) {
@@ -332,23 +338,21 @@ async function prepareAndVerifyRecovery(
     await call<string>(page, 'commitSecretStorageSetup', recoveryKey);
     const keyId = (await call<RecoverySecurityState>(page, 'refreshSecurity')).defaultSecretStorageKeyId;
     if (!keyId) throw new Error(`Secret Storage was not committed for ${userId}.`);
-    const encryptedExport = await encryptRecoveryExport(
+    const encryptedExport = await passphraseSession.createEncryptedExport(
+      userId,
       { account: userId, keyId, recoveryKey },
-      passphrase,
+      (contents) => validateRecoveryContents(contents, userId, keyId, recoveryKey),
     );
     await writeProtectedRecoveryExport(exportFile, encryptedExport);
     await call(page, 'bootstrapSecurity', password);
   } else {
     if (await fileExists(exportFile)) {
       const encryptedExport = await readFile(exportFile, 'utf8');
-      exportContents = await decryptRecoveryExport(encryptedExport, passphrase);
-      if (
-        exportContents.account !== userId ||
-        exportContents.keyId !== security.defaultSecretStorageKeyId
-      ) {
-        exportContents.recoveryKey = '';
-        throw new Error(`The encrypted recovery export does not match ${userId}'s existing Secret Storage key.`);
-      }
+      const exportContents = await passphraseSession.decryptExport(
+        userId,
+        encryptedExport,
+        (contents) => validateRecoveryContents(contents, userId, security.defaultSecretStorageKeyId),
+      );
       recoveryKey = exportContents.recoveryKey;
       exportContents.recoveryKey = '';
     } else {
@@ -373,15 +377,30 @@ async function prepareAndVerifyRecovery(
     if (!securityState.defaultSecretStorageKeyId) {
       throw new Error(`Secret Storage is not configured for ${userId}.`);
     }
-    const encryptedExport = await encryptRecoveryExport(
+    const encryptedExport = await passphraseSession.createEncryptedExport(
+      userId,
       { account: userId, keyId: securityState.defaultSecretStorageKeyId, recoveryKey },
-      passphrase,
+      (contents) => validateRecoveryContents(
+        contents,
+        userId,
+        securityState.defaultSecretStorageKeyId,
+        recoveryKey,
+      ),
     );
     await writeProtectedRecoveryExport(exportFile, encryptedExport);
   }
   const encryptedExport = await readFile(exportFile, 'utf8');
-  await call(page, 'validateRecoveryExport', encryptedExport, passphrase, recoveryKey, userId);
-  exportContents = undefined;
+  const validatedExport = await passphraseSession.decryptExport(
+    userId,
+    encryptedExport,
+    (contents) => validateRecoveryContents(
+      contents,
+      userId,
+      security.defaultSecretStorageKeyId,
+      recoveryKey,
+    ),
+  );
+  validatedExport.recoveryKey = '';
   security = await call<RecoverySecurityState>(page, 'refreshSecurity');
   if (
     keyId !== security.defaultSecretStorageKeyId ||
@@ -396,6 +415,34 @@ async function prepareAndVerifyRecovery(
     throw new Error(`The published cross-signing identity is incomplete for ${userId}.`);
   }
   return { recoveryKey, identityIds };
+}
+
+function validateRecoveryContents(
+  contents: { account: string; keyId: string | null; recoveryKey: string },
+  userId: string,
+  keyId: string | null,
+  recoveryKey?: string,
+): void {
+  if (contents.account !== userId || contents.keyId !== keyId) {
+    throw new Error(`The encrypted recovery export does not match ${userId}'s existing Secret Storage key.`);
+  }
+  if (recoveryKey !== undefined && contents.recoveryKey !== recoveryKey) {
+    throw new Error(`The encrypted recovery export contains an unexpected recovery key for ${userId}.`);
+  }
+}
+
+async function recoverPartner(
+  page: Page,
+  userId: string,
+  password: string,
+  exportFile: string,
+): Promise<{ recoveryKey: string; identityIds: string[] }> {
+  const passphraseSession = new RecoveryExportPassphraseSession(requestExportPassphrase);
+  try {
+    return await prepareAndVerifyRecovery(page, userId, password, exportFile, passphraseSession);
+  } finally {
+    passphraseSession.finish();
+  }
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -517,8 +564,6 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
   let storageKeyB: number[] = [];
   let recoveryKeyA = '';
   let recoveryKeyB = '';
-  let exportPassphraseA = '';
-  let exportPassphraseB = '';
   let identityIdsA: string[] = [];
   let identityIdsB: string[] = [];
 
@@ -568,46 +613,23 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
       '@third-dev:nymph-dev.localhost',
     )).toBe(403);
 
-    exportPassphraseA = requestExportPassphrase(
-      partnerA,
-      '',
-      await fileExists(recoveryExportAPath),
-    );
-    exportPassphraseB = requestExportPassphrase(
-      partnerB,
-      exportPassphraseA,
-      await fileExists(recoveryExportBPath),
-    );
-    const recoveryA = await prepareAndVerifyRecovery(
+    const recoveryA = await recoverPartner(
       pageA,
       partnerA,
       passwordA,
       recoveryExportAPath,
-      exportPassphraseA,
     );
     recoveryKeyA = recoveryA.recoveryKey;
     identityIdsA = recoveryA.identityIds;
-    if (exportPassphraseB === recoveryKeyA) {
-      throw new Error('Partner B recovery-export passphrase must be distinct from Partner A recovery credentials.');
-    }
-    const recoveryB = await prepareAndVerifyRecovery(
+    const recoveryB = await recoverPartner(
       pageB,
       partnerB,
       passwordB,
       recoveryExportBPath,
-      exportPassphraseB,
     );
     recoveryKeyB = recoveryB.recoveryKey;
     identityIdsB = recoveryB.identityIds;
-    if (
-      recoveryKeyA === recoveryKeyB ||
-      exportPassphraseA === recoveryKeyA ||
-      exportPassphraseA === recoveryKeyB ||
-      exportPassphraseB === recoveryKeyA ||
-      exportPassphraseB === recoveryKeyB
-    ) {
-      throw new Error('Partner login credentials, recovery keys, and export passphrases must be distinct.');
-    }
+    if (recoveryKeyA === recoveryKeyB) throw new Error('Partner recovery keys must be independent.');
     expect(identityIdsA).toHaveLength(3);
     expect(identityIdsB).toHaveLength(3);
     expect(new Set([...identityIdsA, ...identityIdsB]).size).toBe(6);
@@ -859,8 +881,6 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     storageKeyB.fill(0);
     recoveryKeyA = '';
     recoveryKeyB = '';
-    exportPassphraseA = '';
-    exportPassphraseB = '';
     passwordA = '';
     passwordB = '';
   }

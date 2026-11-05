@@ -6,7 +6,6 @@ import {
   type NymphEnvelope,
   type ReceivedNymphEvent,
 } from '../../src/matrix/MessagingClient';
-import { decryptRecoveryExport } from '../../src/matrix/recovery-export';
 import QRCode from 'qrcode';
 import { BrowserQRCodeReader } from '@zxing/browser';
 
@@ -30,12 +29,6 @@ type HarnessState = {
   prepareSecretStorageSetup(): Promise<string>;
   commitSecretStorageSetup(confirmation: string): Promise<string>;
   bootstrapSecurity(password: string): Promise<void>;
-  validateRecoveryExport(
-    encryptedExport: string,
-    passphrase: string,
-    recoveryKey: string,
-    expectedUserId: string,
-  ): Promise<void>;
   verifyRecoveryOnSeparateDevice(recoveryKey: string, password: string): Promise<string>;
   requestPartnerVerification(deviceId: string): Promise<void>;
   acceptVerification(id: string): Promise<void>;
@@ -251,16 +244,6 @@ const state: HarnessState = {
   async bootstrapSecurity(password) {
     if (!this.client) throw new Error('Connect a Matrix client before bootstrapping security.');
     await this.client.bootstrapSecurity(password);
-  },
-  async validateRecoveryExport(encryptedExport, passphrase, recoveryKey, expectedUserId) {
-    const contents = await decryptRecoveryExport(encryptedExport, passphrase);
-    try {
-      if (contents.account !== expectedUserId || contents.recoveryKey !== recoveryKey) {
-        throw new Error('The local encrypted recovery export does not match the supplied partner credentials.');
-      }
-    } finally {
-      contents.recoveryKey = '';
-    }
   },
   async verifyRecoveryOnSeparateDevice(recoveryKey, password) {
     if (!this.client) throw new Error('Connect a Matrix client before verifying recovery.');
