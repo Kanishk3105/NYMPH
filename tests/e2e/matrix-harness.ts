@@ -27,6 +27,9 @@ type HarnessState = {
   redeemInvitation(invite: unknown, deviceId?: string): Promise<HarnessSession>;
   replayInvitation(invite: unknown): Promise<number>;
   unlockExistingSecretStorage(recoveryKey: string, password: string): Promise<string>;
+  prepareSecretStorageSetup(): Promise<string>;
+  commitSecretStorageSetup(confirmation: string): Promise<string>;
+  bootstrapSecurity(password: string): Promise<void>;
   validateRecoveryExport(
     encryptedExport: string,
     passphrase: string,
@@ -55,6 +58,31 @@ type HarnessState = {
   getTyping(): boolean;
   getReadEventIds(): string[];
 };
+
+async function loginWithRateLimitRetry<T>(login: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await login();
+    } catch (error) {
+      if (
+        error === null ||
+        typeof error !== 'object' ||
+        !('errcode' in error) ||
+        error.errcode !== 'M_LIMIT_EXCEEDED' ||
+        !('getRetryAfterMs' in error) ||
+        typeof error.getRetryAfterMs !== 'function' ||
+        attempt >= 2
+      ) {
+        throw error;
+      }
+      const delay = error.getRetryAfterMs();
+      if (typeof delay !== 'number' || !Number.isSafeInteger(delay) || delay < 0 || delay > 90_000) {
+        throw error;
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
+    }
+  }
+}
 
 const matrixConfig = {
   homeserverUrl: import.meta.env.VITE_MATRIX_HOMESERVER,
@@ -112,12 +140,12 @@ const state: HarnessState = {
     const { createClient } = await import('matrix-js-sdk');
     const loginClient = createClient({ baseUrl: apiBase });
     try {
-      const session = await loginClient.login('m.login.password', {
-        identifier: { type: 'm.id.user', user: userId },
-        password,
-        initial_device_display_name: deviceName,
-        device_id: deviceId ?? crypto.randomUUID(),
-      });
+      const session = await loginWithRateLimitRetry(() => loginClient.login('m.login.password', {
+          identifier: { type: 'm.id.user', user: userId },
+          password,
+          initial_device_display_name: deviceName,
+          device_id: deviceId ?? crypto.randomUUID(),
+        }));
       return {
         homeserver: apiBase,
         userId: session.user_id,
@@ -211,6 +239,18 @@ const state: HarnessState = {
   async unlockExistingSecretStorage(recoveryKey, password) {
     if (!this.client) throw new Error('Connect a Matrix client before unlocking Secret Storage.');
     return this.client.unlockExistingSecretStorage(recoveryKey, password);
+  },
+  async prepareSecretStorageSetup() {
+    if (!this.client) throw new Error('Connect a Matrix client before preparing Secret Storage.');
+    return this.client.prepareSecretStorageSetup();
+  },
+  async commitSecretStorageSetup(confirmation) {
+    if (!this.client) throw new Error('Connect a Matrix client before confirming Secret Storage.');
+    return this.client.commitSecretStorageSetup(confirmation);
+  },
+  async bootstrapSecurity(password) {
+    if (!this.client) throw new Error('Connect a Matrix client before bootstrapping security.');
+    await this.client.bootstrapSecurity(password);
   },
   async validateRecoveryExport(encryptedExport, passphrase, recoveryKey, expectedUserId) {
     const contents = await decryptRecoveryExport(encryptedExport, passphrase);

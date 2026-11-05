@@ -33,7 +33,7 @@ $form.Width = 680
 $form.Height = 300
 $form.StartPosition = 'CenterScreen'
 $label = New-Object System.Windows.Forms.Label
-$label.Text = 'Copy this recovery key to secure offline storage. Continue only after you have saved it.'
+$label.Text = 'Save this recovery key offline, then re-enter it below to confirm that your saved copy is correct.'
 $label.AutoSize = $true
 $label.Left = 12
 $label.Top = 12
@@ -46,18 +46,23 @@ $box.Left = 12
 $box.Top = 42
 $box.Width = 640
 $box.Height = 100
-$saved = New-Object System.Windows.Forms.CheckBox
-$saved.Text = 'I saved this recovery key offline and can retrieve it later.'
+$saved = New-Object System.Windows.Forms.Label
+$saved.Text = 'Re-enter the recovery key from your saved copy:'
 $saved.AutoSize = $true
 $saved.Left = 12
 $saved.Top = 155
+$verify = New-Object System.Windows.Forms.TextBox
+$verify.Left = 12
+$verify.Top = 180
+$verify.Width = 640
+$verify.UseSystemPasswordChar = $true
 $ok = New-Object System.Windows.Forms.Button
 $ok.Text = 'Confirm saved key'
 $ok.Left = 480
 $ok.Top = 205
 $ok.Width = 170
 $ok.Enabled = $false
-$saved.Add_CheckedChanged({ $ok.Enabled = $saved.Checked })
+$verify.Add_TextChanged({ $ok.Enabled = ($verify.Text -ceq $recoveryKey) })
 $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
 $cancel = New-Object System.Windows.Forms.Button
 $cancel.Text = 'Cancel'
@@ -65,11 +70,12 @@ $cancel.Left = 390
 $cancel.Top = 205
 $cancel.Width = 80
 $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-$form.Controls.AddRange(@($label, $box, $saved, $ok, $cancel))
+$form.Controls.AddRange(@($label, $box, $saved, $verify, $ok, $cancel))
 $form.AcceptButton = $ok
 $form.CancelButton = $cancel
 $result = $form.ShowDialog()
-$savedConfirmed = $saved.Checked
+$savedConfirmed = $verify.Text -ceq $recoveryKey
+$verify.Clear()
 $form.Dispose()
 if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $savedConfirmed) { exit 2 }
 [Console]::Out.Write('confirmed')
@@ -78,19 +84,33 @@ if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $savedConfirmed
 const recoveryPassphraseScript = `
 Add-Type -AssemblyName System.Windows.Forms
 $account = [Console]::In.ReadLine()
+$otherPassphrase = [Console]::In.ReadLine()
+$existingExport = [Console]::In.ReadLine() -eq 'true'
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Encrypted recovery export passphrase - $account"
+if ($existingExport) {
+    $form.Text = "Existing recovery export passphrase - $account"
+} else {
+    $form.Text = "New recovery export passphrase - $account"
+}
 $form.Width = 560
 $form.Height = 270
 $form.StartPosition = 'CenterScreen'
 $label = New-Object System.Windows.Forms.Label
-$label.Text = 'Choose a unique passphrase of at least 12 characters. Store it separately from the encrypted export.'
+if ($existingExport) {
+    $label.Text = 'Enter the original passphrase used to encrypt this existing export. Do not choose a new passphrase.'
+} else {
+    $label.Text = 'Choose a unique passphrase of at least 12 characters. Store it separately from the encrypted export.'
+}
 $label.Left = 12
 $label.Top = 12
 $label.Width = 520
 $label.Height = 36
 $firstLabel = New-Object System.Windows.Forms.Label
-$firstLabel.Text = 'Passphrase'
+if ($existingExport) {
+    $firstLabel.Text = 'Original passphrase'
+} else {
+    $firstLabel.Text = 'Passphrase'
+}
 $firstLabel.Left = 12
 $firstLabel.Top = 65
 $firstLabel.Width = 100
@@ -130,9 +150,9 @@ while ($true) {
         $form.Dispose()
         exit 2
     }
-    if ($first.Text.Length -ge 12 -and $first.Text -ceq $confirm.Text) { break }
+    if ($first.Text.Length -ge 12 -and $first.Text -ceq $confirm.Text -and $first.Text -cne $otherPassphrase) { break }
     [System.Windows.Forms.MessageBox]::Show(
-        'The passphrase must be at least 12 characters and both entries must match.',
+        'Use at least 12 characters, confirm exactly, and choose a passphrase different from the other partner.',
         'Passphrase not accepted',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -229,10 +249,14 @@ function confirmRecoveryKeyOffline(userId: string, recoveryKey: string): void {
   if (result !== 'confirmed') throw new Error(`Recovery-key confirmation was not completed for ${userId}.`);
 }
 
-function requestExportPassphrase(userId: string): string {
+function requestExportPassphrase(
+  userId: string,
+  otherPartnerPassphrase = '',
+  existingExport = false,
+): string {
   const passphrase = runLocalPowerShellDialog(
     recoveryPassphraseScript,
-    `${userId}\n`,
+    `${userId}\n${otherPartnerPassphrase}\n${existingExport}\n`,
     `A local recovery-export passphrase was not provided for ${userId}.`,
   );
   if (passphrase.length < 12) throw new Error(`Recovery-export passphrase is too short for ${userId}.`);
@@ -544,15 +568,16 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
       '@third-dev:nymph-dev.localhost',
     )).toBe(403);
 
-    exportPassphraseA = requestExportPassphrase(partnerA);
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      exportPassphraseB = requestExportPassphrase(partnerB);
-      if (exportPassphraseB !== exportPassphraseA) break;
-      exportPassphraseB = '';
-    }
-    if (!exportPassphraseB) {
-      throw new Error('Each partner must use a distinct recovery-export passphrase.');
-    }
+    exportPassphraseA = requestExportPassphrase(
+      partnerA,
+      '',
+      await fileExists(recoveryExportAPath),
+    );
+    exportPassphraseB = requestExportPassphrase(
+      partnerB,
+      exportPassphraseA,
+      await fileExists(recoveryExportBPath),
+    );
     const recoveryA = await prepareAndVerifyRecovery(
       pageA,
       partnerA,
@@ -562,6 +587,9 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     );
     recoveryKeyA = recoveryA.recoveryKey;
     identityIdsA = recoveryA.identityIds;
+    if (exportPassphraseB === recoveryKeyA) {
+      throw new Error('Partner B recovery-export passphrase must be distinct from Partner A recovery credentials.');
+    }
     const recoveryB = await prepareAndVerifyRecovery(
       pageB,
       partnerB,
@@ -571,8 +599,15 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     );
     recoveryKeyB = recoveryB.recoveryKey;
     identityIdsB = recoveryB.identityIds;
-    expect(recoveryKeyA).not.toBe(recoveryKeyB);
-    expect(exportPassphraseA).not.toBe(exportPassphraseB);
+    if (
+      recoveryKeyA === recoveryKeyB ||
+      exportPassphraseA === recoveryKeyA ||
+      exportPassphraseA === recoveryKeyB ||
+      exportPassphraseB === recoveryKeyA ||
+      exportPassphraseB === recoveryKeyB
+    ) {
+      throw new Error('Partner login credentials, recovery keys, and export passphrases must be distinct.');
+    }
     expect(identityIdsA).toHaveLength(3);
     expect(identityIdsB).toHaveLength(3);
     expect(new Set([...identityIdsA, ...identityIdsB]).size).toBe(6);
