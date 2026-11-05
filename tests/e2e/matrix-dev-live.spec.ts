@@ -557,7 +557,9 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
   const passwordDeviceB = await readIsolatedFile('partner2_dev_device_id');
   const recoveryExportAPath = join(secretDirectory, 'partner1_dev_recovery.enc');
   const recoveryExportBPath = join(secretDirectory, 'partner2_dev_recovery.enc');
+  if (!(await fileExists(recoveryExportAPath))) throw new Error('Partner A recovery export is missing.');
   const recoveryExportBExistedBeforeTest = await fileExists(recoveryExportBPath);
+  if (!recoveryExportBExistedBeforeTest) throw new Error('Partner B recovery export is missing.');
 
   let contextA: BrowserContext | undefined;
   let contextB: BrowserContext | undefined;
@@ -572,6 +574,7 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
   let identityIdsA: string[] = [];
   let identityIdsB: string[] = [];
   let partnerARecoveryAlreadyVerified = false;
+  let partnerBRecoveryAlreadyVerified = false;
 
   try {
     ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
@@ -652,14 +655,23 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
       recoveryKeyA = recoveryA.recoveryKey;
       identityIdsA = recoveryA.identityIds;
     }
-    const recoveryB = await recoverPartner(
-      pageB,
-      partnerB,
-      passwordB,
-      recoveryExportBPath,
-    );
-    recoveryKeyB = recoveryB.recoveryKey;
-    identityIdsB = recoveryB.identityIds;
+    if (
+      preflightSecurityB.recoverySetupVerified &&
+      preflightSecurityB.crossSigningReady &&
+      preflightSecurityB.keyBackupVersion
+    ) {
+      partnerBRecoveryAlreadyVerified = true;
+      identityIdsB = await call<string[]>(pageB, 'crossSigningIdentityIds');
+    } else {
+      const recoveryB = await recoverPartner(
+        pageB,
+        partnerB,
+        passwordB,
+        recoveryExportBPath,
+      );
+      recoveryKeyB = recoveryB.recoveryKey;
+      identityIdsB = recoveryB.identityIds;
+    }
     if (recoveryKeyA && recoveryKeyB && recoveryKeyA === recoveryKeyB) {
       throw new Error('Partner recovery keys must be independent.');
     }
@@ -667,58 +679,70 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     expect(identityIdsB).toHaveLength(3);
     expect(new Set([...identityIdsA, ...identityIdsB]).size).toBe(6);
 
-    await call(pageA, 'requestPartnerVerification', sessionB.deviceId);
-    const canceledIncoming = await waitForValue<{ id: string }>(
-      pageB,
-      'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
-      [partnerA],
-    );
-    const canceledOutgoing = await waitForValue<{ id: string }>(
-      pageA,
-      'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
-      [partnerB],
-    );
-    await call(pageA, 'cancelVerification', canceledOutgoing.id);
-    await waitForValue<boolean>(
-      pageB,
-      'h => h.getVerifications().some(item => item.id === args[0] && item.phase !== "Requested")',
-      [canceledIncoming.id],
-    );
-    expect((await call<RecoverySecurityState & { partnerVerified: boolean }>(
+    const initialTrustA = await call<RecoverySecurityState & { partnerVerified: boolean }>(
       pageA,
       'refreshSecurity',
-    )).partnerVerified).toBe(false);
+    );
+    const initialTrustB = await call<RecoverySecurityState & { partnerVerified: boolean }>(
+      pageB,
+      'refreshSecurity',
+    );
+    if (initialTrustA.partnerVerified !== initialTrustB.partnerVerified) {
+      throw new Error('Partner trust is inconsistent; refusing to start a duplicate SAS verification.');
+    }
+    if (!initialTrustA.partnerVerified) {
+      await call(pageA, 'requestPartnerVerification', sessionB.deviceId);
+      const canceledIncoming = await waitForValue<{ id: string }>(
+        pageB,
+        'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
+        [partnerA],
+      );
+      const canceledOutgoing = await waitForValue<{ id: string }>(
+        pageA,
+        'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
+        [partnerB],
+      );
+      await call(pageA, 'cancelVerification', canceledOutgoing.id);
+      await waitForValue<boolean>(
+        pageB,
+        'h => h.getVerifications().some(item => item.id === args[0] && item.phase !== "Requested")',
+        [canceledIncoming.id],
+      );
+      expect((await call<RecoverySecurityState & { partnerVerified: boolean }>(
+        pageA,
+        'refreshSecurity',
+      )).partnerVerified).toBe(false);
 
-    await call(pageA, 'requestPartnerVerification', sessionB.deviceId);
-    const incoming = await waitForValue<{ id: string }>(
-      pageB,
-      'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
-      [partnerA],
-    );
-    await call(pageB, 'acceptVerification', incoming.id);
-    const outgoing = await waitForValue<{ id: string }>(
-      pageA,
-      'h => h.getVerifications().find(item => item.userId === args[0] && item.id !== args[1])',
-      [partnerB, canceledOutgoing.id],
-    );
-    await call(pageA, 'startSasVerification', outgoing.id);
-    await call(pageB, 'startSasVerification', incoming.id);
-    const sasA = await waitForValue<{ emoji?: unknown[]; decimal?: unknown[] }>(
-      pageA,
-      'h => h.getVerifications().find(item => item.id === args[0])?.sas',
-      [outgoing.id],
-    );
-    const sasB = await waitForValue<{ emoji?: unknown[]; decimal?: unknown[] }>(
-      pageB,
-      'h => h.getVerifications().find(item => item.id === args[0])?.sas',
-      [incoming.id],
-    );
-    expect(sasA).toEqual(sasB);
-    expect(Boolean(sasA.emoji?.length || sasA.decimal?.length)).toBe(true);
-    await call(pageA, 'confirmSas', outgoing.id);
-    await call(pageB, 'confirmSas', incoming.id);
-    await waitForValue<boolean>(pageA, 'h => h.getSecurity()?.partnerVerified');
-    await waitForValue<boolean>(pageB, 'h => h.getSecurity()?.partnerVerified');
+      await call(pageA, 'requestPartnerVerification', sessionB.deviceId);
+      const incoming = await waitForValue<{ id: string }>(
+        pageB,
+        'h => h.getVerifications().find(item => item.userId === args[0] && item.phase === "Requested")',
+        [partnerA],
+      );
+      await call(pageB, 'acceptVerification', incoming.id);
+      const outgoing = await waitForValue<{ id: string }>(
+        pageA,
+        'h => h.getVerifications().find(item => item.userId === args[0] && item.id !== args[1])',
+        [partnerB, canceledOutgoing.id],
+      );
+      await call(pageA, 'startSasVerification', outgoing.id);
+      const sasA = await waitForValue<{ emoji?: unknown[]; decimal?: unknown[] }>(
+        pageA,
+        'h => h.getVerifications().find(item => item.id === args[0])?.sas',
+        [outgoing.id],
+      );
+      const sasB = await waitForValue<{ emoji?: unknown[]; decimal?: unknown[] }>(
+        pageB,
+        'h => h.getVerifications().find(item => item.id === args[0])?.sas',
+        [incoming.id],
+      );
+      expect(sasA).toEqual(sasB);
+      expect(Boolean(sasA.emoji?.length || sasA.decimal?.length)).toBe(true);
+      await call(pageA, 'confirmSas', outgoing.id);
+      await call(pageB, 'confirmSas', incoming.id);
+      await waitForValue<boolean>(pageA, 'h => h.getSecurity()?.partnerVerified');
+      await waitForValue<boolean>(pageB, 'h => h.getSecurity()?.partnerVerified');
+    }
 
     const securityA = await call<RecoverySecurityState & {
       partnerVerified: boolean;
@@ -907,10 +931,7 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     expect(finalMembers).toEqual([partnerA, partnerB].sort());
     const expectedPromptCounts = new Map<string, number>();
     if (!partnerARecoveryAlreadyVerified) expectedPromptCounts.set(`${partnerA}:existing`, 1);
-    expectedPromptCounts.set(
-      `${partnerB}:${recoveryExportBExistedBeforeTest ? 'existing' : 'new'}`,
-      1,
-    );
+    if (!partnerBRecoveryAlreadyVerified) expectedPromptCounts.set(`${partnerB}:existing`, 1);
     expect(recoveryPassphrasePromptCounts).toEqual(expectedPromptCounts);
   } finally {
     if (pageA) await call(pageA, 'disconnect');
