@@ -23,6 +23,7 @@ const secretDirectory = join(process.cwd(), 'backend', 'dev-isolated', 'secrets'
 const profileRoot = join(process.cwd(), '.matrix-e2e', 'isolated-stage-3i');
 const matrixOperationTimeout = 120_000;
 const expectedRoomId = '!Fcs8AEBEJCozGtC_scKDI55dHg-E1Xy6Biiz29O_Pjw';
+const recoveryPassphrasePromptCounts = new Map<string, number>();
 
 const recoveryKeyConfirmationScript = `
 Add-Type -AssemblyName System.Windows.Forms
@@ -261,6 +262,8 @@ function requestExportPassphrase(
   userId: string,
   purpose: RecoveryExportPassphrasePurpose,
 ): string {
+  const promptKey = `${userId}:${purpose}`;
+  recoveryPassphrasePromptCounts.set(promptKey, (recoveryPassphrasePromptCounts.get(promptKey) ?? 0) + 1);
   const passphrase = runLocalPowerShellDialog(
     recoveryPassphraseScript,
     `${userId}\n${purpose}\n`,
@@ -336,7 +339,8 @@ async function prepareAndVerifyRecovery(
     if (!recoveryKey) throw new Error(`Matrix did not generate a recovery key for ${userId}.`);
     confirmRecoveryKeyOffline(userId, recoveryKey);
     await call<string>(page, 'commitSecretStorageSetup', recoveryKey);
-    const keyId = (await call<RecoverySecurityState>(page, 'refreshSecurity')).defaultSecretStorageKeyId;
+    security = await call<RecoverySecurityState>(page, 'refreshSecurity');
+    const keyId = security.defaultSecretStorageKeyId;
     if (!keyId) throw new Error(`Secret Storage was not committed for ${userId}.`);
     const encryptedExport = await passphraseSession.createEncryptedExport(
       userId,
@@ -553,6 +557,7 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
   const passwordDeviceB = await readIsolatedFile('partner2_dev_device_id');
   const recoveryExportAPath = join(secretDirectory, 'partner1_dev_recovery.enc');
   const recoveryExportBPath = join(secretDirectory, 'partner2_dev_recovery.enc');
+  const recoveryExportBExistedBeforeTest = await fileExists(recoveryExportBPath);
 
   let contextA: BrowserContext | undefined;
   let contextB: BrowserContext | undefined;
@@ -566,6 +571,7 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
   let recoveryKeyB = '';
   let identityIdsA: string[] = [];
   let identityIdsB: string[] = [];
+  let partnerARecoveryAlreadyVerified = false;
 
   try {
     ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
@@ -613,14 +619,39 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
       '@third-dev:nymph-dev.localhost',
     )).toBe(403);
 
-    const recoveryA = await recoverPartner(
-      pageA,
-      partnerA,
-      passwordA,
-      recoveryExportAPath,
-    );
-    recoveryKeyA = recoveryA.recoveryKey;
-    identityIdsA = recoveryA.identityIds;
+    const preflightSecurityA = await call<RecoverySecurityState>(pageA, 'refreshSecurity');
+    if (!preflightSecurityA.defaultSecretStorageKeyId) {
+      throw new Error(`Existing Secret Storage is not configured for ${partnerA}; refusing to replace its recovery key.`);
+    }
+    const preflightSecurityB = await call<RecoverySecurityState>(pageB, 'refreshSecurity');
+    if (!preflightSecurityB.defaultSecretStorageKeyId) {
+      if (preflightSecurityB.publicCrossSigningKeysPresent) {
+        throw new Error(
+          `Partner B has an existing published cross-signing identity without Secret Storage; refusing to replace it.`,
+        );
+      }
+      if (await fileExists(recoveryExportBPath)) {
+        throw new Error('Partner B has an existing recovery export without Secret Storage; refusing to overwrite state.');
+      }
+    }
+
+    if (
+      preflightSecurityA.recoverySetupVerified &&
+      preflightSecurityA.crossSigningReady &&
+      preflightSecurityA.keyBackupVersion
+    ) {
+      partnerARecoveryAlreadyVerified = true;
+      identityIdsA = await call<string[]>(pageA, 'crossSigningIdentityIds');
+    } else {
+      const recoveryA = await recoverPartner(
+        pageA,
+        partnerA,
+        passwordA,
+        recoveryExportAPath,
+      );
+      recoveryKeyA = recoveryA.recoveryKey;
+      identityIdsA = recoveryA.identityIds;
+    }
     const recoveryB = await recoverPartner(
       pageB,
       partnerB,
@@ -629,7 +660,9 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     );
     recoveryKeyB = recoveryB.recoveryKey;
     identityIdsB = recoveryB.identityIds;
-    if (recoveryKeyA === recoveryKeyB) throw new Error('Partner recovery keys must be independent.');
+    if (recoveryKeyA && recoveryKeyB && recoveryKeyA === recoveryKeyB) {
+      throw new Error('Partner recovery keys must be independent.');
+    }
     expect(identityIdsA).toHaveLength(3);
     expect(identityIdsB).toHaveLength(3);
     expect(new Set([...identityIdsA, ...identityIdsB]).size).toBe(6);
@@ -872,6 +905,13 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
 
     const finalMembers = await call<string[]>(pageA, 'joinedMembers', sessionA, expectedRoomId);
     expect(finalMembers).toEqual([partnerA, partnerB].sort());
+    const expectedPromptCounts = new Map<string, number>();
+    if (!partnerARecoveryAlreadyVerified) expectedPromptCounts.set(`${partnerA}:existing`, 1);
+    expectedPromptCounts.set(
+      `${partnerB}:${recoveryExportBExistedBeforeTest ? 'existing' : 'new'}`,
+      1,
+    );
+    expect(recoveryPassphrasePromptCounts).toEqual(expectedPromptCounts);
   } finally {
     if (pageA) await call(pageA, 'disconnect');
     if (pageB) await call(pageB, 'disconnect');
