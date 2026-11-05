@@ -979,42 +979,6 @@ test('isolated partners send and decrypt encrypted photo and video attachments',
       return Array.from(new Uint8Array(await blob.arrayBuffer()));
     });
 
-    test('authorized temporary-device revocation stays separate from core messaging', async () => {
-      test.setTimeout(180_000);
-      let password = await readIsolatedFile('partner1_dev_password');
-      const userId = matrixConfig.partnerA;
-      const deviceId = await readIsolatedFile('partner1_dev_device_id');
-      let context: BrowserContext | undefined;
-      let page: Page | undefined;
-      let storageKey: number[] = [];
-
-      try {
-        ({ context, page } = await openPartnerProfile('partner-a'));
-        const session = await call<Session>(
-          page,
-          'passwordLogin',
-          userId,
-          password,
-          'NYMPH authorized lifecycle acceptance',
-          deviceId,
-        );
-        session.roomId = expectedRoomId;
-        storageKey = deriveStorageKey(password, userId);
-        await call(page, 'connect', session, storageKey);
-        const membersBefore = await call<string[]>(page, 'joinedMembers', session, expectedRoomId);
-        expect(membersBefore).toEqual([matrixConfig.partnerA, matrixConfig.partnerB].sort());
-
-        await call(page, 'revokeAuthorizedTemporaryDevice', password);
-
-        const membersAfter = await call<string[]>(page, 'joinedMembers', session, expectedRoomId);
-        expect(membersAfter).toEqual(membersBefore);
-      } finally {
-        if (page) await call(page, 'disconnect');
-        await context?.close();
-        storageKey.fill(0);
-        password = '';
-      }
-    });
     const thumbnailBytes = await pageA.evaluate(async () => {
       const canvas = document.createElement('canvas');
       canvas.width = 48;
@@ -1176,5 +1140,42 @@ test('isolated partners send and decrypt encrypted photo and video attachments',
     storageKeyB.fill(0);
     passwordA = '';
     passwordB = '';
+  }
+});
+
+test('authorized temporary-device revocation stays separate from core messaging', async () => {
+  test.setTimeout(180_000);
+  let password = await readIsolatedFile('partner1_dev_password');
+  const userId = matrixConfig.partnerA;
+  const deviceId = await readIsolatedFile('partner1_dev_device_id');
+  let context: BrowserContext | undefined;
+  let page: Page | undefined;
+  let storageKey: number[] = [];
+
+  try {
+    ({ context, page } = await openPartnerProfile('partner-a'));
+    const session = await call<Session>(
+      page,
+      'passwordLogin',
+      userId,
+      password,
+      'NYMPH authorized lifecycle acceptance',
+      deviceId,
+    );
+    session.roomId = expectedRoomId;
+    storageKey = deriveStorageKey(password, userId);
+    await call(page, 'connect', session, storageKey);
+    const membersBefore = await call<string[]>(page, 'joinedMembers', session, expectedRoomId);
+    expect(membersBefore).toEqual([matrixConfig.partnerA, matrixConfig.partnerB].sort());
+
+    await call(page, 'revokeAuthorizedTemporaryDevice', password);
+
+    const membersAfter = await call<string[]>(page, 'joinedMembers', session, expectedRoomId);
+    expect(membersAfter).toEqual(membersBefore);
+  } finally {
+    if (page) await call(page, 'disconnect');
+    await context?.close();
+    storageKey.fill(0);
+    password = '';
   }
 });

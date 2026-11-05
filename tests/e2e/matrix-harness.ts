@@ -441,8 +441,12 @@ const state: HarnessState = {
     cancellationHeaders.set('Authorization', 'Bearer ' + activeConnection.accessToken);
     await revokeRecoveryVerifier(
       {
-        getDevices: async () => this.client!.getDevices(),
-        deleteDevice: async (deviceId, auth) => this.client!.deleteDevice(deviceId, auth),
+        getDevices: async () => ({
+          devices: (await this.client!.getSecurityState()).ownDevices.map(({ deviceId }) => ({
+            device_id: deviceId,
+          })),
+        }),
+        deleteDevice: async (deviceId, auth) => this.client!.revokeDevice(deviceId, auth.password),
       },
       {
         logout: async () => { await verifierClient!.logout(false); },
@@ -450,7 +454,7 @@ const state: HarnessState = {
       },
       {
         userId: activeConnection.userId,
-        primaryDeviceId: this.client.getDeviceId() ?? '',
+        primaryDeviceId: this.client.deviceId,
         temporaryDeviceId,
         password,
       },
