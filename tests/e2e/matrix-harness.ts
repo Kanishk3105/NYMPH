@@ -6,6 +6,7 @@ import {
   type NymphEnvelope,
   type ReceivedNymphEvent,
 } from '../../src/matrix/MessagingClient';
+import { revokeRecoveryVerifier } from '../../src/matrix/recovery-device-cleanup';
 import QRCode from 'qrcode';
 import { BrowserQRCodeReader } from '@zxing/browser';
 
@@ -36,6 +37,25 @@ type HarnessState = {
   confirmSas(id: string): Promise<void>;
   cancelVerification(id: string): Promise<void>;
   send(envelope: NymphEnvelope): Promise<string>;
+  sendAttachment(
+    envelope: NymphEnvelope,
+    fileBytes: number[],
+    mediaType: string,
+    fileName: string,
+    thumbnailBytes?: number[],
+  ): Promise<{ eventId: string; attachment: NonNullable<ReceivedNymphEvent['attachment']>; thumbnailAttachment?: NonNullable<ReceivedNymphEvent['thumbnailAttachment']> }>;
+  downloadAttachment(eventId: string, thumbnail?: boolean): Promise<number[]>;
+  cancelAttachmentDuringUpload(
+    envelope: NymphEnvelope,
+    fileBytes: number[],
+    mediaType: string,
+    fileName: string,
+    thumbnailBytes?: number[],
+  ): Promise<boolean>;
+  rejectsCorruptedAttachment(eventId: string): Promise<boolean>;
+  downloadStoredCiphertext(mxcUrl: string): Promise<number[]>;
+  unauthenticatedMediaStatus(mxcUrl: string): Promise<number>;
+  revokeAuthorizedTemporaryDevice(password: string): Promise<void>;
   setTyping(isTyping: boolean): Promise<void>;
   markRead(eventId: string): Promise<void>;
   joinedMembers(session: HarnessSession, roomId: string): Promise<string[]>;
@@ -92,6 +112,7 @@ if (
   throw new Error('Matrix test harness requires the exact isolated Stage 3H development configuration.');
 }
 const apiBase = matrixConfig.homeserverUrl;
+let activeConnection: HarnessSession | null = null;
 const partnerPairs = [[matrixConfig.partnerA, matrixConfig.partnerB]] as const;
 const state: HarnessState = {
   client: null,
@@ -102,6 +123,7 @@ const state: HarnessState = {
   readEventIds: [],
   async connect(connection, storageKey) {
     this.disconnect();
+    activeConnection = connection;
     this.events = [];
     this.verifications = [];
     this.security = null;
@@ -125,6 +147,7 @@ const state: HarnessState = {
   disconnect() {
     this.client?.close();
     this.client = null;
+    activeConnection = null;
   },
   async passwordLogin(userId, password, deviceName, deviceId) {
     const pair = partnerPairs.find(([partnerA, partnerB]) => userId === partnerA || userId === partnerB);
@@ -274,6 +297,200 @@ const state: HarnessState = {
   async send(envelope) {
     if (!this.client) throw new Error('Connect a Matrix client before sending.');
     return this.client.send(envelope);
+  },
+  async sendAttachment(envelope, fileBytes, mediaType, fileName, thumbnailBytes) {
+    if (!this.client) throw new Error('Connect a Matrix client before sending encrypted media.');
+    const file = new File([Uint8Array.from(fileBytes)], fileName, { type: mediaType });
+    const thumbnail = thumbnailBytes
+      ? new File([Uint8Array.from(thumbnailBytes)], 'preview.webp', { type: 'image/webp' })
+      : undefined;
+    return this.client.sendAttachment(file, envelope, thumbnail ? { thumbnail } : undefined);
+  },
+  async downloadAttachment(eventId, thumbnail = false) {
+    if (!this.client) throw new Error('Connect a Matrix client before downloading encrypted media.');
+    const event = this.events.find((item) => item.eventId === eventId);
+    const file = thumbnail ? event?.thumbnailAttachment : event?.attachment;
+    const mediaType = thumbnail ? 'image/webp' : event?.mediaType;
+    if (!file || !mediaType) throw new Error('The requested encrypted media event is unavailable.');
+    const blob = await this.client.downloadAttachment(file, mediaType);
+    return Array.from(new Uint8Array(await blob.arrayBuffer()));
+  },
+  async cancelAttachmentDuringUpload(envelope, fileBytes, mediaType, fileName, thumbnailBytes) {
+    if (!this.client) throw new Error('Connect a Matrix client before testing upload cancellation.');
+    const file = new File([Uint8Array.from(fileBytes)], fileName, { type: mediaType });
+    const thumbnail = thumbnailBytes
+      ? new File([Uint8Array.from(thumbnailBytes)], 'preview.webp', { type: 'image/webp' })
+      : undefined;
+    const controller = new AbortController();
+    let interrupted = false;
+    try {
+      await this.client.sendAttachment(file, envelope, {
+        ...(thumbnail ? { thumbnail } : {}),
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (!interrupted && progress > 0) {
+            interrupted = true;
+            controller.abort();
+          }
+        },
+      });
+      return false;
+    } catch (error) {
+      if (interrupted && controller.signal.aborted) return true;
+      throw error;
+    }
+  },
+  async rejectsCorruptedAttachment(eventId) {
+    if (!this.client) throw new Error('Connect a Matrix client before testing media integrity.');
+    const event = this.events.find((item) => item.eventId === eventId);
+    if (!event?.attachment || !event.mediaType) throw new Error('The encrypted media event is unavailable.');
+    const tampered = {
+      ...event.attachment,
+      hashes: { ...event.attachment.hashes, sha256: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
+    };
+    try {
+      await this.client.downloadAttachment(tampered, event.mediaType);
+      return false;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('integrity check failed')) return true;
+      throw error;
+    }
+  },
+  async downloadStoredCiphertext(mxcUrl) {
+    if (!activeConnection) throw new Error('Connect a Matrix client before inspecting encrypted media storage.');
+    const { createClient } = await import('matrix-js-sdk');
+    const mediaClient = createClient({ baseUrl: apiBase });
+    const url = mediaClient.mxcUrlToHttp(mxcUrl, undefined, undefined, undefined, false, false, true);
+    mediaClient.stopClient();
+    if (!url) throw new Error('The encrypted media URL is invalid.');
+    const response = await fetch(url, {
+      headers: { Authorization: 'Bearer ' + activeConnection.accessToken },
+      credentials: 'omit',
+      redirect: 'error',
+    });
+    if (!response.ok) throw new Error(`Could not inspect stored encrypted media (${response.status}).`);
+    return Array.from(new Uint8Array(await response.arrayBuffer()));
+  },
+  async unauthenticatedMediaStatus(mxcUrl) {
+    const { createClient } = await import('matrix-js-sdk');
+    const mediaClient = createClient({ baseUrl: apiBase });
+    const url = mediaClient.mxcUrlToHttp(mxcUrl);
+    mediaClient.stopClient();
+    if (!url) throw new Error('The encrypted media URL is invalid.');
+    const response = await fetch(url, { credentials: 'omit', redirect: 'error' });
+    await response.body?.cancel();
+    return response.status;
+  },
+  async revokeAuthorizedTemporaryDevice(password) {
+    if (!this.client || !activeConnection || !password) {
+      throw new Error('Connect the active partner device before testing authorized device revocation.');
+    }
+    const { createClient, MatrixError } = await import('matrix-js-sdk');
+    const temporaryDeviceId = `NYMPH_LIFECYCLE_${crypto.randomUUID().replaceAll('-', '')}`;
+    const headers = new Headers({ 'Content-Type': 'application/json' });
+    headers.set('Authorization', 'Bearer ' + activeConnection.accessToken);
+    const authorizationResponse = await fetch(`${apiBase}/_synapse/client/nymph/device/recovery-check`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ device_id: temporaryDeviceId }),
+      cache: 'no-store',
+    });
+    if (!authorizationResponse.ok) {
+      throw new Error(`The active partner device could not authorize lifecycle testing (${authorizationResponse.status}).`);
+    }
+    const authorization = await authorizationResponse.json() as {
+      user_id?: unknown;
+      device_id?: unknown;
+      login_token?: unknown;
+    };
+    if (
+      authorization.user_id !== activeConnection.userId ||
+      authorization.device_id !== temporaryDeviceId ||
+      typeof authorization.login_token !== 'string'
+    ) {
+      throw new Error('The server returned invalid temporary-device authorization.');
+    }
+
+    const loginClient = createClient({ baseUrl: apiBase });
+    let verifierClient: ReturnType<typeof createClient> | undefined;
+    let verifierSession: Awaited<ReturnType<typeof loginClient.login>> | undefined;
+    try {
+      verifierSession = await loginClient.login('m.login.token', {
+        token: authorization.login_token,
+        device_id: temporaryDeviceId,
+        initial_device_display_name: 'NYMPH lifecycle verifier',
+      });
+      if (
+        verifierSession.user_id !== activeConnection.userId ||
+        verifierSession.device_id !== temporaryDeviceId
+      ) {
+        throw new Error('The server authenticated an unexpected temporary test device.');
+      }
+      verifierClient = createClient({
+        baseUrl: apiBase,
+        accessToken: verifierSession.access_token,
+        userId: verifierSession.user_id,
+        deviceId: verifierSession.device_id,
+      });
+    } finally {
+      loginClient.stopClient();
+    }
+    if (!verifierClient || !verifierSession) throw new Error('The temporary verifier session was not created.');
+
+    const cancellationHeaders = new Headers({ 'Content-Type': 'application/json' });
+    cancellationHeaders.set('Authorization', 'Bearer ' + activeConnection.accessToken);
+    await revokeRecoveryVerifier(
+      {
+        getDevices: async () => this.client!.getDevices(),
+        deleteDevice: async (deviceId, auth) => this.client!.deleteDevice(deviceId, auth),
+      },
+      {
+        logout: async () => { await verifierClient!.logout(false); },
+        stopClient: () => verifierClient!.stopClient(),
+      },
+      {
+        userId: activeConnection.userId,
+        primaryDeviceId: this.client.getDeviceId() ?? '',
+        temporaryDeviceId,
+        password,
+      },
+      {
+        cancelAuthorization: async () => {
+          const response = await fetch(`${apiBase}/_synapse/client/nymph/device/cancel`, {
+            method: 'POST',
+            headers: cancellationHeaders,
+            body: '{}',
+            cache: 'no-store',
+          });
+          await response.arrayBuffer();
+          if (!response.ok) throw new Error('Temporary-device authorization could not be cancelled.');
+        },
+        isAccessTokenRejected: async () => {
+          const response = await fetch(`${apiBase}/_matrix/client/v3/account/whoami`, {
+            headers: { Authorization: 'Bearer ' + verifierSession!.access_token },
+            cache: 'no-store',
+          });
+          await response.arrayBuffer();
+          return response.status === 401;
+        },
+        isNewLoginRejected: async () => {
+          const attempt = createClient({ baseUrl: apiBase });
+          try {
+            await attempt.login('m.login.password', {
+              identifier: { type: 'm.id.user', user: activeConnection!.userId },
+              password,
+              device_id: temporaryDeviceId,
+            });
+            await attempt.logout(false);
+            return false;
+          } catch (error) {
+            return error instanceof MatrixError && error.httpStatus === 403 && error.errcode === 'M_FORBIDDEN';
+          } finally {
+            attempt.stopClient();
+          }
+        },
+      },
+    );
   },
   async setTyping(isTyping) {
     if (!this.client) throw new Error('Connect a Matrix client before setting typing state.');

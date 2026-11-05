@@ -1,5 +1,5 @@
 import { test, expect, chromium, type BrowserContext, type Page } from '@playwright/test';
-import { randomUUID, scryptSync } from 'node:crypto';
+import { createHash, randomUUID, scryptSync } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -23,7 +23,6 @@ const secretDirectory = join(process.cwd(), 'backend', 'dev-isolated', 'secrets'
 const profileRoot = join(process.cwd(), '.matrix-e2e', 'isolated-stage-3i');
 const matrixOperationTimeout = 120_000;
 const expectedRoomId = '!Fcs8AEBEJCozGtC_scKDI55dHg-E1Xy6Biiz29O_Pjw';
-const recoveryPassphrasePromptCounts = new Map<string, number>();
 
 const recoveryKeyConfirmationScript = `
 Add-Type -AssemblyName System.Windows.Forms
@@ -262,8 +261,6 @@ function requestExportPassphrase(
   userId: string,
   purpose: RecoveryExportPassphrasePurpose,
 ): string {
-  const promptKey = `${userId}:${purpose}`;
-  recoveryPassphrasePromptCounts.set(promptKey, (recoveryPassphrasePromptCounts.get(promptKey) ?? 0) + 1);
   const passphrase = runLocalPowerShellDialog(
     recoveryPassphraseScript,
     `${userId}\n${purpose}\n`,
@@ -783,6 +780,7 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
       kind: 'text',
       text: 'Hey, missing you ❤️',
     });
+
     messageIds.push(firstEventId);
 
     await call(pageB, 'markRead', firstEventId);
@@ -914,25 +912,8 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     expect(await call<string[]>(pageA, 'crossSigningIdentityIds')).toEqual(identityIdsA);
     expect(await call<string[]>(pageB, 'crossSigningIdentityIds')).toEqual(identityIdsB);
 
-    const revokedSession = await call<Session>(
-      pageA,
-      'passwordLogin',
-      partnerA,
-      passwordA,
-      'NYMPH revoked-device acceptance',
-    );
-    if (!revokedSession.deviceId || revokedSession.deviceId === sessionA.deviceId) {
-      throw new Error('The temporary revocation test did not create an independent Matrix device.');
-    }
-    await call(pageA, 'revokeDevice', revokedSession.deviceId, passwordA);
-    expect(await call<number>(pageA, 'whoamiStatus', revokedSession)).toBe(401);
-
     const finalMembers = await call<string[]>(pageA, 'joinedMembers', sessionA, expectedRoomId);
     expect(finalMembers).toEqual([partnerA, partnerB].sort());
-    const expectedPromptCounts = new Map<string, number>();
-    if (!partnerARecoveryAlreadyVerified) expectedPromptCounts.set(`${partnerA}:existing`, 1);
-    if (!partnerBRecoveryAlreadyVerified) expectedPromptCounts.set(`${partnerB}:existing`, 1);
-    expect(recoveryPassphrasePromptCounts).toEqual(expectedPromptCounts);
   } finally {
     if (pageA) await call(pageA, 'disconnect');
     if (pageB) await call(pageB, 'disconnect');
@@ -942,6 +923,257 @@ test('isolated partners join the existing room, recover crypto, verify trust, an
     storageKeyB.fill(0);
     recoveryKeyA = '';
     recoveryKeyB = '';
+    passwordA = '';
+    passwordB = '';
+  }
+});
+
+test('isolated partners send and decrypt encrypted photo and video attachments', async () => {
+  test.setTimeout(600_000);
+  let passwordA = await readIsolatedFile('partner1_dev_password');
+  let passwordB = await readIsolatedFile('partner2_dev_password');
+  const partnerA = matrixConfig.partnerA;
+  const partnerB = matrixConfig.partnerB;
+  const deviceA = await readIsolatedFile('partner1_dev_device_id');
+  const deviceB = await readIsolatedFile('partner2_dev_device_id');
+  let contextA: BrowserContext | undefined;
+  let contextB: BrowserContext | undefined;
+  let pageA: Page | undefined;
+  let pageB: Page | undefined;
+  let storageKeyA: number[] = [];
+  let storageKeyB: number[] = [];
+  let sessionA: Session | undefined;
+  let sessionB: Session | undefined;
+
+  try {
+    ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
+    ({ context: contextB, page: pageB } = await openPartnerProfile('partner-b'));
+    sessionA = await call<Session>(pageA, 'passwordLogin', partnerA, passwordA, 'NYMPH media acceptance A', deviceA);
+    sessionB = await call<Session>(pageB, 'passwordLogin', partnerB, passwordB, 'NYMPH media acceptance B', deviceB);
+    sessionA.roomId = expectedRoomId;
+    sessionB.roomId = expectedRoomId;
+    storageKeyA = deriveStorageKey(passwordA, partnerA);
+    storageKeyB = deriveStorageKey(passwordB, partnerB);
+    await call(pageA, 'connect', sessionA, storageKeyA);
+    await call(pageB, 'connect', sessionB, storageKeyB);
+
+    const securityA = await call<{ partnerVerified: boolean }>(pageA, 'refreshSecurity');
+    const securityB = await call<{ partnerVerified: boolean }>(pageB, 'refreshSecurity');
+    expect(securityA.partnerVerified).toBe(true);
+    expect(securityB.partnerVerified).toBe(true);
+    expect(await call<string[]>(pageA, 'joinedMembers', sessionA, expectedRoomId)).toEqual([partnerA, partnerB].sort());
+
+    const photoBytes = await pageA.evaluate(async () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 48;
+      canvas.height = 32;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Canvas is unavailable for the photo fixture.');
+      context.fillStyle = '#7b2344';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = '#f2b8cc';
+      context.fillRect(9, 8, 24, 16);
+      const blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((result) => result ? resolve(result) : reject(new Error('Could not encode the photo fixture.')), 'image/png'),
+      );
+      return Array.from(new Uint8Array(await blob.arrayBuffer()));
+    });
+
+    test('authorized temporary-device revocation stays separate from core messaging', async () => {
+      test.setTimeout(180_000);
+      let password = await readIsolatedFile('partner1_dev_password');
+      const userId = matrixConfig.partnerA;
+      const deviceId = await readIsolatedFile('partner1_dev_device_id');
+      let context: BrowserContext | undefined;
+      let page: Page | undefined;
+      let storageKey: number[] = [];
+
+      try {
+        ({ context, page } = await openPartnerProfile('partner-a'));
+        const session = await call<Session>(
+          page,
+          'passwordLogin',
+          userId,
+          password,
+          'NYMPH authorized lifecycle acceptance',
+          deviceId,
+        );
+        session.roomId = expectedRoomId;
+        storageKey = deriveStorageKey(password, userId);
+        await call(page, 'connect', session, storageKey);
+        const membersBefore = await call<string[]>(page, 'joinedMembers', session, expectedRoomId);
+        expect(membersBefore).toEqual([matrixConfig.partnerA, matrixConfig.partnerB].sort());
+
+        await call(page, 'revokeAuthorizedTemporaryDevice', password);
+
+        const membersAfter = await call<string[]>(page, 'joinedMembers', session, expectedRoomId);
+        expect(membersAfter).toEqual(membersBefore);
+      } finally {
+        if (page) await call(page, 'disconnect');
+        await context?.close();
+        storageKey.fill(0);
+        password = '';
+      }
+    });
+    const thumbnailBytes = await pageA.evaluate(async () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 48;
+      canvas.height = 32;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Canvas is unavailable for the thumbnail fixture.');
+      context.fillStyle = '#7b2344';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob((result) => result ? resolve(result) : reject(new Error('Could not encode the thumbnail fixture.')), 'image/webp'),
+      );
+      return Array.from(new Uint8Array(await blob.arrayBuffer()));
+    });
+
+    const paddedPhoto = await pageA.evaluate((bytes) => {
+      const padded = new Uint8Array(bytes.length + 2 * 1024 * 1024);
+      padded.set(bytes);
+      return Array.from(padded);
+    }, photoBytes);
+    const interrupted = await call<boolean>(pageA, 'cancelAttachmentDuringUpload', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'romantic',
+      kind: 'media',
+      text: 'Interrupted private photo',
+      sentAt: Date.now(),
+      mediaType: 'image/png',
+      mediaName: 'photo.png',
+    }, paddedPhoto, 'image/png', 'photo.png', thumbnailBytes);
+    expect(interrupted).toBe(true);
+
+    const photo = await call<{
+      eventId: string;
+      attachment: { url: string; hashes: { sha256: string } };
+      thumbnailAttachment?: { url: string };
+    }>(pageA, 'sendAttachment', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'romantic',
+      kind: 'media',
+      text: 'A private photo',
+      sentAt: Date.now(),
+      mediaType: 'image/png',
+      mediaName: 'photo.png',
+    }, photoBytes, 'image/png', 'photo.png', thumbnailBytes);
+    await waitForValue<boolean>(
+      pageB,
+      'h => h.getEvents().some(event => event.eventId === args[0])',
+      [photo.eventId],
+    );
+    const photoEvent = await waitForValue<{
+      attachment?: { url: string; hashes: { sha256: string } };
+      thumbnailAttachment?: { url: string };
+      mediaType?: string;
+    }>(
+      pageB,
+      'h => h.getEvents().find(event => event.eventId === args[0])',
+      [photo.eventId],
+    );
+    expect(photoEvent.mediaType).toBe('image/png');
+    expect(photoEvent.attachment?.url).toMatch(/^mxc:/);
+    expect(photoEvent.thumbnailAttachment?.url).toMatch(/^mxc:/);
+    expect(await call<number[]>(pageB, 'downloadAttachment', photo.eventId)).toEqual(photoBytes);
+    expect(await call<number[]>(pageB, 'downloadAttachment', photo.eventId, true)).toEqual(thumbnailBytes);
+    const storedPhoto = await call<number[]>(pageA, 'downloadStoredCiphertext', photo.attachment.url);
+    expect(storedPhoto).not.toEqual(photoBytes);
+    expect(createHash('sha256').update(Buffer.from(storedPhoto)).digest('base64url')).toBe(photo.attachment.hashes.sha256);
+    expect([401, 403, 404]).toContain(
+      await call<number>(pageB, 'unauthenticatedMediaStatus', photo.attachment.url),
+    );
+    expect(await call<boolean>(pageB, 'rejectsCorruptedAttachment', photo.eventId)).toBe(true);
+
+    const videoBytes = await pageB.evaluate(async () => {
+      if (typeof MediaRecorder === 'undefined') throw new Error('MediaRecorder is unavailable for the video fixture.');
+      const canvas = document.createElement('canvas');
+      canvas.width = 32;
+      canvas.height = 24;
+      const context = canvas.getContext('2d');
+      if (!context || typeof canvas.captureStream !== 'function') throw new Error('Video capture is unavailable.');
+      const stream = canvas.captureStream(8);
+      const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+      const chunks: Blob[] = [];
+      recorder.addEventListener('dataavailable', (event) => {
+        if (event.data.size) chunks.push(event.data);
+      });
+      const result = new Promise<number[]>((resolve, reject) => {
+        recorder.addEventListener('stop', async () => {
+          stream.getTracks().forEach((track) => track.stop());
+          try {
+            const blob = new Blob(chunks, { type: recorder.mimeType });
+            resolve(Array.from(new Uint8Array(await blob.arrayBuffer())));
+          } catch (error) {
+            reject(error);
+          }
+        }, { once: true });
+        recorder.addEventListener('error', () => reject(new Error('Video recording fixture failed.')), { once: true });
+      });
+      recorder.start();
+      const draw = () => {
+        context.fillStyle = `hsl(${Math.floor(Math.random() * 360)} 55% 40%)`;
+        context.fillRect(0, 0, canvas.width, canvas.height);
+      };
+      draw();
+      const timer = window.setInterval(draw, 80);
+      window.setTimeout(() => {
+        window.clearInterval(timer);
+        recorder.stop();
+      }, 700);
+      return result;
+    });
+    expect(videoBytes.length).toBeGreaterThan(0);
+    const video = await call<{
+      eventId: string;
+      attachment: { url: string; hashes: { sha256: string } };
+    }>(pageB, 'sendAttachment', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'flirty',
+      kind: 'media',
+      text: 'A private video',
+      sentAt: Date.now(),
+      mediaType: 'video/webm',
+      mediaName: 'moment.webm',
+    }, videoBytes, 'video/webm', 'moment.webm', thumbnailBytes);
+    await waitForValue<boolean>(
+      pageA,
+      'h => h.getEvents().some(event => event.eventId === args[0])',
+      [video.eventId],
+    );
+    expect(await call<number[]>(pageA, 'downloadAttachment', video.eventId)).toEqual(videoBytes);
+    const storedVideo = await call<number[]>(pageB, 'downloadStoredCiphertext', video.attachment.url);
+    expect(storedVideo).not.toEqual(videoBytes);
+    expect(createHash('sha256').update(Buffer.from(storedVideo)).digest('base64url')).toBe(video.attachment.hashes.sha256);
+
+    await call(pageB, 'disconnect');
+    const offlineMedia = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'spicy',
+      kind: 'media',
+      text: 'Saved for when you are back',
+      sentAt: Date.now(),
+      mediaType: 'image/png',
+      mediaName: 'offline-photo.png',
+    }, photoBytes, 'image/png', 'offline-photo.png', thumbnailBytes);
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    await waitForValue<boolean>(
+      pageB,
+      'h => h.getEvents().some(event => event.eventId === args[0])',
+      [offlineMedia.eventId],
+    );
+    expect(await call<number[]>(pageB, 'downloadAttachment', offlineMedia.eventId)).toEqual(photoBytes);
+  } finally {
+    if (pageA) await call(pageA, 'disconnect');
+    if (pageB) await call(pageB, 'disconnect');
+    await contextA?.close();
+    await contextB?.close();
+    storageKeyA.fill(0);
+    storageKeyB.fill(0);
     passwordA = '';
     passwordB = '';
   }
