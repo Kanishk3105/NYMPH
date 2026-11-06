@@ -18,6 +18,7 @@ type HarnessState = {
   security: unknown;
   typing: boolean;
   readEventIds: string[];
+  redactedEventIds: string[];
   connect(connection: HarnessSession, storageKey?: number[]): Promise<void>;
   disconnect(): void;
   passwordLogin(userId: string, password: string, deviceName: string, deviceId?: string): Promise<HarnessSession>;
@@ -48,6 +49,8 @@ type HarnessState = {
   downloadAttachment(eventId: string, thumbnail?: boolean): Promise<number[]>;
   openEphemeralMedia(eventId: string): Promise<number>;
   mediaStoreStatus(eventId: string): Promise<{ state: string; expires_at: number; media_exists: boolean }>;
+  getRetentionPolicy(): Promise<{ seconds: number | null; eventTimestamp: number | null; eventId: string | null }>;
+  messageExpiryStatus(eventId: string): Promise<{ state: string; expires_at: number | null; redaction_event_id: string | null }>;
   cancelAttachmentDuringUpload(
     envelope: NymphEnvelope,
     fileBytes: number[],
@@ -73,6 +76,7 @@ type HarnessState = {
   getSecurity(): unknown;
   getTyping(): boolean;
   getReadEventIds(): string[];
+  getRedactedEventIds(): string[];
 };
 
 async function loginWithRateLimitRetry<T>(login: () => Promise<T>): Promise<T> {
@@ -124,6 +128,7 @@ const state: HarnessState = {
   security: null,
   typing: false,
   readEventIds: [],
+  redactedEventIds: [],
   async connect(connection, storageKey) {
     this.disconnect();
     activeConnection = connection;
@@ -132,6 +137,7 @@ const state: HarnessState = {
     this.security = null;
     this.typing = false;
     this.readEventIds = [];
+    this.redactedEventIds = [];
     this.client = await connectMatrix(
       storageKey ? { ...connection, storageKey: Uint8Array.from(storageKey) } : connection,
       (event) => this.events.push(event),
@@ -145,6 +151,7 @@ const state: HarnessState = {
       (security) => { this.security = security; },
       (typing) => { this.typing = typing; },
       (eventId) => { this.readEventIds.push(eventId); },
+      (eventId) => { this.redactedEventIds.push(eventId); },
     );
   },
   disconnect() {
@@ -341,6 +348,18 @@ const state: HarnessState = {
       { media_id: match[1] },
       activeConnection.accessToken,
     ) as Promise<{ state: string; expires_at: number; media_exists: boolean }>;
+  },
+  async getRetentionPolicy() {
+    if (!this.client) throw new Error('Connect a Matrix client before checking conversation retention.');
+    return this.client.getRetentionPolicy();
+  },
+  async messageExpiryStatus(eventId) {
+    if (!activeConnection) throw new Error('Connect a Matrix client before checking message expiry.');
+    return postJson(
+      '/_synapse/client/nymph/retention/message-status',
+      { event_id: eventId },
+      activeConnection.accessToken,
+    ) as Promise<{ state: string; expires_at: number | null; redaction_event_id: string | null }>;
   },
   async cancelAttachmentDuringUpload(envelope, fileBytes, mediaType, fileName, thumbnailBytes) {
     if (!this.client) throw new Error('Connect a Matrix client before testing upload cancellation.');
@@ -596,6 +615,7 @@ const state: HarnessState = {
   getSecurity() { return this.security; },
   getTyping() { return this.typing; },
   getReadEventIds() { return this.readEventIds; },
+  getRedactedEventIds() { return this.redactedEventIds; },
 };
 
 async function postJson<T>(path: string, body: unknown, accessToken?: string): Promise<T> {

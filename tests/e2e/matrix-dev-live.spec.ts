@@ -541,6 +541,29 @@ async function openPartnerProfile(
   return { context, page };
 }
 
+async function restartExistingIsolatedSynapse(page: Page): Promise<void> {
+  const restart = spawnSync('docker', ['restart', 'nymph-stage3h1-dev-synapse-1'], {
+    encoding: 'utf8',
+    timeout: 60_000,
+    windowsHide: true,
+  });
+  if (restart.error || restart.status !== 0) {
+    throw new Error('The existing isolated Synapse service could not be restarted safely.', {
+      cause: restart.error ?? new Error(restart.stderr || `docker exited with ${restart.status}`),
+    });
+  }
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    const health = spawnSync(
+      'docker',
+      ['inspect', '--format', '{{.State.Health.Status}}', 'nymph-stage3h1-dev-synapse-1'],
+      { encoding: 'utf8', timeout: 10_000, windowsHide: true },
+    );
+    if (health.status === 0 && health.stdout.trim() === 'healthy') return;
+    await page.waitForTimeout(1_000);
+  }
+  throw new Error('The existing isolated Synapse service did not become healthy after restart.');
+}
+
 test('isolated partners join the existing room, recover crypto, verify trust, and exchange encrypted messages', async () => {
   test.setTimeout(1_200_000);
 
@@ -1249,44 +1272,8 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
     }>(pageA, 'h => h.getEvents().find(event => event.eventId === args[0])', [photoReceiptId]);
     expect(receivedReceipt.viewOnceReceipt).toEqual({ messageId: photoMessageId, expiresAt: photoExpiry });
 
-    const videoFixture = await pageA.evaluate(async () => {
-      if (typeof MediaRecorder === 'undefined') throw new Error('MediaRecorder is unavailable for the video fixture.');
-      const canvas = document.createElement('canvas');
-      canvas.width = 64;
-      canvas.height = 48;
-      const context = canvas.getContext('2d');
-      if (!context) throw new Error('Could not create the view-once video fixture.');
-      const stream = canvas.captureStream(12);
-      const mimeType = ['video/webm;codecs=vp8', 'video/webm'].find((type) => MediaRecorder.isTypeSupported(type));
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      const chunks: Blob[] = [];
-      recorder.addEventListener('dataavailable', (event) => {
-        if (event.data.size) chunks.push(event.data);
-      });
-      const result = new Promise<{ bytes: number[]; mimeType: string }>((resolve, reject) => {
-        recorder.addEventListener('stop', async () => {
-          stream.getTracks().forEach((track) => track.stop());
-          const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
-          resolve({ bytes: Array.from(new Uint8Array(await blob.arrayBuffer())), mimeType: blob.type });
-        }, { once: true });
-        recorder.addEventListener('error', () => reject(new Error('The video fixture could not be recorded.')), { once: true });
-      });
-      recorder.start();
-      const draw = () => {
-        context.fillStyle = '#7a1939';
-        context.fillRect(0, 0, canvas.width, canvas.height);
-        context.fillStyle = '#fff';
-        context.fillRect(Math.floor(Date.now() / 100) % 50, 8, 12, 12);
-      };
-      draw();
-      const timer = window.setInterval(draw, 80);
-      window.setTimeout(() => {
-        window.clearInterval(timer);
-        recorder.stop();
-      }, 700);
-      return result;
-    });
-    expect(videoFixture.bytes.length).toBeGreaterThan(0);
+    const videoFixtureBytes = Array.from(new Uint8Array(await readFile(join(process.cwd(), 'tests', 'fixtures', 'view-once-acceptance-video.mp4'))));
+    expect(videoFixtureBytes.length).toBeGreaterThan(0);
     const videoMessageId = randomUUID();
     const video = await call<{ eventId: string }>(pageA, 'sendAttachment', {
       version: 1,
@@ -1296,9 +1283,9 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
       text: 'View-once acceptance video',
       sentAt: Date.now(),
       viewOnceSeconds: 15,
-      mediaType: videoFixture.mimeType,
-      mediaName: 'acceptance-video.webm',
-    }, videoFixture.bytes, videoFixture.mimeType, 'acceptance-video.webm');
+      mediaType: 'video/mp4',
+      mediaName: 'acceptance-video.mp4',
+    }, videoFixtureBytes, 'video/mp4', 'acceptance-video.mp4');
     await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [video.eventId]);
     await call(pageB, 'openEphemeralMedia', video.eventId);
     const decryptedVideo = await call<number[]>(pageB, 'downloadAttachment', video.eventId);
@@ -1322,12 +1309,11 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
         videoElement.pause();
         URL.revokeObjectURL(url);
       }
-    }, { bytes: decryptedVideo, type: videoFixture.mimeType });
+    }, { bytes: decryptedVideo, type: 'video/mp4' });
     expect(playbackDuration).toBeGreaterThan(0);
 
     const durationMessages: Array<{ eventId: string; seconds: number }> = [];
     for (const seconds of [5, 10, 15, 30, 60, 7]) {
-      const id = randomUUID();
       const sent = await call<{ eventId: string }>(pageA, 'sendAttachment', {
         version: 1,
         id: randomUUID(),
@@ -1339,7 +1325,6 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
         mediaType: 'image/png',
         mediaName: `duration-${seconds}.png`,
       }, photoBytes, 'image/png', `duration-${seconds}.png`);
-      void id;
       await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [sent.eventId]);
       const claimedAt = Date.now();
       const expiresAt = await call<number>(pageB, 'openEphemeralMedia', sent.eventId);
@@ -1360,6 +1345,7 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
       mediaType: 'image/png',
       mediaName: 'unopened.png',
     }, photoBytes, 'image/png', 'unopened.png', undefined, 2);
+    await waitForValue<boolean>(pageA, 'h => h.getEvents().some(event => event.eventId === args[0])', [unopened.eventId]);
     await expect.poll(
       async () => (await call<{ media_exists: boolean }>(pageA, 'mediaStoreStatus', unopened.eventId)).media_exists,
       { timeout: 20_000, intervals: [1_000, 2_000, 3_000] },
@@ -1399,10 +1385,9 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
     }>(pageA, 'h => h.getEvents().find(event => event.eventId === args[0])', [offlineReceiptId]);
     expect(offlineReceipt.viewOnceReceipt).toEqual({ messageId: offlineMessageId, expiresAt: offlineExpiry });
 
-    const longTimers = durationMessages.filter(({ seconds }) => seconds >= 30);
     await expect.poll(
       async () => {
-        const statuses = await Promise.all(longTimers.map(({ eventId }) =>
+        const statuses = await Promise.all(durationMessages.map(({ eventId }) =>
           call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', eventId),
         ));
         return statuses.every((status) => status.state === 'deleted' && !status.media_exists);
@@ -1413,6 +1398,180 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
     expect(await call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', photo.eventId))
       .toMatchObject({ state: 'deleted', media_exists: false });
   } finally {
+    if (pageA) await call(pageA, 'disconnect').catch(() => undefined);
+    if (pageB) await call(pageB, 'disconnect').catch(() => undefined);
+    await contextA?.close();
+    await contextB?.close();
+    storageKeyA.fill(0);
+    storageKeyB.fill(0);
+    passwordA = '';
+    passwordB = '';
+  }
+});
+
+test('existing isolated partners synchronize server retention, Never, offline expiry, relations, and restart jobs', async () => {
+  test.setTimeout(240_000);
+  let passwordA = await readIsolatedFile('partner1_dev_password');
+  let passwordB = await readIsolatedFile('partner2_dev_password');
+  const partnerA = matrixConfig.partnerA;
+  const partnerB = matrixConfig.partnerB;
+  const deviceA = await readIsolatedFile('partner1_dev_device_id');
+  const deviceB = await readIsolatedFile('partner2_dev_device_id');
+  let contextA: BrowserContext | undefined;
+  let contextB: BrowserContext | undefined;
+  let pageA: Page | undefined;
+  let pageB: Page | undefined;
+  let storageKeyA: number[] = [];
+  let storageKeyB: number[] = [];
+  let sessionA: Session | undefined;
+  let sessionB: Session | undefined;
+  let previousPolicy: number | null = null;
+  let policyChanged = false;
+
+  const policyEnvelope = (seconds: number | null) => ({
+    version: 1 as const,
+    id: randomUUID(),
+    mode: 'romantic' as const,
+    kind: 'text' as const,
+    text: '',
+    sentAt: Date.now(),
+    retentionPolicy: { seconds },
+  });
+
+  try {
+    ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
+    ({ context: contextB, page: pageB } = await openPartnerProfile('partner-b'));
+    sessionA = await call<Session>(pageA, 'passwordLogin', partnerA, passwordA, 'NYMPH retention acceptance A', deviceA);
+    sessionB = await call<Session>(pageB, 'passwordLogin', partnerB, passwordB, 'NYMPH retention acceptance B', deviceB);
+    sessionA.roomId = expectedRoomId;
+    sessionB.roomId = expectedRoomId;
+    storageKeyA = deriveStorageKey(passwordA, partnerA);
+    storageKeyB = deriveStorageKey(passwordB, partnerB);
+    await call(pageA, 'connect', sessionA, storageKeyA);
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    expect((await call<{ partnerVerified: boolean }>(pageA, 'refreshSecurity')).partnerVerified).toBe(true);
+    expect((await call<{ partnerVerified: boolean }>(pageB, 'refreshSecurity')).partnerVerified).toBe(true);
+    previousPolicy = (await call<{ seconds: number | null }>(pageA, 'getRetentionPolicy')).seconds;
+
+    const neverPolicyId = await call<string>(pageA, 'send', policyEnvelope(null));
+    policyChanged = true;
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [neverPolicyId]);
+    expect(await call<{ seconds: number | null }>(pageA, 'getRetentionPolicy')).toMatchObject({ seconds: null });
+    expect(await call<{ seconds: number | null }>(pageB, 'getRetentionPolicy')).toMatchObject({ seconds: null });
+    const neverMessageId = await call<string>(pageA, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'romantic',
+      kind: 'text',
+      text: 'Never-retained live acceptance event',
+      sentAt: Date.now(),
+    });
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [neverMessageId]);
+    await expect.poll(
+      async () => (await call<{ state: string }>(pageA, 'messageExpiryStatus', neverMessageId)).state,
+    ).toBe('never');
+    await pageA.waitForTimeout(6_000);
+    expect(await call<string[]>(pageA, 'getRedactedEventIds')).not.toContain(neverMessageId);
+    expect(await call<string[]>(pageB, 'getRedactedEventIds')).not.toContain(neverMessageId);
+    expect(await call<unknown[]>(pageA, 'getEvents')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventId: neverMessageId }),
+    ]));
+
+    const customPolicyId = await call<string>(pageA, 'send', policyEnvelope(2));
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [customPolicyId]);
+    expect(await call<{ seconds: number | null }>(pageB, 'getRetentionPolicy')).toMatchObject({ seconds: 2 });
+    const offlineMessageId = await (async () => {
+      await call(pageB, 'disconnect');
+      return call<string>(pageA, 'send', {
+        version: 1,
+        id: randomUUID(),
+        mode: 'flirty',
+        kind: 'text',
+        text: 'Offline recipient expiry fixture',
+        sentAt: Date.now(),
+      });
+    })();
+    expect(await call<{ state: string }>(pageA, 'messageExpiryStatus', offlineMessageId)).toMatchObject({ state: 'scheduled' });
+    await expect.poll(
+      async () => (await call<{ state: string }>(pageA, 'messageExpiryStatus', offlineMessageId)).state,
+      { timeout: 20_000, intervals: [1_000, 2_000, 3_000] },
+    ).toBe('redacted');
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    await waitForValue<boolean>(
+      pageB,
+      'h => h.getRedactedEventIds().includes(args[0])',
+      [offlineMessageId],
+    );
+
+    const restartPolicyId = await call<string>(pageA, 'send', policyEnvelope(15));
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [restartPolicyId]);
+    const parentEventId = await call<string>(pageA, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'spicy',
+      kind: 'text',
+      text: 'Parent message with server expiry',
+      sentAt: Date.now(),
+    });
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [parentEventId]);
+    const replyEventId = await call<string>(pageB, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'spicy',
+      kind: 'text',
+      text: 'Reply expires with its parent',
+      sentAt: Date.now(),
+      replyToEventId: parentEventId,
+    });
+    const reactionEventId = await call<string>(pageB, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'spicy',
+      kind: 'reaction',
+      text: '❤️',
+      sentAt: Date.now(),
+      reactionTo: parentEventId,
+    });
+    await waitForValue<boolean>(pageA, 'h => h.getEvents().some(event => event.eventId === args[0])', [replyEventId]);
+    await waitForValue<boolean>(pageA, 'h => h.getEvents().some(event => event.eventId === args[0])', [reactionEventId]);
+    for (const eventId of [parentEventId, replyEventId, reactionEventId]) {
+      expect(await call<{ state: string }>(pageA, 'messageExpiryStatus', eventId))
+        .toMatchObject({ state: 'scheduled' });
+    }
+
+    await restartExistingIsolatedSynapse(pageA);
+    for (const eventId of [parentEventId, replyEventId, reactionEventId]) {
+      await expect.poll(
+        async () => (await call<{ state: string }>(pageA, 'messageExpiryStatus', eventId)).state,
+        { timeout: 30_000, intervals: [1_000, 2_000, 3_000] },
+      ).toBe('redacted');
+      await waitForValue<boolean>(
+        pageA,
+        'h => h.getRedactedEventIds().includes(args[0])',
+        [eventId],
+        60_000,
+      );
+      await waitForValue<boolean>(
+        pageB,
+        'h => h.getRedactedEventIds().includes(args[0])',
+        [eventId],
+        60_000,
+      );
+    }
+  } finally {
+    if (pageA && policyChanged && previousPolicy !== null) {
+      try {
+        await call(pageA, 'send', policyEnvelope(previousPolicy));
+      } catch (error) {
+        console.error('Could not restore the pre-acceptance retention policy.', error);
+      }
+    } else if (pageA && policyChanged && previousPolicy === null) {
+      try {
+        await call(pageA, 'send', policyEnvelope(null));
+      } catch (error) {
+        console.error('Could not restore Never retention after acceptance.', error);
+      }
+    }
     if (pageA) await call(pageA, 'disconnect').catch(() => undefined);
     if (pageB) await call(pageB, 'disconnect').catch(() => undefined);
     await contextA?.close();
