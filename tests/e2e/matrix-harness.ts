@@ -43,8 +43,11 @@ type HarnessState = {
     mediaType: string,
     fileName: string,
     thumbnailBytes?: number[],
+    pendingExpirySeconds?: number,
   ): Promise<{ eventId: string; attachment: NonNullable<ReceivedNymphEvent['attachment']>; thumbnailAttachment?: NonNullable<ReceivedNymphEvent['thumbnailAttachment']> }>;
   downloadAttachment(eventId: string, thumbnail?: boolean): Promise<number[]>;
+  openEphemeralMedia(eventId: string): Promise<number>;
+  mediaStoreStatus(eventId: string): Promise<{ state: string; expires_at: number; media_exists: boolean }>;
   cancelAttachmentDuringUpload(
     envelope: NymphEnvelope,
     fileBytes: number[],
@@ -298,13 +301,16 @@ const state: HarnessState = {
     if (!this.client) throw new Error('Connect a Matrix client before sending.');
     return this.client.send(envelope);
   },
-  async sendAttachment(envelope, fileBytes, mediaType, fileName, thumbnailBytes) {
+  async sendAttachment(envelope, fileBytes, mediaType, fileName, thumbnailBytes, pendingExpirySeconds) {
     if (!this.client) throw new Error('Connect a Matrix client before sending encrypted media.');
     const file = new File([Uint8Array.from(fileBytes)], fileName, { type: mediaType });
     const thumbnail = thumbnailBytes
       ? new File([Uint8Array.from(thumbnailBytes)], 'preview.webp', { type: 'image/webp' })
       : undefined;
-    return this.client.sendAttachment(file, envelope, thumbnail ? { thumbnail } : undefined);
+    return this.client.sendAttachment(file, envelope, {
+      ...(thumbnail ? { thumbnail } : {}),
+      ...(pendingExpirySeconds === undefined ? {} : { pendingExpirySeconds }),
+    });
   },
   async downloadAttachment(eventId, thumbnail = false) {
     if (!this.client) throw new Error('Connect a Matrix client before downloading encrypted media.');
@@ -314,6 +320,27 @@ const state: HarnessState = {
     if (!file || !mediaType) throw new Error('The requested encrypted media event is unavailable.');
     const blob = await this.client.downloadAttachment(file, mediaType);
     return Array.from(new Uint8Array(await blob.arrayBuffer()));
+  },
+  async openEphemeralMedia(eventId) {
+    if (!this.client) throw new Error('Connect a Matrix client before opening expiring media.');
+    const event = this.events.find((item) => item.eventId === eventId);
+    if (!event?.attachment) throw new Error('The expiring media event is unavailable.');
+    return this.client.openEphemeralMedia(event.attachment);
+  },
+  async mediaStoreStatus(eventId) {
+    if (!activeConnection) throw new Error('Connect a Matrix client before checking media expiration.');
+    const event = this.events.find((item) => item.eventId === eventId);
+    if (!event?.attachment) throw new Error('The expiring media event is unavailable.');
+    const mediaUrl = new URL(event.attachment.url);
+    const match = mediaUrl.pathname.match(/^\/_synapse\/client\/nymph\/media\/content\/([A-Za-z0-9._=-]{1,255})$/);
+    if (mediaUrl.origin !== new URL(apiBase).origin || !match) {
+      throw new Error('The event does not reference registered view-once media.');
+    }
+    return postJson(
+      '/_synapse/client/nymph/media/status',
+      { media_id: match[1] },
+      activeConnection.accessToken,
+    ) as Promise<{ state: string; expires_at: number; media_exists: boolean }>;
   },
   async cancelAttachmentDuringUpload(envelope, fileBytes, mediaType, fileName, thumbnailBytes) {
     if (!this.client) throw new Error('Connect a Matrix client before testing upload cancellation.');

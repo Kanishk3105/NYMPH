@@ -1143,6 +1143,725 @@ test('isolated partners send and decrypt encrypted photo and video attachments',
   }
 });
 
+test('existing isolated partners complete encrypted view-once photo, video, offline, and expiry acceptance', async () => {
+  test.setTimeout(300_000);
+  let passwordA = await readIsolatedFile('partner1_dev_password');
+  let passwordB = await readIsolatedFile('partner2_dev_password');
+  const partnerA = matrixConfig.partnerA;
+  const partnerB = matrixConfig.partnerB;
+  const deviceA = await readIsolatedFile('partner1_dev_device_id');
+  const deviceB = await readIsolatedFile('partner2_dev_device_id');
+  let contextA: BrowserContext | undefined;
+  let contextB: BrowserContext | undefined;
+  let pageA: Page | undefined;
+  let pageB: Page | undefined;
+  let storageKeyA: number[] = [];
+  let storageKeyB: number[] = [];
+  let sessionA: Session | undefined;
+  let sessionB: Session | undefined;
+
+  try {
+    ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
+    ({ context: contextB, page: pageB } = await openPartnerProfile('partner-b'));
+    sessionA = await call<Session>(pageA, 'passwordLogin', partnerA, passwordA, 'NYMPH view-once acceptance A', deviceA);
+    sessionB = await call<Session>(pageB, 'passwordLogin', partnerB, passwordB, 'NYMPH view-once acceptance B', deviceB);
+    sessionA.roomId = expectedRoomId;
+    sessionB.roomId = expectedRoomId;
+    storageKeyA = deriveStorageKey(passwordA, partnerA);
+    storageKeyB = deriveStorageKey(passwordB, partnerB);
+    await call(pageA, 'connect', sessionA, storageKeyA);
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    expect((await call<{ partnerVerified: boolean }>(pageA, 'refreshSecurity')).partnerVerified).toBe(true);
+    expect((await call<{ partnerVerified: boolean }>(pageB, 'refreshSecurity')).partnerVerified).toBe(true);
+
+    const photoBytes = await pageA.evaluate(async () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 32;
+      canvas.height = 24;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Could not create the view-once photo fixture.');
+      context.fillStyle = '#9b1c42';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(
+        (value) => value ? resolve(value) : reject(new Error('Could not encode the view-once photo fixture.')),
+        'image/png',
+      ));
+      return Array.from(new Uint8Array(await blob.arrayBuffer()));
+    });
+    const photoMessageId = randomUUID();
+    const photo = await call<{
+      eventId: string;
+      attachment: { url: string; hashes: { sha256: string } };
+    }>(pageA, 'sendAttachment', {
+      version: 1,
+      id: photoMessageId,
+      mode: 'romantic',
+      kind: 'media',
+      text: 'View-once acceptance photo',
+      sentAt: Date.now(),
+      viewOnceSeconds: 5,
+      mediaType: 'image/png',
+      mediaName: 'acceptance-photo.png',
+    }, photoBytes, 'image/png', 'acceptance-photo.png');
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [photo.eventId]);
+    const photoStatusBeforeOpen = await call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', photo.eventId);
+    expect(photoStatusBeforeOpen).toMatchObject({ state: 'pending', media_exists: true });
+
+    const photoMediaId = new URL(photo.attachment.url).pathname.split('/').pop();
+    if (!photoMediaId) throw new Error('The encrypted photo reference did not contain a media ID.');
+    const storedPhotoCiphertext = await call<number[]>(
+      pageA,
+      'downloadStoredCiphertext',
+      `mxc://${matrixConfig.serverName}/${photoMediaId}`,
+    );
+    expect(storedPhotoCiphertext).not.toEqual(photoBytes);
+
+    await expect(call(pageA, 'openEphemeralMedia', photo.eventId)).rejects.toThrow();
+    const photoExpiry = await call<number>(pageB, 'openEphemeralMedia', photo.eventId);
+    expect(await call<{ state: string; media_exists: boolean }>(pageB, 'mediaStoreStatus', photo.eventId))
+      .toMatchObject({ state: 'opened', media_exists: true });
+    const decryptedPhoto = await call<number[]>(pageB, 'downloadAttachment', photo.eventId);
+    const imageSize = await pageB.evaluate(async (bytes) => {
+      const image = new Image();
+      const url = URL.createObjectURL(new Blob([Uint8Array.from(bytes)], { type: 'image/png' }));
+      try {
+        image.src = url;
+        await image.decode();
+        return { width: image.naturalWidth, height: image.naturalHeight };
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }, decryptedPhoto);
+    expect(imageSize).toEqual({ width: 32, height: 24 });
+    await expect(call(pageB, 'openEphemeralMedia', photo.eventId)).rejects.toThrow();
+
+    const photoReceiptId = await call<string>(pageB, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'romantic',
+      kind: 'text',
+      text: '',
+      sentAt: Date.now(),
+      viewOnceReceipt: { messageId: photoMessageId, expiresAt: photoExpiry },
+    });
+    const receivedReceipt = await waitForValue<{
+      viewOnceReceipt?: { messageId: string; expiresAt: number };
+    }>(pageA, 'h => h.getEvents().find(event => event.eventId === args[0])', [photoReceiptId]);
+    expect(receivedReceipt.viewOnceReceipt).toEqual({ messageId: photoMessageId, expiresAt: photoExpiry });
+
+    const videoFixture = await pageA.evaluate(async () => {
+      if (typeof MediaRecorder === 'undefined') throw new Error('MediaRecorder is unavailable for the video fixture.');
+      const canvas = document.createElement('canvas');
+      canvas.width = 64;
+      canvas.height = 48;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Could not create the view-once video fixture.');
+      const stream = canvas.captureStream(12);
+      const mimeType = ['video/webm;codecs=vp8', 'video/webm'].find((type) => MediaRecorder.isTypeSupported(type));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const chunks: Blob[] = [];
+      recorder.addEventListener('dataavailable', (event) => {
+        if (event.data.size) chunks.push(event.data);
+      });
+      const result = new Promise<{ bytes: number[]; mimeType: string }>((resolve, reject) => {
+        recorder.addEventListener('stop', async () => {
+          stream.getTracks().forEach((track) => track.stop());
+          const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
+          resolve({ bytes: Array.from(new Uint8Array(await blob.arrayBuffer())), mimeType: blob.type });
+        }, { once: true });
+        recorder.addEventListener('error', () => reject(new Error('The video fixture could not be recorded.')), { once: true });
+      });
+      recorder.start();
+      const draw = () => {
+        context.fillStyle = '#7a1939';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.fillStyle = '#fff';
+        context.fillRect(Math.floor(Date.now() / 100) % 50, 8, 12, 12);
+      };
+      draw();
+      const timer = window.setInterval(draw, 80);
+      window.setTimeout(() => {
+        window.clearInterval(timer);
+        recorder.stop();
+      }, 700);
+      return result;
+    });
+    expect(videoFixture.bytes.length).toBeGreaterThan(0);
+    const videoMessageId = randomUUID();
+    const video = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+      version: 1,
+      id: videoMessageId,
+      mode: 'flirty',
+      kind: 'media',
+      text: 'View-once acceptance video',
+      sentAt: Date.now(),
+      viewOnceSeconds: 15,
+      mediaType: videoFixture.mimeType,
+      mediaName: 'acceptance-video.webm',
+    }, videoFixture.bytes, videoFixture.mimeType, 'acceptance-video.webm');
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [video.eventId]);
+    await call(pageB, 'openEphemeralMedia', video.eventId);
+    const decryptedVideo = await call<number[]>(pageB, 'downloadAttachment', video.eventId);
+    const playbackDuration = await pageB.evaluate(async ({ bytes, type }) => {
+      const videoElement = document.createElement('video');
+      videoElement.muted = true;
+      const url = URL.createObjectURL(new Blob([Uint8Array.from(bytes)], { type }));
+      try {
+        videoElement.src = url;
+        await new Promise<void>((resolve, reject) => {
+          videoElement.addEventListener('loadedmetadata', () => resolve(), { once: true });
+          videoElement.addEventListener('error', () => reject(new Error('The decrypted view-once video could not be decoded.')), { once: true });
+        });
+        await videoElement.play();
+        await new Promise<void>((resolve, reject) => {
+          videoElement.addEventListener('ended', () => resolve(), { once: true });
+          videoElement.addEventListener('error', () => reject(new Error('The decrypted view-once video could not play.')), { once: true });
+        });
+        return videoElement.duration;
+      } finally {
+        videoElement.pause();
+        URL.revokeObjectURL(url);
+      }
+    }, { bytes: decryptedVideo, type: videoFixture.mimeType });
+    expect(playbackDuration).toBeGreaterThan(0);
+
+    const durationMessages: Array<{ eventId: string; seconds: number }> = [];
+    for (const seconds of [5, 10, 15, 30, 60, 7]) {
+      const id = randomUUID();
+      const sent = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+        version: 1,
+        id: randomUUID(),
+        mode: 'romantic',
+        kind: 'media',
+        text: `View duration ${seconds}`,
+        sentAt: Date.now(),
+        viewOnceSeconds: seconds,
+        mediaType: 'image/png',
+        mediaName: `duration-${seconds}.png`,
+      }, photoBytes, 'image/png', `duration-${seconds}.png`);
+      void id;
+      await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [sent.eventId]);
+      const claimedAt = Date.now();
+      const expiresAt = await call<number>(pageB, 'openEphemeralMedia', sent.eventId);
+      expect(expiresAt - claimedAt).toBeGreaterThan(seconds * 1000 - 2_000);
+      expect(expiresAt - claimedAt).toBeLessThan(seconds * 1000 + 2_000);
+      durationMessages.push({ eventId: sent.eventId, seconds });
+    }
+
+    await call(pageB, 'disconnect');
+    const unopened = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'romantic',
+      kind: 'media',
+      text: 'Unopened expiry fixture',
+      sentAt: Date.now(),
+      viewOnceSeconds: 5,
+      mediaType: 'image/png',
+      mediaName: 'unopened.png',
+    }, photoBytes, 'image/png', 'unopened.png', undefined, 2);
+    await expect.poll(
+      async () => (await call<{ media_exists: boolean }>(pageA, 'mediaStoreStatus', unopened.eventId)).media_exists,
+      { timeout: 20_000, intervals: [1_000, 2_000, 3_000] },
+    ).toBe(false);
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [unopened.eventId]);
+    await expect(call(pageB, 'openEphemeralMedia', unopened.eventId)).rejects.toThrow();
+
+    await call(pageB, 'disconnect');
+    const offlineMessageId = randomUUID();
+    const offline = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+      version: 1,
+      id: offlineMessageId,
+      mode: 'spicy',
+      kind: 'media',
+      text: 'Delivered while Partner B was offline',
+      sentAt: Date.now(),
+      viewOnceSeconds: 5,
+      mediaType: 'image/png',
+      mediaName: 'offline-view-once.png',
+    }, photoBytes, 'image/png', 'offline-view-once.png');
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [offline.eventId]);
+    const offlineExpiry = await call<number>(pageB, 'openEphemeralMedia', offline.eventId);
+    expect(await call<number[]>(pageB, 'downloadAttachment', offline.eventId)).toEqual(photoBytes);
+    const offlineReceiptId = await call<string>(pageB, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'spicy',
+      kind: 'text',
+      text: '',
+      sentAt: Date.now(),
+      viewOnceReceipt: { messageId: offlineMessageId, expiresAt: offlineExpiry },
+    });
+    const offlineReceipt = await waitForValue<{
+      viewOnceReceipt?: { messageId: string; expiresAt: number };
+    }>(pageA, 'h => h.getEvents().find(event => event.eventId === args[0])', [offlineReceiptId]);
+    expect(offlineReceipt.viewOnceReceipt).toEqual({ messageId: offlineMessageId, expiresAt: offlineExpiry });
+
+    const longTimers = durationMessages.filter(({ seconds }) => seconds >= 30);
+    await expect.poll(
+      async () => {
+        const statuses = await Promise.all(longTimers.map(({ eventId }) =>
+          call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', eventId),
+        ));
+        return statuses.every((status) => status.state === 'deleted' && !status.media_exists);
+      },
+      { timeout: 80_000, intervals: [1_000, 3_000, 5_000] },
+    ).toBe(true);
+    await expect(call(pageB, 'openEphemeralMedia', photo.eventId)).rejects.toThrow();
+    expect(await call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', photo.eventId))
+      .toMatchObject({ state: 'deleted', media_exists: false });
+  } finally {
+    if (pageA) await call(pageA, 'disconnect').catch(() => undefined);
+    if (pageB) await call(pageB, 'disconnect').catch(() => undefined);
+    await contextA?.close();
+    await contextB?.close();
+    storageKeyA.fill(0);
+    storageKeyB.fill(0);
+    passwordA = '';
+    passwordB = '';
+  }
+});
+
+test('isolated partners exchange encrypted voice messages and private sticker-pack assets', async () => {
+  test.setTimeout(600_000);
+  let passwordA = await readIsolatedFile('partner1_dev_password');
+  let passwordB = await readIsolatedFile('partner2_dev_password');
+  const partnerA = matrixConfig.partnerA;
+  const partnerB = matrixConfig.partnerB;
+  const deviceA = await readIsolatedFile('partner1_dev_device_id');
+  const deviceB = await readIsolatedFile('partner2_dev_device_id');
+  let contextA: BrowserContext | undefined;
+  let contextB: BrowserContext | undefined;
+  let pageA: Page | undefined;
+  let pageB: Page | undefined;
+  let storageKeyA: number[] = [];
+  let storageKeyB: number[] = [];
+  let sessionA: Session | undefined;
+  let sessionB: Session | undefined;
+
+  try {
+    ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
+    ({ context: contextB, page: pageB } = await openPartnerProfile('partner-b'));
+    sessionA = await call<Session>(pageA, 'passwordLogin', partnerA, passwordA, 'NYMPH voice and sticker acceptance A', deviceA);
+    sessionB = await call<Session>(pageB, 'passwordLogin', partnerB, passwordB, 'NYMPH voice and sticker acceptance B', deviceB);
+    sessionA.roomId = expectedRoomId;
+    sessionB.roomId = expectedRoomId;
+    storageKeyA = deriveStorageKey(passwordA, partnerA);
+    storageKeyB = deriveStorageKey(passwordB, partnerB);
+    await call(pageA, 'connect', sessionA, storageKeyA);
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    expect((await call<{ partnerVerified: boolean }>(pageA, 'refreshSecurity')).partnerVerified).toBe(true);
+    expect((await call<{ partnerVerified: boolean }>(pageB, 'refreshSecurity')).partnerVerified).toBe(true);
+
+    const audioBytes = await pageA.evaluate(async () => {
+      if (typeof MediaRecorder === 'undefined') throw new Error('MediaRecorder is unavailable for voice acceptance.');
+      const audioContext = new AudioContext();
+      const destination = audioContext.createMediaStreamDestination();
+      const oscillator = audioContext.createOscillator();
+      oscillator.frequency.value = 440;
+      oscillator.connect(destination);
+      oscillator.connect(audioContext.destination);
+      const mimeType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4']
+        .find((type) => MediaRecorder.isTypeSupported(type));
+      const recorder = new MediaRecorder(destination.stream, mimeType ? { mimeType } : undefined);
+      const chunks: Blob[] = [];
+      recorder.addEventListener('dataavailable', (event) => {
+        if (event.data.size) chunks.push(event.data);
+      });
+      const recorded = new Promise<number[]>((resolve, reject) => {
+        recorder.addEventListener('stop', async () => {
+          oscillator.stop();
+          destination.stream.getTracks().forEach((track) => track.stop());
+          await audioContext.close();
+          try {
+            const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+            resolve(Array.from(new Uint8Array(await blob.arrayBuffer())));
+          } catch (error) {
+            reject(error);
+          }
+        }, { once: true });
+        recorder.addEventListener('error', () => reject(new Error('Voice fixture recording failed.')), { once: true });
+      });
+      await audioContext.resume();
+      if (audioContext.state !== 'running') throw new Error('The audio fixture context did not start.');
+      oscillator.start();
+      recorder.start(100);
+      window.setTimeout(() => recorder.stop(), 1000);
+      return recorded;
+    });
+    expect(audioBytes.length).toBeGreaterThan(0);
+    const playDecryptedVoice = (page: Page, bytes: number[]) => page.evaluate(async (rawBytes) => {
+      const url = URL.createObjectURL(new Blob([Uint8Array.from(rawBytes)], { type: 'audio/webm' }));
+      const audio = new Audio();
+      audio.muted = true;
+      const metadata = new Promise<void>((resolve, reject) => {
+        audio.addEventListener('loadedmetadata', () => resolve(), { once: true });
+        audio.addEventListener('error', () => reject(new Error('Decrypted voice message could not be decoded for playback.')), { once: true });
+      });
+      audio.src = url;
+      try {
+        await metadata;
+        const duration = audio.duration;
+        await audio.play();
+        await new Promise<void>((resolve, reject) => {
+          audio.addEventListener('ended', () => resolve(), { once: true });
+          audio.addEventListener('error', () => reject(new Error('Decrypted voice playback failed.')), { once: true });
+        });
+        return duration;
+      } finally {
+        audio.pause();
+        URL.revokeObjectURL(url);
+      }
+    }, bytes);
+    const retryAudio = Buffer.alloc(1_100_044);
+    const retryDataSize = retryAudio.length - 44;
+    retryAudio.write('RIFF', 0);
+    retryAudio.writeUInt32LE(retryAudio.length - 8, 4);
+    retryAudio.write('WAVEfmt ', 8);
+    retryAudio.writeUInt32LE(16, 16);
+    retryAudio.writeUInt16LE(1, 20);
+    retryAudio.writeUInt16LE(1, 22);
+    retryAudio.writeUInt32LE(8000, 24);
+    retryAudio.writeUInt32LE(16000, 28);
+    retryAudio.writeUInt16LE(2, 32);
+    retryAudio.writeUInt16LE(16, 34);
+    retryAudio.write('data', 36);
+    retryAudio.writeUInt32LE(retryDataSize, 40);
+    for (let offset = 44; offset < retryAudio.length; offset += 2) {
+      retryAudio.writeInt16LE(Math.round(Math.sin((offset - 44) / 16000 * Math.PI * 2 * 440) * 32767), offset);
+    }
+    const retryEnvelope = {
+      version: 1 as const,
+      id: randomUUID(),
+      mode: 'romantic' as const,
+      kind: 'media' as const,
+      text: 'Interrupted voice upload retry',
+      sentAt: Date.now(),
+      durationMs: Math.round(retryDataSize / 16000 * 1000),
+      mediaType: 'audio/wav',
+      mediaName: 'voice-retry.wav',
+    };
+    expect(await call<boolean>(pageA, 'cancelAttachmentDuringUpload', {
+      ...retryEnvelope,
+    }, Array.from(retryAudio), 'audio/wav', 'voice-retry.wav')).toBe(true);
+    const retriedVoice = await call<{ eventId: string }>(
+      pageA,
+      'sendAttachment',
+      retryEnvelope,
+      Array.from(retryAudio),
+      'audio/wav',
+      'voice-retry.wav',
+    );
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [retriedVoice.eventId]);
+    expect(await call<number[]>(pageB, 'downloadAttachment', retriedVoice.eventId)).toEqual(Array.from(retryAudio));
+
+    await call(pageB, 'disconnect');
+    const voiceA = await call<{ eventId: string; attachment: { url: string; hashes: { sha256: string } } }>(
+      pageA,
+      'sendAttachment',
+      {
+        version: 1,
+        id: randomUUID(),
+        mode: 'romantic',
+        kind: 'media',
+        text: 'A private voice message',
+        sentAt: Date.now(),
+        durationMs: 1000,
+        waveform: [0.2, 0.4, 0.8, 1],
+        mediaType: 'audio/webm',
+        mediaName: 'voice-note.webm',
+      },
+      audioBytes,
+      'audio/webm',
+      'voice-note.webm',
+    );
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [voiceA.eventId]);
+    const receivedVoiceA = await waitForValue<{ durationMs?: number; mediaType?: string; waveform?: number[] }>(
+      pageB,
+      'h => h.getEvents().find(event => event.eventId === args[0])',
+      [voiceA.eventId],
+    );
+    expect(receivedVoiceA.durationMs).toBe(1000);
+    expect(receivedVoiceA.mediaType).toBe('audio/webm');
+    expect(receivedVoiceA.waveform).toEqual([0.2, 0.4, 0.8, 1]);
+    const decryptedVoiceA = await call<number[]>(pageB, 'downloadAttachment', voiceA.eventId);
+    expect(decryptedVoiceA).toEqual(audioBytes);
+    expect(await playDecryptedVoice(pageB, decryptedVoiceA)).toBeGreaterThan(0);
+    expect(await call<boolean>(pageB, 'rejectsCorruptedAttachment', voiceA.eventId)).toBe(true);
+    const storedVoice = await call<number[]>(pageA, 'downloadStoredCiphertext', voiceA.attachment.url);
+    expect(storedVoice).not.toEqual(audioBytes);
+    expect(createHash('sha256').update(Buffer.from(storedVoice)).digest('base64url')).toBe(voiceA.attachment.hashes.sha256);
+
+    const voiceB = await call<{ eventId: string }>(
+      pageB,
+      'sendAttachment',
+      {
+        version: 1,
+        id: randomUUID(),
+        mode: 'flirty',
+        kind: 'media',
+        text: 'A voice reply',
+        sentAt: Date.now(),
+        durationMs: 1000,
+        waveform: [0.3, 0.7, 0.5, 0.9],
+        mediaType: 'audio/webm',
+        mediaName: 'voice-reply.webm',
+      },
+      audioBytes,
+      'audio/webm',
+      'voice-reply.webm',
+    );
+    await waitForValue<boolean>(pageA, 'h => h.getEvents().some(event => event.eventId === args[0])', [voiceB.eventId]);
+    const decryptedVoiceB = await call<number[]>(pageA, 'downloadAttachment', voiceB.eventId);
+    expect(decryptedVoiceB).toEqual(audioBytes);
+    expect(await playDecryptedVoice(pageA, decryptedVoiceB)).toBeGreaterThan(0);
+
+    const stickerBytes = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lS8AAAAASUVORK5CYII=',
+      'base64',
+    );
+    const packId = randomUUID();
+    const stickerId = randomUUID();
+    await call(pageB, 'disconnect');
+    const sticker = await call<{ eventId: string; attachment: { url: string; hashes: { sha256: string } } }>(
+      pageA,
+      'sendAttachment',
+      {
+        version: 1,
+        id: randomUUID(),
+        mode: 'kinky',
+        kind: 'sticker',
+        text: '',
+        sentAt: Date.now(),
+        stickerSync: {
+          operation: 'pack-upsert',
+          packId,
+          packName: 'Private fantasy',
+          adult: true,
+          description: 'Partner-only collection',
+          categories: ['Fantasy'],
+          stickerId,
+          stickerName: 'Moon',
+          stickerType: 'image/png',
+        },
+        mediaType: 'image/png',
+        mediaName: 'private-sticker.png',
+      },
+      Array.from(stickerBytes),
+      'image/png',
+      'private-sticker.png',
+    );
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [sticker.eventId]);
+    const receivedSticker = await waitForValue<{
+      kind: string;
+      mode: string;
+      stickerSync?: { packId: string; adult: boolean; stickerId?: string };
+    }>(pageB, 'h => h.getEvents().find(event => event.eventId === args[0])', [sticker.eventId]);
+    expect(receivedSticker.kind).toBe('sticker');
+    expect(receivedSticker.mode).toBe('kinky');
+    expect(receivedSticker.stickerSync).toMatchObject({ packId, adult: true, stickerId });
+    expect(await call<number[]>(pageB, 'downloadAttachment', sticker.eventId)).toEqual(Array.from(stickerBytes));
+    const storedSticker = await call<number[]>(pageA, 'downloadStoredCiphertext', sticker.attachment.url);
+    expect(storedSticker).not.toEqual(Array.from(stickerBytes));
+    expect(createHash('sha256').update(Buffer.from(storedSticker)).digest('base64url')).toBe(sticker.attachment.hashes.sha256);
+
+    const gifBytes = Buffer.from('R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=', 'base64');
+    const gifPackId = randomUUID();
+    const gifId = randomUUID();
+    const gif = await call<{ eventId: string; attachment: { url: string; hashes: { sha256: string } } }>(
+      pageB,
+      'sendAttachment',
+      {
+        version: 1,
+        id: randomUUID(),
+        mode: 'romantic',
+        kind: 'sticker',
+        text: '',
+        sentAt: Date.now(),
+        stickerSync: {
+          operation: 'pack-upsert',
+          packId: gifPackId,
+          packName: 'Love loops',
+          adult: false,
+          description: 'Everyday moments',
+          categories: ['Kisses'],
+          stickerId: gifId,
+          stickerName: 'Tiny loop',
+          stickerType: 'image/gif',
+        },
+        mediaType: 'image/gif',
+        mediaName: 'private-loop.gif',
+      },
+      Array.from(gifBytes),
+      'image/gif',
+      'private-loop.gif',
+    );
+    const receivedGif = await waitForValue<{
+      mode: string;
+      stickerSync?: { packId: string; adult: boolean; stickerId?: string };
+    }>(pageA, 'h => h.getEvents().find(event => event.eventId === args[0])', [gif.eventId]);
+    expect(receivedGif.mode).toBe('romantic');
+    expect(receivedGif.stickerSync).toMatchObject({ packId: gifPackId, adult: false, stickerId: gifId });
+    expect(await call<number[]>(pageA, 'downloadAttachment', gif.eventId)).toEqual(Array.from(gifBytes));
+    const storedGif = await call<number[]>(pageB, 'downloadStoredCiphertext', gif.attachment.url);
+    expect(storedGif).not.toEqual(Array.from(gifBytes));
+    expect(createHash('sha256').update(Buffer.from(storedGif)).digest('base64url')).toBe(gif.attachment.hashes.sha256);
+
+    const renamedPackEventId = await call<string>(pageB, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'romantic',
+      kind: 'sticker',
+      text: '',
+      sentAt: Date.now(),
+      stickerSync: {
+        operation: 'pack-upsert',
+        packId: gifPackId,
+        packName: 'Love loops renamed',
+        adult: false,
+        description: 'Our everyday collection',
+        categories: ['Kisses', 'Love'],
+      },
+    });
+    const renamedPackEvent = await waitForValue<{
+      mode: string;
+      stickerSync?: { packId: string; packName: string; adult: boolean };
+    }>(pageA, 'h => h.getEvents().find(event => event.eventId === args[0])', [renamedPackEventId]);
+    expect(renamedPackEvent.mode).toBe('romantic');
+    expect(renamedPackEvent.stickerSync).toMatchObject({
+      packId: gifPackId,
+      packName: 'Love loops renamed',
+      adult: false,
+    });
+
+    for (const stickerSync of [
+      { operation: 'favorite' as const, stickerId: gifId, active: true },
+      { operation: 'recent' as const, stickerId: gifId },
+    ]) {
+      const eventId = await call<string>(pageB, 'send', {
+        version: 1,
+        id: randomUUID(),
+        mode: 'romantic',
+        kind: 'sticker',
+        text: '',
+        sentAt: Date.now(),
+        stickerSync,
+      });
+      const syncedEvent = await waitForValue<{
+        mode: string;
+        stickerSync?: { operation: string; stickerId: string };
+      }>(pageA, 'h => h.getEvents().find(event => event.eventId === args[0])', [eventId]);
+      expect(syncedEvent.mode).toBe('romantic');
+      expect(syncedEvent.stickerSync).toMatchObject({
+        operation: stickerSync.operation,
+        stickerId: gifId,
+      });
+    }
+
+    await call(pageB, 'disconnect');
+    const offlineStickerBytes = Buffer.from(stickerBytes);
+    const offlineStickerId = randomUUID();
+    const offlineSticker = await call<{ eventId: string }>(
+      pageA,
+      'sendAttachment',
+      {
+        version: 1,
+        id: randomUUID(),
+        mode: 'romantic',
+        kind: 'sticker',
+        text: '',
+        sentAt: Date.now(),
+        stickerSync: {
+          operation: 'pack-upsert',
+          packId: gifPackId,
+          packName: 'Love loops renamed',
+          adult: false,
+          description: 'Our everyday collection',
+          categories: ['Kisses', 'Love'],
+          stickerId: offlineStickerId,
+          stickerName: 'Offline heart',
+          stickerType: 'image/png',
+        },
+        mediaType: 'image/png',
+        mediaName: 'offline-heart.png',
+      },
+      Array.from(offlineStickerBytes),
+      'image/png',
+      'offline-heart.png',
+    );
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    await waitForValue<boolean>(
+      pageB,
+      'h => h.getEvents().some(event => event.eventId === args[0])',
+      [offlineSticker.eventId],
+    );
+    expect(await call<number[]>(pageB, 'downloadAttachment', offlineSticker.eventId))
+      .toEqual(Array.from(offlineStickerBytes));
+
+    await call(pageA, 'disconnect');
+    await call(pageB, 'disconnect');
+    await contextA.close();
+    contextA = undefined;
+    pageA = undefined;
+    await contextB.close();
+    contextB = undefined;
+    pageB = undefined;
+
+    ({ context: contextA, page: pageA } = await openPartnerProfile('partner-a'));
+    ({ context: contextB, page: pageB } = await openPartnerProfile('partner-b'));
+    const restartedSessionA = await call<Session>(
+      pageA,
+      'passwordLogin',
+      partnerA,
+      passwordA,
+      'NYMPH voice and sticker restart A',
+      deviceA,
+    );
+    const restartedSessionB = await call<Session>(
+      pageB,
+      'passwordLogin',
+      partnerB,
+      passwordB,
+      'NYMPH voice and sticker restart B',
+      deviceB,
+    );
+    expect(restartedSessionA.deviceId).toBe(deviceA);
+    expect(restartedSessionB.deviceId).toBe(deviceB);
+    restartedSessionA.roomId = expectedRoomId;
+    restartedSessionB.roomId = expectedRoomId;
+    await call(pageA, 'connect', restartedSessionA, storageKeyA);
+    await call(pageB, 'connect', restartedSessionB, storageKeyB);
+    expect((await call<{ partnerVerified: boolean }>(pageA, 'refreshSecurity')).partnerVerified).toBe(true);
+    expect((await call<{ partnerVerified: boolean }>(pageB, 'refreshSecurity')).partnerVerified).toBe(true);
+    for (const eventId of [voiceA.eventId, voiceB.eventId, sticker.eventId, gif.eventId, offlineSticker.eventId]) {
+      await waitForValue<boolean>(
+        eventId === voiceB.eventId || eventId === gif.eventId || eventId === offlineSticker.eventId ? pageB : pageA,
+        'h => h.getEvents().some(event => event.eventId === args[0])',
+        [eventId],
+      );
+    }
+    expect(await call<number[]>(pageA, 'downloadAttachment', voiceB.eventId)).toEqual(audioBytes);
+    expect(await call<number[]>(pageB, 'downloadAttachment', voiceA.eventId)).toEqual(audioBytes);
+    expect(await call<number[]>(pageB, 'downloadAttachment', sticker.eventId)).toEqual(Array.from(stickerBytes));
+    expect(await call<number[]>(pageA, 'downloadAttachment', gif.eventId)).toEqual(Array.from(gifBytes));
+    expect(await call<number[]>(pageB, 'downloadAttachment', offlineSticker.eventId))
+      .toEqual(Array.from(offlineStickerBytes));
+  } finally {
+    if (pageA) await call(pageA, 'disconnect');
+    if (pageB) await call(pageB, 'disconnect');
+    await contextA?.close();
+    await contextB?.close();
+    storageKeyA.fill(0);
+    storageKeyB.fill(0);
+    passwordA = '';
+    passwordB = '';
+  }
+});
+
 test('authorized temporary-device revocation stays separate from core messaging', async () => {
   test.setTimeout(180_000);
   let password = await readIsolatedFile('partner1_dev_password');
