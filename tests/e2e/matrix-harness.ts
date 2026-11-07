@@ -11,6 +11,83 @@ import QRCode from 'qrcode';
 import { BrowserQRCodeReader } from '@zxing/browser';
 
 type HarnessSession = MatrixConnection;
+const ENVELOPE_PREFIX = 'nymph.v1:';
+
+function isMode(value: unknown): value is 'romantic' | 'flirty' | 'spicy' | 'kinky' {
+  return value === 'romantic' || value === 'flirty' || value === 'spicy' || value === 'kinky';
+}
+
+function isEncryptedAttachment(value: unknown): value is NonNullable<ReceivedNymphEvent['attachment']> {
+  if (!value || typeof value !== 'object') return false;
+  const file = value as Record<string, unknown>;
+  const url = file.url;
+  const isMxcUrl = typeof url === 'string' && url.startsWith('mxc://');
+  const isNymphEphemeralUrl = typeof url === 'string' && /^https?:\/\/[^/]+\/_synapse\/client\/nymph\/media\/content\/[A-Za-z0-9._=-]{1,255}$/.test(url);
+  return file.v === 'v2' && (isMxcUrl || isNymphEphemeralUrl) &&
+    file.key && typeof file.key === 'object' &&
+    (file.key as { alg?: unknown }).alg === 'A256CTR' &&
+    (file.key as { kty?: unknown }).kty === 'oct' &&
+    (file.key as { ext?: unknown }).ext === true &&
+    Array.isArray((file.key as { key_ops?: unknown[] }).key_ops) &&
+    ((file.key as { key_ops: string[] }).key_ops as string[]).includes('decrypt') &&
+    typeof (file.key as { k?: unknown }).k === 'string' &&
+    typeof file.iv === 'string' &&
+    typeof (file.hashes as { sha256?: unknown } | undefined)?.sha256 === 'string';
+}
+
+function decodeHarvesterEnvelopeBody(body: string, sender: string, eventId: string, eventTimestamp: number): ReceivedNymphEvent | undefined {
+  if (!body.startsWith(ENVELOPE_PREFIX)) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(body.slice(ENVELOPE_PREFIX.length));
+    if (!parsed || typeof parsed !== 'object') return undefined;
+    const payload = parsed as Partial<NymphEnvelope>;
+    if (
+      payload.version !== 1 ||
+      typeof payload.id !== 'string' ||
+      !isMode(payload.mode) ||
+      !['text', 'mood', 'sticker', 'media', 'reaction'].includes(String(payload.kind)) ||
+      typeof payload.text !== 'string' ||
+      typeof payload.sentAt !== 'number'
+    ) return undefined;
+    if (
+      (payload.kind === 'media' && !isEncryptedAttachment(payload.attachment)) ||
+      (payload.attachment !== undefined && (!isEncryptedAttachment(payload.attachment) || typeof payload.mediaType !== 'string' || typeof payload.mediaName !== 'string')) ||
+      (payload.durationMs !== undefined && (typeof payload.durationMs !== 'number' || !Number.isFinite(payload.durationMs) || payload.durationMs < 0)) ||
+      (payload.viewOnceSeconds !== undefined && (payload.kind !== 'media' || !payload.attachment || typeof payload.viewOnceSeconds !== 'number' || !Number.isInteger(payload.viewOnceSeconds) || payload.viewOnceSeconds < 1 || payload.viewOnceSeconds > 86_400)) ||
+      (payload.viewOncePendingExpiresAt !== undefined && (typeof payload.viewOncePendingExpiresAt !== 'number' || !Number.isFinite(payload.viewOncePendingExpiresAt))) ||
+      (payload.viewOnceReceipt !== undefined && (payload.kind !== 'text' || !payload.viewOnceReceipt || typeof payload.viewOnceReceipt.messageId !== 'string' || typeof payload.viewOnceReceipt.expiresAt !== 'number' || !Number.isFinite(payload.viewOnceReceipt.expiresAt))) ||
+      (payload.retentionPolicy !== undefined && (!payload.retentionPolicy || (payload.retentionPolicy.seconds !== null && (typeof payload.retentionPolicy.seconds !== 'number' || !Number.isInteger(payload.retentionPolicy.seconds) || payload.retentionPolicy.seconds < 1 || payload.retentionPolicy.seconds > 31_536_000)))) ||
+      (payload.waveform !== undefined && (!Array.isArray(payload.waveform) || payload.waveform.length > 64 || payload.waveform.some((sample) => typeof sample !== 'number' || !Number.isFinite(sample) || sample < 0 || sample > 1))) ||
+      (payload.stickerSync !== undefined && !('operation' in (payload.stickerSync ?? {}))) ||
+      (payload.thumbnailAttachment !== undefined && (!isEncryptedAttachment(payload.thumbnailAttachment) || !isEncryptedAttachment(payload.attachment)))
+    ) return undefined;
+
+    return {
+      ...payload as NymphEnvelope,
+      sender,
+      eventId: eventId || payload.id,
+      sentAt: eventTimestamp || payload.sentAt,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeRawMatrixEvent(rawEvent: { getType(): string; getContent(): { body?: unknown }; getSender(): string | null; getId(): string | null; getTs(): number; } | null | undefined): ReceivedNymphEvent | undefined {
+  if (!rawEvent || (rawEvent.getType() !== 'm.room.message' && rawEvent.getType() !== 'm.reaction')) return undefined;
+  const content = rawEvent.getContent();
+  if (typeof content.body !== 'string') return undefined;
+  return decodeHarvesterEnvelopeBody(content.body, rawEvent.getSender() ?? '', rawEvent.getId() ?? crypto.randomUUID(), rawEvent.getTs());
+}
+
+function findRoomEventById(eventId: string): ReceivedNymphEvent | undefined {
+  if (!activeConnection) return undefined;
+  const room = state.client?.getRoom(activeConnection.roomId);
+  return room?.getLiveTimeline().getEvents()
+    .map((matrixEvent) => decodeRawMatrixEvent(matrixEvent))
+    .find((candidate) => candidate?.eventId === eventId);
+}
+
 type HarnessState = {
   client: MatrixMessagingClient | null;
   events: ReceivedNymphEvent[];
@@ -47,10 +124,16 @@ type HarnessState = {
     pendingExpirySeconds?: number,
   ): Promise<{ eventId: string; attachment: NonNullable<ReceivedNymphEvent['attachment']>; thumbnailAttachment?: NonNullable<ReceivedNymphEvent['thumbnailAttachment']> }>;
   downloadAttachment(eventId: string, thumbnail?: boolean): Promise<number[]>;
+  downloadAttachmentReference(
+    attachment: NonNullable<ReceivedNymphEvent['attachment']>,
+    mediaType: string,
+  ): Promise<number[]>;
   openEphemeralMedia(eventId: string): Promise<number>;
-  mediaStoreStatus(eventId: string): Promise<{ state: string; expires_at: number; media_exists: boolean }>;
+  openEphemeralMediaReference(attachment: NonNullable<ReceivedNymphEvent['attachment']>): Promise<number>;
+  mediaStoreStatus(mediaId: string): Promise<{ state: string; expires_at: number; media_exists: boolean }>;
   getRetentionPolicy(): Promise<{ seconds: number | null; eventTimestamp: number | null; eventId: string | null }>;
   messageExpiryStatus(eventId: string): Promise<{ state: string; expires_at: number | null; redaction_event_id: string | null }>;
+  redactedContentKeys(eventId: string): Promise<string[]>;
   cancelAttachmentDuringUpload(
     envelope: NymphEnvelope,
     fileBytes: number[],
@@ -321,31 +404,35 @@ const state: HarnessState = {
   },
   async downloadAttachment(eventId, thumbnail = false) {
     if (!this.client) throw new Error('Connect a Matrix client before downloading encrypted media.');
-    const event = this.events.find((item) => item.eventId === eventId);
+    const event = this.events.find((item) => item.eventId === eventId) ?? findRoomEventById(eventId);
     const file = thumbnail ? event?.thumbnailAttachment : event?.attachment;
     const mediaType = thumbnail ? 'image/webp' : event?.mediaType;
     if (!file || !mediaType) throw new Error('The requested encrypted media event is unavailable.');
-    const blob = await this.client.downloadAttachment(file, mediaType);
+    if (event && !this.events.some((item) => item.eventId === event.eventId)) this.events.push(event);
+    return this.downloadAttachmentReference(file, mediaType);
+  },
+  async downloadAttachmentReference(attachment, mediaType) {
+    if (!this.client) throw new Error('Connect a Matrix client before downloading encrypted media.');
+    const blob = await this.client.downloadAttachment(attachment, mediaType);
     return Array.from(new Uint8Array(await blob.arrayBuffer()));
   },
   async openEphemeralMedia(eventId) {
     if (!this.client) throw new Error('Connect a Matrix client before opening expiring media.');
-    const event = this.events.find((item) => item.eventId === eventId);
+    const event = this.events.find((item) => item.eventId === eventId) ?? findRoomEventById(eventId);
     if (!event?.attachment) throw new Error('The expiring media event is unavailable.');
-    return this.client.openEphemeralMedia(event.attachment);
+    if (!this.events.some((item) => item.eventId === event.eventId)) this.events.push(event);
+    return this.openEphemeralMediaReference(event.attachment);
   },
-  async mediaStoreStatus(eventId) {
+  async openEphemeralMediaReference(attachment) {
+    if (!this.client) throw new Error('Connect a Matrix client before opening expiring media.');
+    return this.client.openEphemeralMedia(attachment);
+  },
+  async mediaStoreStatus(mediaId) {
     if (!activeConnection) throw new Error('Connect a Matrix client before checking media expiration.');
-    const event = this.events.find((item) => item.eventId === eventId);
-    if (!event?.attachment) throw new Error('The expiring media event is unavailable.');
-    const mediaUrl = new URL(event.attachment.url);
-    const match = mediaUrl.pathname.match(/^\/_synapse\/client\/nymph\/media\/content\/([A-Za-z0-9._=-]{1,255})$/);
-    if (mediaUrl.origin !== new URL(apiBase).origin || !match) {
-      throw new Error('The event does not reference registered view-once media.');
-    }
+    if (!/^[A-Za-z0-9._=-]{1,255}$/.test(mediaId)) throw new Error('The expiring-media ID is invalid.');
     return postJson(
       '/_synapse/client/nymph/media/status',
-      { media_id: match[1] },
+      { media_id: mediaId },
       activeConnection.accessToken,
     ) as Promise<{ state: string; expires_at: number; media_exists: boolean }>;
   },
@@ -360,6 +447,29 @@ const state: HarnessState = {
       { event_id: eventId },
       activeConnection.accessToken,
     ) as Promise<{ state: string; expires_at: number | null; redaction_event_id: string | null }>;
+  },
+  async redactedContentKeys(eventId) {
+    if (!activeConnection) throw new Error('Connect a Matrix client before checking a redacted event.');
+    const response = await fetch(
+      `${apiBase}/_matrix/client/v3/rooms/${encodeURIComponent(activeConnection.roomId)}/event/${encodeURIComponent(eventId)}`,
+      {
+        headers: { Authorization: 'Bearer ' + activeConnection.accessToken },
+        cache: 'no-store',
+        redirect: 'error',
+      },
+    );
+    if (!response.ok) throw new Error(`Could not inspect the redacted room event (${response.status}).`);
+    const event: unknown = await response.json();
+    if (
+      !event ||
+      typeof event !== 'object' ||
+      !('content' in event) ||
+      !event.content ||
+      typeof event.content !== 'object'
+    ) {
+      throw new Error('The server returned an invalid redacted room event.');
+    }
+    return Object.keys(event.content);
   },
   async cancelAttachmentDuringUpload(envelope, fileBytes, mediaType, fileName, thumbnailBytes) {
     if (!this.client) throw new Error('Connect a Matrix client before testing upload cancellation.');

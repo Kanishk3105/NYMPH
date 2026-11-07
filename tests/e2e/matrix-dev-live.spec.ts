@@ -3,6 +3,7 @@ import { createHash, randomUUID, scryptSync } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { ReceivedNymphEvent } from '../../src/matrix/MessagingClient.ts';
 import { RecoveryExportPassphraseSession } from '../../src/matrix/recovery-export-session.ts';
 import type { RecoveryExportPassphrasePurpose } from '../../src/matrix/recovery-export-session.ts';
 import { loadIsolatedMatrixConfig } from './matrix-runtime-config.mjs';
@@ -465,6 +466,15 @@ function deriveStorageKey(password: string, userId: string): number[] {
   }
 }
 
+function mediaIdFromAttachment(attachment: { url: string }): string {
+  const mediaUrl = new URL(attachment.url);
+  const match = mediaUrl.pathname.match(/^\/_synapse\/client\/nymph\/media\/content\/([A-Za-z0-9._=-]{1,255})$/);
+  if (mediaUrl.origin !== new URL(matrixConfig.homeserverUrl).origin || !match) {
+    throw new Error('The encrypted view-once attachment has an invalid media reference.');
+  }
+  return match[1];
+}
+
 async function call<T>(
   page: Page,
   method: string,
@@ -527,10 +537,18 @@ async function waitForValue<T>(
 async function openPartnerProfile(
   partner: 'partner-a' | 'partner-b',
 ): Promise<{ context: BrowserContext; page: Page }> {
-  const context = await chromium.launchPersistentContext(join(profileRoot, partner), {
+  const profileDir = join(profileRoot, partner);
+  const context = await chromium.launchPersistentContext(profileDir, {
     executablePath: chromePath,
     headless: true,
-    args: ['--disable-extensions', '--no-first-run', '--no-default-browser-check'],
+    args: [
+      '--disable-extensions',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+    ],
   });
   const page = await context.newPage();
   await page.goto('http://127.0.0.1:5174/tests/e2e/matrix-harness.html', {
@@ -562,6 +580,65 @@ async function restartExistingIsolatedSynapse(page: Page): Promise<void> {
     await page.waitForTimeout(1_000);
   }
   throw new Error('The existing isolated Synapse service did not become healthy after restart.');
+}
+
+async function restoreExistingCrossSigningForCurrentDevice(
+  page: Page,
+  userId: string,
+  password: string,
+  exportFile: string,
+): Promise<void> {
+  const before = await call<RecoverySecurityState>(page, 'refreshSecurity');
+  if (before.crossSigningReady) return;
+  if (
+    !before.defaultSecretStorageKeyId ||
+    !before.publicCrossSigningKeysPresent ||
+    !before.privateCrossSigningSecretsStored
+  ) {
+    throw new Error(
+      `Existing cross-signing state is incomplete for ${userId}; refusing to create or replace identity keys.`,
+    );
+  }
+  if (!(await fileExists(exportFile))) {
+    throw new Error(`The existing encrypted recovery export is missing for ${userId}.`);
+  }
+
+  const originalIdentityIds = await call<string[]>(page, 'crossSigningIdentityIds');
+  if (originalIdentityIds.length !== 3 || new Set(originalIdentityIds).size !== 3) {
+    throw new Error(`The published cross-signing identity is incomplete for ${userId}.`);
+  }
+
+  const passphraseSession = new RecoveryExportPassphraseSession(requestExportPassphrase);
+  let recoveryKey = '';
+  try {
+    const encryptedExport = await readFile(exportFile, 'utf8');
+    const contents = await passphraseSession.decryptExport(
+      userId,
+      encryptedExport,
+      (value) => validateRecoveryContents(value, userId, before.defaultSecretStorageKeyId),
+    );
+    recoveryKey = contents.recoveryKey;
+    contents.recoveryKey = '';
+
+    const keyId = await call<string>(page, 'unlockExistingSecretStorage', recoveryKey, password);
+    if (keyId !== before.defaultSecretStorageKeyId) {
+      throw new Error(`Secret Storage changed unexpectedly while restoring ${userId}'s current device.`);
+    }
+
+    const after = await call<RecoverySecurityState>(page, 'refreshSecurity');
+    const restoredIdentityIds = await call<string[]>(page, 'crossSigningIdentityIds');
+    if (
+      !after.crossSigningReady ||
+      after.defaultSecretStorageKeyId !== before.defaultSecretStorageKeyId ||
+      !after.publicCrossSigningKeysPresent ||
+      JSON.stringify(restoredIdentityIds) !== JSON.stringify(originalIdentityIds)
+    ) {
+      throw new Error(`Existing cross-signing state could not be restored unchanged for ${userId}.`);
+    }
+  } finally {
+    recoveryKey = '';
+    passphraseSession.finish();
+  }
 }
 
 test('isolated partners join the existing room, recover crypto, verify trust, and exchange encrypted messages', async () => {
@@ -1167,7 +1244,7 @@ test('isolated partners send and decrypt encrypted photo and video attachments',
 });
 
 test('existing isolated partners complete encrypted view-once photo, video, offline, and expiry acceptance', async () => {
-  test.setTimeout(300_000);
+  test.setTimeout(600_000);
   let passwordA = await readIsolatedFile('partner1_dev_password');
   let passwordB = await readIsolatedFile('partner2_dev_password');
   const partnerA = matrixConfig.partnerA;
@@ -1214,7 +1291,7 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
     const photoMessageId = randomUUID();
     const photo = await call<{
       eventId: string;
-      attachment: { url: string; hashes: { sha256: string } };
+      attachment: NonNullable<ReceivedNymphEvent['attachment']>;
     }>(pageA, 'sendAttachment', {
       version: 1,
       id: photoMessageId,
@@ -1222,16 +1299,16 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
       kind: 'media',
       text: 'View-once acceptance photo',
       sentAt: Date.now(),
-      viewOnceSeconds: 5,
+      viewOnceSeconds: 60,
       mediaType: 'image/png',
       mediaName: 'acceptance-photo.png',
     }, photoBytes, 'image/png', 'acceptance-photo.png');
     await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [photo.eventId]);
-    const photoStatusBeforeOpen = await call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', photo.eventId);
+    const photoMediaId = mediaIdFromAttachment(photo.attachment);
+    const photoStatusBeforeOpen = await call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', photoMediaId);
     expect(photoStatusBeforeOpen).toMatchObject({ state: 'pending', media_exists: true });
+    await expect(call(pageA, 'downloadAttachmentReference', photo.attachment, 'image/png')).rejects.toThrow();
 
-    const photoMediaId = new URL(photo.attachment.url).pathname.split('/').pop();
-    if (!photoMediaId) throw new Error('The encrypted photo reference did not contain a media ID.');
     const storedPhotoCiphertext = await call<number[]>(
       pageA,
       'downloadStoredCiphertext',
@@ -1239,9 +1316,9 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
     );
     expect(storedPhotoCiphertext).not.toEqual(photoBytes);
 
-    await expect(call(pageA, 'openEphemeralMedia', photo.eventId)).rejects.toThrow();
+    await expect(call(pageA, 'openEphemeralMediaReference', photo.attachment)).rejects.toThrow();
     const photoExpiry = await call<number>(pageB, 'openEphemeralMedia', photo.eventId);
-    expect(await call<{ state: string; media_exists: boolean }>(pageB, 'mediaStoreStatus', photo.eventId))
+    expect(await call<{ state: string; media_exists: boolean }>(pageB, 'mediaStoreStatus', photoMediaId))
       .toMatchObject({ state: 'opened', media_exists: true });
     const decryptedPhoto = await call<number[]>(pageB, 'downloadAttachment', photo.eventId);
     const imageSize = await pageB.evaluate(async (bytes) => {
@@ -1256,7 +1333,7 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
       }
     }, decryptedPhoto);
     expect(imageSize).toEqual({ width: 32, height: 24 });
-    await expect(call(pageB, 'openEphemeralMedia', photo.eventId)).rejects.toThrow();
+    await expect(call(pageB, 'openEphemeralMediaReference', photo.attachment)).rejects.toThrow();
 
     const photoReceiptId = await call<string>(pageB, 'send', {
       version: 1,
@@ -1275,17 +1352,21 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
     const videoFixtureBytes = Array.from(new Uint8Array(await readFile(join(process.cwd(), 'tests', 'fixtures', 'view-once-acceptance-video.mp4'))));
     expect(videoFixtureBytes.length).toBeGreaterThan(0);
     const videoMessageId = randomUUID();
-    const video = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+    const video = await call<{
+      eventId: string;
+      attachment: NonNullable<ReceivedNymphEvent['attachment']>;
+    }>(pageA, 'sendAttachment', {
       version: 1,
       id: videoMessageId,
       mode: 'flirty',
       kind: 'media',
       text: 'View-once acceptance video',
       sentAt: Date.now(),
-      viewOnceSeconds: 15,
+      viewOnceSeconds: 60,
       mediaType: 'video/mp4',
       mediaName: 'acceptance-video.mp4',
     }, videoFixtureBytes, 'video/mp4', 'acceptance-video.mp4');
+    const videoMediaId = mediaIdFromAttachment(video.attachment);
     await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [video.eventId]);
     await call(pageB, 'openEphemeralMedia', video.eventId);
     const decryptedVideo = await call<number[]>(pageB, 'downloadAttachment', video.eventId);
@@ -1312,9 +1393,12 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
     }, { bytes: decryptedVideo, type: 'video/mp4' });
     expect(playbackDuration).toBeGreaterThan(0);
 
-    const durationMessages: Array<{ eventId: string; seconds: number }> = [];
+    const durationMessages: Array<{ mediaId: string; seconds: number }> = [];
     for (const seconds of [5, 10, 15, 30, 60, 7]) {
-      const sent = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+      const sent = await call<{
+        eventId: string;
+        attachment: NonNullable<ReceivedNymphEvent['attachment']>;
+      }>(pageA, 'sendAttachment', {
         version: 1,
         id: randomUUID(),
         mode: 'romantic',
@@ -1330,11 +1414,14 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
       const expiresAt = await call<number>(pageB, 'openEphemeralMedia', sent.eventId);
       expect(expiresAt - claimedAt).toBeGreaterThan(seconds * 1000 - 2_000);
       expect(expiresAt - claimedAt).toBeLessThan(seconds * 1000 + 2_000);
-      durationMessages.push({ eventId: sent.eventId, seconds });
+      durationMessages.push({ mediaId: mediaIdFromAttachment(sent.attachment), seconds });
     }
 
     await call(pageB, 'disconnect');
-    const unopened = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+    const unopened = await call<{
+      eventId: string;
+      attachment: NonNullable<ReceivedNymphEvent['attachment']>;
+    }>(pageA, 'sendAttachment', {
       version: 1,
       id: randomUUID(),
       mode: 'romantic',
@@ -1345,28 +1432,31 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
       mediaType: 'image/png',
       mediaName: 'unopened.png',
     }, photoBytes, 'image/png', 'unopened.png', undefined, 2);
-    await waitForValue<boolean>(pageA, 'h => h.getEvents().some(event => event.eventId === args[0])', [unopened.eventId]);
+    const unopenedMediaId = mediaIdFromAttachment(unopened.attachment);
     await expect.poll(
-      async () => (await call<{ media_exists: boolean }>(pageA, 'mediaStoreStatus', unopened.eventId)).media_exists,
+      async () => (await call<{ media_exists: boolean }>(pageA, 'mediaStoreStatus', unopenedMediaId)).media_exists,
       { timeout: 20_000, intervals: [1_000, 2_000, 3_000] },
     ).toBe(false);
     await call(pageB, 'connect', sessionB, storageKeyB);
-    await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [unopened.eventId]);
-    await expect(call(pageB, 'openEphemeralMedia', unopened.eventId)).rejects.toThrow();
+    await expect(call(pageB, 'openEphemeralMediaReference', unopened.attachment)).rejects.toThrow();
 
     await call(pageB, 'disconnect');
     const offlineMessageId = randomUUID();
-    const offline = await call<{ eventId: string }>(pageA, 'sendAttachment', {
+    const offline = await call<{
+      eventId: string;
+      attachment: NonNullable<ReceivedNymphEvent['attachment']>;
+    }>(pageA, 'sendAttachment', {
       version: 1,
       id: offlineMessageId,
       mode: 'spicy',
       kind: 'media',
       text: 'Delivered while Partner B was offline',
       sentAt: Date.now(),
-      viewOnceSeconds: 5,
+      viewOnceSeconds: 60,
       mediaType: 'image/png',
       mediaName: 'offline-view-once.png',
     }, photoBytes, 'image/png', 'offline-view-once.png');
+    const offlineMediaId = mediaIdFromAttachment(offline.attachment);
     await call(pageB, 'connect', sessionB, storageKeyB);
     await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [offline.eventId]);
     const offlineExpiry = await call<number>(pageB, 'openEphemeralMedia', offline.eventId);
@@ -1387,15 +1477,28 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
 
     await expect.poll(
       async () => {
-        const statuses = await Promise.all(durationMessages.map(({ eventId }) =>
-          call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', eventId),
-        ));
-        return statuses.every((status) => status.state === 'deleted' && !status.media_exists);
+        const eventIds = [
+            ...durationMessages.map(({ mediaId }) => mediaId),
+            photoMediaId,
+            videoMediaId,
+            offlineMediaId,
+        ];
+        const [statusesA, statusesB] = await Promise.all([
+            Promise.all(eventIds.map((mediaId) =>
+              call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', mediaId),
+          )),
+            Promise.all(eventIds.map((mediaId) =>
+              call<{ state: string; media_exists: boolean }>(pageB, 'mediaStoreStatus', mediaId),
+          )),
+        ]);
+        return [...statusesA, ...statusesB].every((status) => status.state === 'deleted' && !status.media_exists);
       },
-      { timeout: 80_000, intervals: [1_000, 3_000, 5_000] },
+      { timeout: 100_000, intervals: [1_000, 3_000, 5_000] },
     ).toBe(true);
-    await expect(call(pageB, 'openEphemeralMedia', photo.eventId)).rejects.toThrow();
-    expect(await call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', photo.eventId))
+    await expect(call(pageB, 'openEphemeralMediaReference', photo.attachment)).rejects.toThrow();
+    await expect(call(pageB, 'openEphemeralMediaReference', video.attachment)).rejects.toThrow();
+    await expect(call(pageB, 'openEphemeralMediaReference', offline.attachment)).rejects.toThrow();
+    expect(await call<{ state: string; media_exists: boolean }>(pageA, 'mediaStoreStatus', photoMediaId))
       .toMatchObject({ state: 'deleted', media_exists: false });
   } finally {
     if (pageA) await call(pageA, 'disconnect').catch(() => undefined);
@@ -1410,13 +1513,15 @@ test('existing isolated partners complete encrypted view-once photo, video, offl
 });
 
 test('existing isolated partners synchronize server retention, Never, offline expiry, relations, and restart jobs', async () => {
-  test.setTimeout(240_000);
+  test.setTimeout(600_000);
   let passwordA = await readIsolatedFile('partner1_dev_password');
   let passwordB = await readIsolatedFile('partner2_dev_password');
   const partnerA = matrixConfig.partnerA;
   const partnerB = matrixConfig.partnerB;
   const deviceA = await readIsolatedFile('partner1_dev_device_id');
   const deviceB = await readIsolatedFile('partner2_dev_device_id');
+  const recoveryExportA = join(secretDirectory, 'partner1_dev_recovery.enc');
+  const recoveryExportB = join(secretDirectory, 'partner2_dev_recovery.enc');
   let contextA: BrowserContext | undefined;
   let contextB: BrowserContext | undefined;
   let pageA: Page | undefined;
@@ -1449,6 +1554,8 @@ test('existing isolated partners synchronize server retention, Never, offline ex
     storageKeyB = deriveStorageKey(passwordB, partnerB);
     await call(pageA, 'connect', sessionA, storageKeyA);
     await call(pageB, 'connect', sessionB, storageKeyB);
+    await restoreExistingCrossSigningForCurrentDevice(pageA, partnerA, passwordA, recoveryExportA);
+    await restoreExistingCrossSigningForCurrentDevice(pageB, partnerB, passwordB, recoveryExportB);
     expect((await call<{ partnerVerified: boolean }>(pageA, 'refreshSecurity')).partnerVerified).toBe(true);
     expect((await call<{ partnerVerified: boolean }>(pageB, 'refreshSecurity')).partnerVerified).toBe(true);
     previousPolicy = (await call<{ seconds: number | null }>(pageA, 'getRetentionPolicy')).seconds;
@@ -1502,6 +1609,8 @@ test('existing isolated partners synchronize server retention, Never, offline ex
       'h => h.getRedactedEventIds().includes(args[0])',
       [offlineMessageId],
     );
+    expect(await call<string[]>(pageA, 'redactedContentKeys', offlineMessageId))
+      .not.toContain('ciphertext');
 
     const restartPolicyId = await call<string>(pageA, 'send', policyEnvelope(15));
     await waitForValue<boolean>(pageB, 'h => h.getEvents().some(event => event.eventId === args[0])', [restartPolicyId]);
@@ -1558,6 +1667,8 @@ test('existing isolated partners synchronize server retention, Never, offline ex
         60_000,
       );
     }
+    expect(await call<string[]>(pageA, 'redactedContentKeys', parentEventId))
+      .not.toContain('ciphertext');
   } finally {
     if (pageA && policyChanged && previousPolicy !== null) {
       try {
