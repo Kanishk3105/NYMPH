@@ -39,6 +39,10 @@ def main() -> None:
     config["allow_guest_access"] = False
     config["allow_public_rooms"] = False
     config["allow_public_rooms_over_federation"] = False
+    config["rc_login"] = {
+        "address": {"per_second": 0.05, "burst_count": 10},
+        "account": {"per_second": 0.05, "burst_count": 10},
+    }
     config["block_non_admin_invites"] = False
     config["require_auth_for_profile_requests"] = True
     config["federation_domain_whitelist"] = []

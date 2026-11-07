@@ -92,6 +92,13 @@ Describe 'Isolated Stage 3H provisioner safety gates' {
         $config | Should Not Match '@partner2:localhost'
     }
 
+    It 'keeps isolated development login throttling enabled with a test-sized burst' {
+        $config = Get-Content -LiteralPath (Join-Path $backendPath 'configure_isolated_dev_synapse.py') -Raw
+        $config | Should Match '"rc_login"'
+        $config | Should Match '"address": \{"per_second": 0\.05, "burst_count": 10\}'
+        $config | Should Match '"account": \{"per_second": 0\.05, "burst_count": 10\}'
+    }
+
     It 'reconciles existing development resources instead of resetting or recreating them' {
         $provisioner = Get-Content -LiteralPath $provisionerPath -Raw
         $provisioner | Should Match '--exists-ok'

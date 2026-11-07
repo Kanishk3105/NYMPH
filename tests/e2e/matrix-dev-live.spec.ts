@@ -99,7 +99,7 @@ $form.Height = 270
 $form.StartPosition = 'CenterScreen'
 $label = New-Object System.Windows.Forms.Label
 if ($existingExport) {
-    $label.Text = 'Enter the original passphrase used to encrypt this existing export. Do not choose a new passphrase.'
+    $label.Text = "Enter the original recovery-export passphrase for $account. This is not the Matrix account password, Matrix Secret Storage recovery key, or NYMPH app PIN. Do not guess or choose a replacement."
 } else {
     $label.Text = 'Choose a unique passphrase of at least 12 characters. Store it separately from the encrypted export.'
 }
@@ -109,7 +109,7 @@ $label.Width = 520
 $label.Height = 36
 $firstLabel = New-Object System.Windows.Forms.Label
 if ($existingExport) {
-    $firstLabel.Text = 'Original passphrase'
+    $firstLabel.Text = 'Original export passphrase'
 } else {
     $firstLabel.Text = 'Passphrase'
 }
@@ -172,6 +172,49 @@ $first.Clear()
 $confirm.Clear()
 $form.Dispose()
 [Console]::Out.Write($passphrase)
+`;
+
+const existingMatrixPasswordScript = `
+Add-Type -AssemblyName System.Windows.Forms
+$account = [Console]::In.ReadLine()
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Existing Matrix account password - $account"
+$form.Width = 560
+$form.Height = 190
+$form.StartPosition = 'CenterScreen'
+$label = New-Object System.Windows.Forms.Label
+$label.Text = "Enter the existing Matrix account password for $account. This is not the Secret Storage recovery key, export passphrase, or NYMPH app PIN."
+$label.Left = 12
+$label.Top = 12
+$label.Width = 520
+$label.Height = 48
+$passwordBox = New-Object System.Windows.Forms.TextBox
+$passwordBox.Left = 12
+$passwordBox.Top = 68
+$passwordBox.Width = 520
+$passwordBox.UseSystemPasswordChar = $true
+$ok = New-Object System.Windows.Forms.Button
+$ok.Text = 'Continue'
+$ok.Left = 440
+$ok.Top = 112
+$ok.Width = 90
+$ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = 'Cancel'
+$cancel.Left = 345
+$cancel.Top = 112
+$cancel.Width = 80
+$cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$form.Controls.AddRange(@($label, $passwordBox, $ok, $cancel))
+$form.AcceptButton = $ok
+$form.CancelButton = $cancel
+$result = $form.ShowDialog()
+$password = $passwordBox.Text
+$passwordBox.Clear()
+$form.Dispose()
+if ($result -ne [System.Windows.Forms.DialogResult]::OK -or -not $password) { exit 2 }
+[Console]::Out.Write($password)
+$password = $null
 `;
 
 const recoveryKeyInputScript = `
@@ -269,6 +312,16 @@ function requestExportPassphrase(
   );
   if (passphrase.length < 12) throw new Error(`Recovery-export passphrase is too short for ${userId}.`);
   return passphrase;
+}
+
+function requestExistingMatrixPassword(userId: string): string {
+  const password = runLocalPowerShellDialog(
+    existingMatrixPasswordScript,
+    `${userId}\n`,
+    `The existing Matrix account password was not provided for ${userId}.`,
+  );
+  if (!password) throw new Error(`The existing Matrix account password was not provided for ${userId}.`);
+  return password;
 }
 
 function requestExistingRecoveryKey(userId: string): string {
@@ -582,6 +635,57 @@ async function restartExistingIsolatedSynapse(page: Page): Promise<void> {
   throw new Error('The existing isolated Synapse service did not become healthy after restart.');
 }
 
+function assertExistingPartnerBDeviceRegistered(deviceId: string): number {
+  const query = [
+    'SELECT CASE WHEN EXISTS (',
+    "SELECT 1 FROM devices WHERE user_id = '@partner2-dev:nymph-dev.localhost' ",
+    `AND device_id = '${deviceId.replace(/'/g, "''")}' AND hidden = false`,
+    ") THEN 'registered' ELSE 'missing' END;",
+    "SELECT COUNT(*) FROM devices WHERE user_id = '@partner2-dev:nymph-dev.localhost' AND hidden = false;",
+  ].join('');
+  const deviceResult = spawnSync(
+    'docker',
+    ['exec', '-i', 'nymph-stage3h1-dev-postgres-1', 'psql', '-XAtq', '-v', 'ON_ERROR_STOP=1', '-U', 'synapse', '-d', 'synapse'],
+    { input: query, encoding: 'utf8', windowsHide: true, timeout: 15_000 },
+  );
+  const [deviceStatus, deviceCountText] = deviceResult.stdout.trim().split(/\r?\n/);
+  const deviceCount = Number(deviceCountText);
+  if (
+    deviceResult.error ||
+    deviceResult.status !== 0 ||
+    deviceStatus !== 'registered' ||
+    !Number.isSafeInteger(deviceCount) ||
+    deviceCount < 1
+  ) {
+    throw new Error('The exact existing Partner B device is not confirmed in Synapse; refusing login.');
+  }
+
+  const activeDeviceCheck = [
+    'import sys,sqlite3; expected=sys.stdin.read().strip(); ',
+    'conn=sqlite3.connect("file:/data/nymph-policy.sqlite3?mode=ro",uri=True); ',
+    'row=conn.execute("SELECT device_id,first_login_allowed FROM nymph_active_device WHERE user_id=?",',
+    '("@partner2-dev:nymph-dev.localhost",)).fetchone(); ',
+    'print("active" if row and row[0]==expected and row[1]==0 else "not-active"); conn.close()',
+  ].join('');
+  const encodedCheck = Buffer.from(activeDeviceCheck, 'utf8').toString('base64');
+  const activeResult = spawnSync(
+    'docker',
+    [
+      'exec',
+      '-i',
+      'nymph-stage3h1-dev-synapse-1',
+      'python',
+      '-c',
+      `exec(__import__('base64').b64decode('${encodedCheck}'))`,
+    ],
+    { input: deviceId, encoding: 'utf8', windowsHide: true, timeout: 15_000 },
+  );
+  if (activeResult.error || activeResult.status !== 0 || activeResult.stdout.trim() !== 'active') {
+    throw new Error('The exact existing Partner B device is not the active Synapse device; refusing login.');
+  }
+  return deviceCount;
+}
+
 async function restoreExistingCrossSigningForCurrentDevice(
   page: Page,
   userId: string,
@@ -640,6 +744,66 @@ async function restoreExistingCrossSigningForCurrentDevice(
     passphraseSession.finish();
   }
 }
+
+test('Partner B reauthenticates only on the registered device and loads its existing crypto store', async () => {
+  test.setTimeout(300_000);
+  const partnerB = matrixConfig.partnerB;
+  const deviceB = await readIsolatedFile('partner2_dev_device_id');
+  const registeredDeviceCountBeforeLogin = assertExistingPartnerBDeviceRegistered(deviceB);
+
+  let passwordB = requestExistingMatrixPassword(partnerB);
+  let contextB: BrowserContext | undefined;
+  let pageB: Page | undefined;
+  let storageKeyB: number[] = [];
+
+  try {
+    ({ context: contextB, page: pageB } = await openPartnerProfile('partner-b'));
+    const sessionB = await call<Session>(
+      pageB,
+      'passwordLogin',
+      partnerB,
+      passwordB,
+      'NYMPH Partner B existing device reauthentication',
+      deviceB,
+      false,
+    );
+    if (sessionB.userId !== partnerB || sessionB.deviceId !== deviceB) {
+      throw new Error('Synapse did not reauthenticate the exact existing Partner B device.');
+    }
+    expect(assertExistingPartnerBDeviceRegistered(deviceB)).toBe(registeredDeviceCountBeforeLogin);
+
+    sessionB.roomId = expectedRoomId;
+    storageKeyB = deriveStorageKey(passwordB, partnerB);
+    await call(pageB, 'connect', sessionB, storageKeyB);
+    const security = await call<RecoverySecurityState & {
+      userId: string;
+      ownDeviceId: string;
+      partnerVerified: boolean;
+      identityChanged: boolean;
+      privateCrossSigningKeysCachedLocally: boolean;
+      ownDevices: Array<{ deviceId: string; verified: boolean; current: boolean }>;
+    }>(pageB, 'refreshSecurity');
+    expect(security.userId).toBe(partnerB);
+    expect(security.ownDeviceId).toBe(deviceB);
+    expect(security.ownDevices).toContainEqual(expect.objectContaining({
+      deviceId: deviceB,
+      current: true,
+    }));
+    expect(security.crossSigningReady).toBe(true);
+    expect(security.privateCrossSigningKeysCachedLocally).toBe(true);
+    expect(security.partnerVerified).toBe(true);
+    expect(security.identityChanged).toBe(false);
+    expect(await call<string[]>(pageB, 'crossSigningIdentityIds')).toHaveLength(3);
+
+    const decryptedEvents = await call<ReceivedNymphEvent[]>(pageB, 'getEvents');
+    expect(decryptedEvents.length).toBeGreaterThan(0);
+  } finally {
+    if (pageB) await call(pageB, 'disconnect').catch(() => undefined);
+    await contextB?.close();
+    storageKeyB.fill(0);
+    passwordB = '';
+  }
+});
 
 test('isolated partners join the existing room, recover crypto, verify trust, and exchange encrypted messages', async () => {
   test.setTimeout(1_200_000);

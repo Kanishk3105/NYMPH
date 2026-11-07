@@ -1,4 +1,12 @@
 {$MATRIX_SERVER_NAME} {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
 	@admin_api path /_synapse/admin /_synapse/admin/*
 	respond @admin_api 404
 

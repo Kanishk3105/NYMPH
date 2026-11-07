@@ -28,12 +28,19 @@ export default defineConfig({
     launchOptions: {
       executablePath: chromePath,
       headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+      ],
     },
   },
   webServer: {
     command: 'node scripts/serve-matrix-e2e.mjs',
     url: 'http://127.0.0.1:5174/tests/e2e/matrix-harness.html',
     reuseExistingServer: !process.env.CI,
-    timeout: 60_000,
+    timeout: 600_000,
   },
 });

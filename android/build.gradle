@@ -24,6 +24,19 @@ allprojects {
     }
 }
 
+subprojects { subproject ->
+    if (subproject.name == 'capacitor-cordova-android-plugins') {
+        subproject.plugins.withId('com.android.library') {
+            subproject.dependencies.constraints.add(
+                'androidTestImplementation',
+                'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
+            ) {
+                because 'Align the legacy Android-test coroutine dependency with the Kotlin 1.8.22 test runtime.'
+            }
+        }
+    }
+}
+
 task clean(type: Delete) {
     delete rootProject.buildDir
 }

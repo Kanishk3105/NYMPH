@@ -1,6 +1,14 @@
+import type { NymphMode, StickerSync } from './matrix/MessagingClient.ts';
+
 export const MAX_STICKER_BYTES = 512 * 1024;
 export const MAX_STICKER_LIBRARY_BYTES = 2 * 1024 * 1024;
 export const MAX_STICKER_PACK_NAME_LENGTH = 32;
+
+type StickerPackMembership = {
+  id: string;
+  adult: boolean;
+  stickers: readonly { id: string }[];
+};
 
 export interface StickerFileDetails {
   name: string;
@@ -14,6 +22,22 @@ const supportedStickerTypes = new Set([
   'image/png',
   'image/webp',
 ]);
+
+export function getStickerSyncMode(
+  sync: StickerSync,
+  packs: readonly StickerPackMembership[],
+  currentMode: NymphMode,
+  adultStickerIds: readonly string[],
+): NymphMode {
+  if (sync.operation === 'pack-upsert') return sync.adult ? 'kinky' : currentMode;
+  if (sync.operation === 'pack-delete') {
+    return packs.find((pack) => pack.id === sync.packId)?.adult ? 'kinky' : currentMode;
+  }
+  const isAdultPackSticker = packs.some(
+    (pack) => pack.adult && pack.stickers.some((sticker) => sticker.id === sync.stickerId),
+  );
+  return isAdultPackSticker || adultStickerIds.includes(sync.stickerId) ? 'kinky' : currentMode;
+}
 
 export function normalizeStickerPackName(name: string): string {
   return name.trim().replace(/\s+/g, ' ').slice(0, MAX_STICKER_PACK_NAME_LENGTH);

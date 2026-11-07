@@ -2,14 +2,19 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import pathlib
+import re
 import secrets
 import sqlite3
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from synapse.api.errors import Codes, SynapseError
 from synapse.module_api import NOT_SPAM, ModuleApi
 from twisted.internet import defer
+from twisted.internet.threads import deferToThread
 from twisted.web.resource import Resource
 from twisted.web.server import NOT_DONE_YET
 
@@ -18,7 +23,15 @@ logger = logging.getLogger(__name__)
 INVITATION_TTL_MS = 120_000
 LOGIN_TOKEN_TTL_MS = 120_000
 ROOM_RESERVATION_TTL_MS = 120_000
+EPHEMERAL_MEDIA_PENDING_TTL_MS = 30 * 24 * 60 * 60 * 1000
+EPHEMERAL_MEDIA_PENDING_MIN_TTL_SECONDS = 1
+EPHEMERAL_MEDIA_PENDING_MAX_TTL_SECONDS = EPHEMERAL_MEDIA_PENDING_TTL_MS // 1000
+MEDIA_ID_PATTERN = re.compile(r"^[A-Za-z0-9._=-]{1,255}$")
+EVENT_ID_PATTERN = re.compile(r"^\$[A-Za-z0-9._=:-]{1,255}$")
 ROOM_ENCRYPTION = "m.megolm.v1.aes-sha2"
+MAX_RETENTION_SECONDS = 31_536_000
+MAX_RETENTION_RECONCILE_EVENTS = 100
+WORKER_HEALTH_MAX_AGE_MS = 30_000
 
 
 def now_ms() -> int:
@@ -113,6 +126,22 @@ class PairingResource(Resource):
                 result = await self.policy.cancel_device_replacement(request)
             elif self.endpoint == "device_recovery_check":
                 result = await self.policy.create_recovery_verification(request, payload)
+            elif self.endpoint == "media_register":
+                result = await self.policy.register_ephemeral_media(request, payload)
+            elif self.endpoint == "media_open":
+                result = await self.policy.open_ephemeral_media(request, payload)
+            elif self.endpoint == "media_status":
+                result = await self.policy.get_ephemeral_media_status(request, payload)
+            elif self.endpoint == "retention_set":
+                result = await self.policy.set_conversation_retention(request, payload)
+            elif self.endpoint == "retention_status":
+                result = await self.policy.get_conversation_retention(request)
+            elif self.endpoint == "retention_relation":
+                result = await self.policy.register_message_relation(request, payload)
+            elif self.endpoint == "retention_message_status":
+                result = await self.policy.get_message_expiry_status(request, payload)
+            elif self.endpoint == "retention_reconcile":
+                result = await self.policy.reconcile_expired_messages(request, payload)
             else:
                 result = await self.policy.redeem_invitation(payload)
         except SynapseError as error:
@@ -132,62 +161,173 @@ class PairingResource(Resource):
         request.finish()
 
 
+class EphemeralMediaContentResource(Resource):
+    isLeaf = False
+
+    def __init__(self, policy: "NymphPolicy", media_id: str | None = None) -> None:
+        super().__init__()
+        self.policy = policy
+        self.media_id = media_id
+
+    def getChild(self, path: bytes, _request: Any) -> Resource:
+        media_id = path.decode("ascii", errors="ignore")
+        return EphemeralMediaContentResource(self.policy, media_id)
+
+    def render_OPTIONS(self, request: Any) -> bytes:
+        if not self.policy.allow_origin(request):
+            request.setResponseCode(403)
+            return b""
+        self.policy.set_cors_headers(request)
+        request.setHeader(b"Access-Control-Allow-Methods", b"GET, OPTIONS")
+        request.setResponseCode(204)
+        return b""
+
+    def render_GET(self, request: Any) -> bytes:
+        if not self.media_id or not MEDIA_ID_PATTERN.fullmatch(self.media_id):
+            request.setResponseCode(404)
+            return b""
+        if not self.policy.allow_origin(request):
+            request.setResponseCode(403)
+            return b""
+        self.policy.set_cors_headers(request)
+        request.setHeader(b"Cache-Control", b"no-store")
+        request.setHeader(b"Content-Type", b"application/octet-stream")
+        defer.ensureDeferred(self._serve(request))
+        return NOT_DONE_YET
+
+    async def _serve(self, request: Any) -> None:
+        try:
+            requester = await self.policy.api.get_user_by_req(request)
+            user_id = requester.user.to_string()
+            media_path = self.policy.authorized_ephemeral_media_path(user_id, self.media_id or "")
+            data = await deferToThread(pathlib.Path(media_path).read_bytes)
+            request.setHeader(b"Content-Length", str(len(data)).encode("ascii"))
+            request.setResponseCode(200)
+            request.write(data)
+        except SynapseError as error:
+            request.setResponseCode(error.code)
+            request.setHeader(b"Content-Length", b"0")
+        except FileNotFoundError:
+            request.setResponseCode(410)
+            request.setHeader(b"Content-Length", b"0")
+        except Exception:
+            logger.exception("NYMPH ephemeral media retrieval failed.")
+            request.setResponseCode(500)
+            request.setHeader(b"Content-Length", b"0")
+        request.finish()
+
+
+class PolicyHealthResource(Resource):
+    isLeaf = True
+
+    def __init__(self, policy: "NymphPolicy") -> None:
+        super().__init__()
+        self.policy = policy
+
+    def render_GET(self, request: Any) -> bytes:
+        request.setHeader(b"Content-Type", b"application/json")
+        status = self.policy.worker_health()
+        request.setResponseCode(200 if status["healthy"] else 503)
+        return json.dumps(status, separators=(",", ":")).encode("utf-8")
+
+
 class NymphPolicy:
     @staticmethod
     def parse_config(config: dict[str, Any]) -> dict[str, Any]:
-        required = (
-            "dev_partner_a_user_id",
-            "dev_partner_b_user_id",
-            "server_name",
-            "homeserver_url",
-            "app_origins",
-            "state_path",
+        mode = config.get("policy_mode", "development")
+        if mode not in {"development", "production"}:
+            raise ValueError("NYMPH policy_mode must be development or production.")
+        partner_keys = (
+            ("dev_partner_a_user_id", "dev_partner_b_user_id")
+            if mode == "development"
+            else ("partner_a_user_id", "partner_b_user_id")
         )
+        required = (*partner_keys, "server_name", "homeserver_url", "app_origins", "state_path")
         if any(not isinstance(config.get(key), str) or not config[key] for key in required):
-            raise ValueError("NYMPH policy requires both development IDs and local service URLs.")
+            raise ValueError("NYMPH policy requires two participant IDs and all service URLs/state paths.")
         server_name = config["server_name"]
         if "/" in server_name or ":" in server_name:
-            raise ValueError("The development server name must be a hostname.")
-        legacy_enabled = config.get("legacy_pair_enabled", True)
+            raise ValueError("The Matrix server name must be a hostname.")
+        legacy_enabled = config.get("legacy_pair_enabled", mode == "development")
         if not isinstance(legacy_enabled, bool):
             raise ValueError("legacy_pair_enabled must be a boolean.")
         legacy_ids = (config.get("partner_a_user_id"), config.get("partner_b_user_id"))
-        if legacy_enabled and legacy_ids != ("@partner1:localhost", "@partner2:localhost"):
-            raise ValueError("The archived development identities cannot be rebound by the policy.")
-        if not legacy_enabled and any(legacy_ids):
-            raise ValueError("Archived account IDs must not be configured in an isolated development policy.")
-        dev_ids = (config["dev_partner_a_user_id"], config["dev_partner_b_user_id"])
-        if dev_ids != (f"@partner1-dev:{server_name}", f"@partner2-dev:{server_name}"):
-            raise ValueError("Development partner IDs must match their dedicated server name.")
-        user_ids = (*legacy_ids, *dev_ids) if legacy_enabled else dev_ids
+        configured_ids = (config[partner_keys[0]], config[partner_keys[1]])
+        if mode == "development":
+            if legacy_enabled and legacy_ids != ("@partner1:localhost", "@partner2:localhost"):
+                raise ValueError("The archived development identities cannot be rebound by the policy.")
+            if not legacy_enabled and any(legacy_ids):
+                raise ValueError("Archived account IDs cannot be configured in isolated development policy.")
+            if configured_ids != (f"@partner1-dev:{server_name}", f"@partner2-dev:{server_name}"):
+                raise ValueError("Development partner IDs must match their dedicated server name.")
+        elif legacy_enabled or any(legacy_ids) or any(
+            config.get(key) for key in ("dev_partner_a_user_id", "dev_partner_b_user_id")
+        ):
+            raise ValueError("Production policy cannot include archived or development partner identities.")
+        user_ids = (*legacy_ids, *configured_ids) if legacy_enabled else configured_ids
         if len(set(user_ids)) != len(user_ids):
-            raise ValueError("Legacy and development partner IDs must be distinct.")
+            raise ValueError("All NYMPH policy participant IDs must be distinct.")
         if not all(
-            isinstance(user_id, str) and user_id.startswith("@") and ":" in user_id
+            isinstance(user_id, str)
+            and user_id.startswith("@")
+            and user_id.count(":") == 1
+            and user_id.rsplit(":", 1)[1] == server_name
             for user_id in user_ids
         ):
-            raise ValueError("NYMPH policy account IDs must be fully-qualified Matrix IDs.")
+            raise ValueError("NYMPH policy participant IDs must belong to its configured server.")
         homeserver = config["homeserver_url"]
-        if not (
-            homeserver.startswith("http://127.0.0.1:")
-            or homeserver.startswith("http://localhost:")
-            or homeserver.startswith("https://")
+        parsed_homeserver = urlsplit(homeserver)
+        if mode == "development":
+            if not (
+                homeserver.startswith("http://127.0.0.1:")
+                or homeserver.startswith("http://localhost:")
+                or homeserver.startswith("https://")
+            ):
+                raise ValueError("The development pairing endpoint must use localhost HTTP or HTTPS.")
+        elif (
+            parsed_homeserver.scheme != "https"
+            or parsed_homeserver.hostname != server_name
+            or parsed_homeserver.path not in ("", "/")
+            or parsed_homeserver.query
+            or parsed_homeserver.fragment
+            or parsed_homeserver.username
+            or parsed_homeserver.password
         ):
-            raise ValueError("The development pairing endpoint must use localhost HTTP or HTTPS.")
+            raise ValueError("Production homeserver URL must be HTTPS at the configured Matrix server name.")
+        if not os.path.isabs(config["state_path"]):
+            raise ValueError("NYMPH policy state_path must be absolute and persistent.")
+        origins = config["app_origins"].split(",")
+        if mode == "production" and any(
+            urlsplit(origin).scheme != "https"
+            or not urlsplit(origin).netloc
+            or urlsplit(origin).path
+            or urlsplit(origin).query
+            or urlsplit(origin).fragment
+            for origin in origins
+        ):
+            raise ValueError("Production app origins must be HTTPS origins.")
         return config
 
     def __init__(self, config: dict[str, Any], api: ModuleApi) -> None:
+        self.parse_config(config)
+        self.policy_mode = config.get("policy_mode", "development")
+        self.primary_pair_key = "primary" if self.policy_mode == "production" else "dev"
+        partner_a_key, partner_b_key = (
+            ("partner_a_user_id", "partner_b_user_id")
+            if self.policy_mode == "production"
+            else ("dev_partner_a_user_id", "dev_partner_b_user_id")
+        )
         self.pairs = {}
-        if config.get("legacy_pair_enabled", True):
+        if self.policy_mode == "development" and config.get("legacy_pair_enabled", True):
             self.pairs["legacy"] = {
                 "partner_a": config["partner_a_user_id"],
                 "partner_b": config["partner_b_user_id"],
                 "table": "nymph_room_policy",
             }
-        self.pairs["dev"] = {
-            "partner_a": config["dev_partner_a_user_id"],
-            "partner_b": config["dev_partner_b_user_id"],
-            "table": "nymph_dev_room_policy",
+        self.pairs[self.primary_pair_key] = {
+            "partner_a": config[partner_a_key],
+            "partner_b": config[partner_b_key],
+            "table": f"nymph_{self.primary_pair_key}_room_policy",
         }
         all_users = [
             user_id
@@ -196,10 +336,11 @@ class NymphPolicy:
         ]
         if len(set(all_users)) != len(all_users):
             raise ValueError("Legacy and development partner IDs must all be distinct.")
-        self.dev_users = {
-            self.pairs["dev"]["partner_a"],
-            self.pairs["dev"]["partner_b"],
+        self.partner_users = {
+            self.pairs[self.primary_pair_key]["partner_a"],
+            self.pairs[self.primary_pair_key]["partner_b"],
         }
+        self.dev_users = self.partner_users
         self.homeserver_url = config["homeserver_url"]
         self.app_origins = set(config["app_origins"].split(","))
         self.api = api
@@ -218,13 +359,40 @@ class NymphPolicy:
             self.db.execute(
                 "INSERT OR IGNORE INTO nymph_room_policy (id, room_id, creation_reserved_at) VALUES (1, NULL, NULL)"
             )
+        primary_room_table = self.pairs[self.primary_pair_key]["table"]
         self.db.execute(
-            "CREATE TABLE IF NOT EXISTS nymph_dev_room_policy "
+            f"CREATE TABLE IF NOT EXISTS {primary_room_table} "
             "(id INTEGER PRIMARY KEY CHECK (id = 1), room_id TEXT, creation_reserved_at INTEGER)"
         )
         self.db.execute(
-            "INSERT OR IGNORE INTO nymph_dev_room_policy "
+            f"INSERT OR IGNORE INTO {primary_room_table} "
             "(id, room_id, creation_reserved_at) VALUES (1, NULL, NULL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_ephemeral_media "
+            "(media_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, owner_user_id TEXT NOT NULL, "
+            "duration_seconds INTEGER NOT NULL, state TEXT NOT NULL, opened_by TEXT, "
+            "opened_at INTEGER, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_retention_policy "
+            "(room_id TEXT PRIMARY KEY, seconds INTEGER, event_timestamp INTEGER NOT NULL, "
+            "event_id TEXT NOT NULL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_seen_room_events "
+            "(event_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, sender TEXT NOT NULL, "
+            "event_type TEXT NOT NULL, origin_server_ts INTEGER NOT NULL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_message_expiry "
+            "(event_id TEXT PRIMARY KEY, room_id TEXT NOT NULL, sender TEXT NOT NULL, "
+            "expires_at INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'scheduled', "
+            "redaction_event_id TEXT)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_message_relations "
+            "(child_event_id TEXT PRIMARY KEY, parent_event_id TEXT NOT NULL, room_id TEXT NOT NULL)"
         )
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS nymph_active_device "
@@ -246,7 +414,7 @@ class NymphPolicy:
             self.db.execute(
                 "ALTER TABLE nymph_pending_device ADD COLUMN purpose TEXT NOT NULL DEFAULT 'replace'"
             )
-        for user_id in self.dev_users:
+        for user_id in self.partner_users:
             self.db.execute(
                 "INSERT OR IGNORE INTO nymph_active_device (user_id, device_id, first_login_allowed) "
                 "VALUES (?, NULL, 1)",
@@ -294,6 +462,65 @@ class NymphPolicy:
             "/_synapse/client/nymph/device/recovery-check",
             PairingResource(self, "device_recovery_check"),
         )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/media/register",
+            PairingResource(self, "media_register"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/media/open",
+            PairingResource(self, "media_open"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/media/status",
+            PairingResource(self, "media_status"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/media/content",
+            EphemeralMediaContentResource(self),
+        )
+        self.media_repository = getattr(getattr(api, "_hs", None), "get_media_repository", lambda: None)()
+        if self.policy_mode == "production" and self.media_repository is None:
+            raise RuntimeError("Production NYMPH policy requires Synapse's media repository API.")
+        self.worker_heartbeats: dict[str, int | None] = {"media": None, "messages": None}
+        self.worker_failures: dict[str, bool] = {"media": False, "messages": False}
+        if self.policy_mode == "production":
+            self.api.register_web_resource(
+                "/_synapse/client/nymph/health",
+                PolicyHealthResource(self),
+            )
+        if self.media_repository is not None:
+            self.media_expiry_call = self.api.looping_background_call(
+                self.run_media_expiry_worker,
+                5_000,
+                desc="nymph_expire_ephemeral_media",
+                run_on_all_instances=(self.policy_mode != "production"),
+            )
+        self.message_expiry_loop = self.api.looping_background_call(
+            self.run_message_expiry_worker,
+            5_000,
+            desc="nymph_expire_room_messages",
+            run_on_all_instances=(self.policy_mode != "production"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/retention/set",
+            PairingResource(self, "retention_set"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/retention/status",
+            PairingResource(self, "retention_status"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/retention/relation",
+            PairingResource(self, "retention_relation"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/retention/message-status",
+            PairingResource(self, "retention_message_status"),
+        )
+        self.api.register_web_resource(
+            "/_synapse/client/nymph/retention/reconcile",
+            PairingResource(self, "retention_reconcile"),
+        )
 
     def allow_origin(self, request: Any) -> bool:
         origin = request.getHeader("origin")
@@ -327,6 +554,439 @@ class NymphPolicy:
                 return pair_key, pair
         return None
 
+    async def register_ephemeral_media(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        requester = await self.api.get_user_by_req(request)
+        owner_user_id = requester.user.to_string()
+        pair_info = self.pair_for_user(owner_user_id)
+        media_id = payload.get("media_id")
+        room_id = payload.get("room_id")
+        duration_seconds = payload.get("duration_seconds")
+        pending_ttl_seconds = payload.get(
+            "pending_ttl_seconds",
+            EPHEMERAL_MEDIA_PENDING_MAX_TTL_SECONDS,
+        )
+        if (
+            pair_info is None
+            or pair_info[0] != self.primary_pair_key
+            or not isinstance(media_id, str)
+            or not MEDIA_ID_PATTERN.fullmatch(media_id)
+            or not isinstance(room_id, str)
+            or room_id != self.room_id(pair_info[0])
+            or not isinstance(duration_seconds, int)
+            or isinstance(duration_seconds, bool)
+            or not 1 <= duration_seconds <= 86_400
+            or not isinstance(pending_ttl_seconds, int)
+            or isinstance(pending_ttl_seconds, bool)
+            or not EPHEMERAL_MEDIA_PENDING_MIN_TTL_SECONDS
+            <= pending_ttl_seconds
+            <= EPHEMERAL_MEDIA_PENDING_MAX_TTL_SECONDS
+        ):
+            raise SynapseError(400, "Invalid expiring-media registration.", Codes.INVALID_PARAM)
+        if self.media_repository is None:
+            raise SynapseError(503, "Server-side media expiration is unavailable.", Codes.UNKNOWN)
+        media_info = await self.media_repository.store.get_local_media(media_id)
+        if media_info is None or media_info.media_length is None:
+            raise SynapseError(404, "The encrypted media upload was not found.", Codes.NOT_FOUND)
+        if media_info.user_id != owner_user_id:
+            raise SynapseError(403, "Only the uploader can register expiring media.", Codes.FORBIDDEN)
+        media_path = self.media_repository.filepaths.local_media_filepath(media_id)
+        if not os.path.isfile(media_path):
+            raise SynapseError(404, "The encrypted media upload was not found.", Codes.NOT_FOUND)
+        created_at = now_ms()
+        expires_at = created_at + pending_ttl_seconds * 1000
+        try:
+            self.db.execute(
+                "INSERT INTO nymph_ephemeral_media "
+                "(media_id, room_id, owner_user_id, duration_seconds, state, expires_at, created_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                (media_id, room_id, owner_user_id, duration_seconds, expires_at, created_at),
+            )
+        except sqlite3.IntegrityError as error:
+            raise SynapseError(409, "This media object is already registered.", Codes.INVALID_PARAM) from error
+        return {"registered": True, "pending_expires_at": expires_at}
+
+    async def open_ephemeral_media(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        requester = await self.api.get_user_by_req(request)
+        user_id = requester.user.to_string()
+        media_id = payload.get("media_id")
+        if not isinstance(media_id, str) or not MEDIA_ID_PATTERN.fullmatch(media_id):
+            raise SynapseError(400, "Invalid media reference.", Codes.INVALID_PARAM)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT room_id, owner_user_id, duration_seconds, state, opened_by, expires_at "
+                "FROM nymph_ephemeral_media WHERE media_id = ?",
+                (media_id,),
+            ).fetchone()
+            if row is None:
+                raise SynapseError(404, "Expiring media was not found.", Codes.NOT_FOUND)
+            room_id, owner_user_id, duration_seconds, state, opened_by, expires_at = row
+            pair_info = self.pair_for_user(user_id)
+            if (
+                pair_info is None
+                or pair_info[0] != self.primary_pair_key
+                or user_id == owner_user_id
+                or user_id not in {pair_info[1]["partner_a"], pair_info[1]["partner_b"]}
+                or room_id != self.room_id(pair_info[0])
+            ):
+                raise SynapseError(403, "This account cannot open this media.", Codes.FORBIDDEN)
+            current_time = now_ms()
+            if state == "pending":
+                if expires_at <= current_time:
+                    raise SynapseError(410, "This expiring media is no longer available.", Codes.NOT_FOUND)
+                expires_at = current_time + duration_seconds * 1000
+                self.db.execute(
+                    "UPDATE nymph_ephemeral_media SET state = 'opened', opened_by = ?, "
+                    "opened_at = ?, expires_at = ? WHERE media_id = ? AND state = 'pending'",
+                    (user_id, current_time, expires_at, media_id),
+                )
+            else:
+                raise SynapseError(410, "This expiring media is no longer available.", Codes.NOT_FOUND)
+            self.db.execute("COMMIT")
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+        return {"opened": True, "expires_at": expires_at}
+
+    async def get_ephemeral_media_status(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        requester = await self.api.get_user_by_req(request)
+        user_id = requester.user.to_string()
+        pair_info = self.pair_for_user(user_id)
+        media_id = payload.get("media_id")
+        if (
+            pair_info is None
+            or pair_info[0] != self.primary_pair_key
+            or not isinstance(media_id, str)
+            or not MEDIA_ID_PATTERN.fullmatch(media_id)
+        ):
+            raise SynapseError(403, "This account cannot inspect expiring media.", Codes.FORBIDDEN)
+        await self.expire_ephemeral_media()
+        row = self.db.execute(
+            "SELECT room_id, state, expires_at FROM nymph_ephemeral_media WHERE media_id = ?",
+            (media_id,),
+        ).fetchone()
+        if row is None or row[0] != self.room_id(pair_info[0]):
+            raise SynapseError(404, "Expiring media was not found.", Codes.NOT_FOUND)
+        media_info = await self.media_repository.store.get_local_media(media_id) if self.media_repository else None
+        media_path = (
+            self.media_repository.filepaths.local_media_filepath(media_id)
+            if self.media_repository is not None
+            else ""
+        )
+        return {
+            "state": row[1],
+            "expires_at": row[2],
+            "media_exists": media_info is not None and os.path.isfile(media_path),
+        }
+
+    async def set_conversation_retention(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        requester = await self.api.get_user_by_req(request)
+        user_id = requester.user.to_string()
+        pair_info = self.pair_for_user(user_id)
+        seconds = payload.get("seconds")
+        event_id = payload.get("event_id")
+        await self.expire_room_messages()
+        if (
+            pair_info is None
+            or pair_info[0] != self.primary_pair_key
+            or not isinstance(event_id, str)
+            or not EVENT_ID_PATTERN.fullmatch(event_id)
+            or (
+                seconds is not None
+                and (
+                    not isinstance(seconds, int)
+                    or isinstance(seconds, bool)
+                    or not 1 <= seconds <= MAX_RETENTION_SECONDS
+                )
+            )
+        ):
+            raise SynapseError(400, "Invalid conversation-retention policy.", Codes.INVALID_PARAM)
+        room_id = self.room_id(pair_info[0])
+        if not room_id:
+            raise SynapseError(404, "The private room is not configured.", Codes.NOT_FOUND)
+        event = self.db.execute(
+            "SELECT room_id, sender, event_type, origin_server_ts "
+            "FROM nymph_seen_room_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if (
+            event is None
+            or event[0] != room_id
+            or event[1] not in {pair_info[1]["partner_a"], pair_info[1]["partner_b"]}
+            or event[2] != "m.room.encrypted"
+        ):
+            raise SynapseError(404, "The encrypted policy event is not available in this room.", Codes.NOT_FOUND)
+        event_timestamp = event[3]
+        current = self.db.execute(
+            "SELECT seconds, event_timestamp, event_id FROM nymph_retention_policy WHERE room_id = ?",
+            (room_id,),
+        ).fetchone()
+        applied = current is None or (event_timestamp, event_id) > (current[1], current[2])
+        if current and (event_timestamp, event_id) == (current[1], current[2]) and seconds != current[0]:
+            raise SynapseError(409, "The policy event has already been applied with a different value.", Codes.INVALID_PARAM)
+        if applied:
+            self.db.execute(
+                "INSERT INTO nymph_retention_policy (room_id, seconds, event_timestamp, event_id) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(room_id) DO UPDATE SET "
+                "seconds = excluded.seconds, event_timestamp = excluded.event_timestamp, event_id = excluded.event_id",
+                (room_id, seconds, event_timestamp, event_id),
+            )
+        effective = self.db.execute(
+            "SELECT seconds, event_timestamp, event_id FROM nymph_retention_policy WHERE room_id = ?",
+            (room_id,),
+        ).fetchone()
+        return {
+            "seconds": effective[0],
+            "event_timestamp": effective[1],
+            "event_id": effective[2],
+            "applied": applied,
+        }
+
+    async def get_conversation_retention(self, request: Any) -> dict[str, Any]:
+        requester = await self.api.get_user_by_req(request)
+        pair_info = self.pair_for_user(requester.user.to_string())
+        if pair_info is None or pair_info[0] != self.primary_pair_key:
+            raise SynapseError(403, "This account cannot inspect conversation retention.", Codes.FORBIDDEN)
+        room_id = self.room_id(pair_info[0])
+        if not room_id:
+            raise SynapseError(404, "The private room is not configured.", Codes.NOT_FOUND)
+        row = self.db.execute(
+            "SELECT seconds, event_timestamp, event_id FROM nymph_retention_policy WHERE room_id = ?",
+            (room_id,),
+        ).fetchone()
+        return {
+            "seconds": row[0] if row else None,
+            "event_timestamp": row[1] if row else None,
+            "event_id": row[2] if row else None,
+        }
+
+    async def register_message_relation(self, request: Any, payload: dict[str, Any]) -> dict[str, bool]:
+        requester = await self.api.get_user_by_req(request)
+        user_id = requester.user.to_string()
+        pair_info = self.pair_for_user(user_id)
+        child_event_id = payload.get("child_event_id")
+        parent_event_id = payload.get("parent_event_id")
+        if (
+            pair_info is None
+            or pair_info[0] != self.primary_pair_key
+            or not isinstance(child_event_id, str)
+            or not EVENT_ID_PATTERN.fullmatch(child_event_id)
+            or not isinstance(parent_event_id, str)
+            or not EVENT_ID_PATTERN.fullmatch(parent_event_id)
+        ):
+            raise SynapseError(400, "Invalid expiring-message relation.", Codes.INVALID_PARAM)
+        room_id = self.room_id(pair_info[0])
+        child = self.db.execute(
+            "SELECT room_id, sender FROM nymph_seen_room_events WHERE event_id = ?",
+            (child_event_id,),
+        ).fetchone()
+        parent = self.db.execute(
+            "SELECT room_id FROM nymph_seen_room_events WHERE event_id = ?",
+            (parent_event_id,),
+        ).fetchone()
+        if not child or not parent or child[0] != room_id or parent[0] != room_id:
+            raise SynapseError(404, "The related events are not available in the private room.", Codes.NOT_FOUND)
+        self.db.execute(
+            "INSERT INTO nymph_message_relations (child_event_id, parent_event_id, room_id) "
+            "VALUES (?, ?, ?) ON CONFLICT(child_event_id) DO UPDATE SET "
+            "parent_event_id = excluded.parent_event_id, room_id = excluded.room_id",
+            (child_event_id, parent_event_id, room_id),
+        )
+        parent_expiry = self.db.execute(
+            "SELECT expires_at, state FROM nymph_message_expiry WHERE event_id = ?",
+            (parent_event_id,),
+        ).fetchone()
+        if parent_expiry:
+            expires_at = min(parent_expiry[0], now_ms()) if parent_expiry[1] == "redacted" else parent_expiry[0]
+            self.db.execute(
+                "INSERT INTO nymph_message_expiry (event_id, room_id, sender, expires_at, state) "
+                "VALUES (?, ?, ?, ?, 'scheduled') ON CONFLICT(event_id) DO UPDATE SET "
+                "expires_at = MIN(nymph_message_expiry.expires_at, excluded.expires_at)",
+                (child_event_id, room_id, child[1], expires_at),
+            )
+        return {"registered": True}
+
+    async def get_message_expiry_status(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        requester = await self.api.get_user_by_req(request)
+        pair_info = self.pair_for_user(requester.user.to_string())
+        event_id = payload.get("event_id")
+        if (
+            pair_info is None
+            or pair_info[0] != self.primary_pair_key
+            or not isinstance(event_id, str)
+            or not EVENT_ID_PATTERN.fullmatch(event_id)
+        ):
+            raise SynapseError(403, "This account cannot inspect message expiration.", Codes.FORBIDDEN)
+        await self.expire_room_messages()
+        room_id = self.room_id(pair_info[0])
+        seen = self.db.execute(
+            "SELECT room_id FROM nymph_seen_room_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if not seen or seen[0] != room_id:
+            raise SynapseError(404, "The room event was not found.", Codes.NOT_FOUND)
+        expiry = self.db.execute(
+            "SELECT state, expires_at, redaction_event_id FROM nymph_message_expiry WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        return {
+            "state": expiry[0] if expiry else "never",
+            "expires_at": expiry[1] if expiry else None,
+            "redaction_event_id": expiry[2] if expiry else None,
+        }
+
+    async def reconcile_expired_messages(self, request: Any, payload: dict[str, Any]) -> dict[str, list[str]]:
+        requester = await self.api.get_user_by_req(request)
+        pair_info = self.pair_for_user(requester.user.to_string())
+        event_ids = payload.get("event_ids")
+        if (
+            pair_info is None
+            or pair_info[0] != self.primary_pair_key
+            or not isinstance(event_ids, list)
+            or len(event_ids) > MAX_RETENTION_RECONCILE_EVENTS
+            or any(not isinstance(event_id, str) or not EVENT_ID_PATTERN.fullmatch(event_id) for event_id in event_ids)
+        ):
+            raise SynapseError(400, "Invalid message-expiry reconciliation request.", Codes.INVALID_PARAM)
+        room_id = self.room_id(pair_info[0])
+        if not room_id:
+            raise SynapseError(404, "The private room is not configured.", Codes.NOT_FOUND)
+        if not event_ids:
+            return {"expired_event_ids": []}
+
+        await self.expire_room_messages()
+        unique_event_ids = list(dict.fromkeys(event_ids))
+        placeholders = ",".join("?" for _ in unique_event_ids)
+        expired = self.db.execute(
+            "SELECT event_id FROM nymph_message_expiry "
+            f"WHERE room_id = ? AND event_id IN ({placeholders}) "
+            "AND (state = 'redacted' OR expires_at <= ?)",
+            (room_id, *unique_event_ids, now_ms()),
+        ).fetchall()
+        return {"expired_event_ids": [row[0] for row in expired]}
+
+    async def expire_room_messages(self) -> None:
+        due = self.db.execute(
+            "SELECT event_id, room_id, sender FROM nymph_message_expiry "
+            "WHERE state = 'scheduled' AND expires_at <= ? ORDER BY expires_at LIMIT 100",
+            (now_ms(),),
+        ).fetchall()
+        for event_id, room_id, sender in due:
+            try:
+                redaction = await self.api.create_and_send_event_into_room(
+                    {
+                        "type": "m.room.redaction",
+                        "room_id": room_id,
+                        "sender": sender,
+                        "redacts": event_id,
+                        "content": {
+                            "reason": "Expired by NYMPH conversation retention",
+                        },
+                    }
+                )
+            except Exception:
+                self.worker_failures["messages"] = True
+                logger.exception("Could not redact an expired NYMPH room event.")
+                continue
+            redaction_event_id = getattr(redaction, "event_id", None)
+            self.db.execute(
+                "UPDATE nymph_message_expiry SET state = 'redacted', redaction_event_id = ? "
+                "WHERE event_id = ? AND state = 'scheduled'",
+                (redaction_event_id, event_id),
+            )
+
+    async def run_media_expiry_worker(self) -> None:
+        try:
+            await self.expire_ephemeral_media()
+        except Exception:
+            self.worker_failures["media"] = True
+            logger.exception("NYMPH media-expiry worker failed.")
+            return
+        self.worker_failures["media"] = False
+        self.worker_heartbeats["media"] = now_ms()
+
+    async def run_message_expiry_worker(self) -> None:
+        self.worker_failures["messages"] = False
+        try:
+            await self.expire_room_messages()
+        except Exception:
+            self.worker_failures["messages"] = True
+            logger.exception("NYMPH message-expiry worker failed.")
+            return
+        if not self.worker_failures["messages"]:
+            self.worker_heartbeats["messages"] = now_ms()
+
+    def worker_health(self) -> dict[str, Any]:
+        current_time = now_ms()
+        workers = {
+            name: {
+                "last_success_ms": last_success,
+                "healthy": (
+                    last_success is not None
+                    and current_time - last_success <= WORKER_HEALTH_MAX_AGE_MS
+                    and not self.worker_failures[name]
+                ),
+            }
+            for name, last_success in self.worker_heartbeats.items()
+        }
+        try:
+            self.db.execute("SELECT 1").fetchone()
+            state_store_healthy = True
+        except sqlite3.Error:
+            state_store_healthy = False
+        healthy = state_store_healthy and all(worker["healthy"] for worker in workers.values())
+        if self.policy_mode == "production" and self.media_repository is None:
+            healthy = False
+        return {
+            "healthy": healthy,
+            "state_store_healthy": state_store_healthy,
+            "workers": workers,
+        }
+
+    def authorized_ephemeral_media_path(self, user_id: str, media_id: str) -> str:
+        if not MEDIA_ID_PATTERN.fullmatch(media_id):
+            raise SynapseError(404, "Expiring media was not found.", Codes.NOT_FOUND)
+        pair_info = self.pair_for_user(user_id)
+        row = self.db.execute(
+            "SELECT room_id, owner_user_id, state, opened_by, expires_at "
+            "FROM nymph_ephemeral_media WHERE media_id = ?",
+            (media_id,),
+        ).fetchone()
+        if (
+            pair_info is None
+            or pair_info[0] != self.primary_pair_key
+            or row is None
+            or row[0] != self.room_id(pair_info[0])
+            or row[1] == user_id
+            or row[2] != "opened"
+            or row[3] != user_id
+            or row[4] <= now_ms()
+            or self.media_repository is None
+        ):
+            raise SynapseError(403, "This account cannot retrieve this expiring media.", Codes.FORBIDDEN)
+        return self.media_repository.filepaths.local_media_filepath(media_id)
+
+    async def expire_ephemeral_media(self) -> None:
+        if self.media_repository is None:
+            return
+        expired = self.db.execute(
+            "SELECT media_id FROM nymph_ephemeral_media "
+            "WHERE expires_at <= ? AND state != 'deleted' ORDER BY expires_at LIMIT 100",
+            (now_ms(),),
+        ).fetchall()
+        if not expired:
+            return
+        media_ids = [row[0] for row in expired]
+        deleted_ids, _count = await self.media_repository.delete_local_media_ids(media_ids)
+        if set(deleted_ids) != set(media_ids):
+            self.worker_failures["media"] = True
+            logger.error("Server-side expiration did not delete all due media objects.")
+        for media_id in deleted_ids:
+            self.db.execute(
+                "UPDATE nymph_ephemeral_media SET state = 'deleted' WHERE media_id = ?",
+                (media_id,),
+            )
+
     async def check_login_for_spam(
         self,
         user_id: str,
@@ -335,7 +995,7 @@ class NymphPolicy:
         _request_info: Any,
         _auth_provider_id: str | None = None,
     ) -> str | Codes:
-        if user_id not in self.dev_users:
+        if user_id not in self.partner_users:
             return NOT_SPAM
         if not device_id:
             return Codes.FORBIDDEN
@@ -377,36 +1037,73 @@ class NymphPolicy:
             raise
 
     async def on_new_event(self, event: Any, _state: Any) -> None:
-        if event.type != "m.room.create" or event.content.get("m.federate") is not False:
-            return
-        pair_info = self.pair_for_user(event.sender)
-        if pair_info is None:
-            return
-        pair_key, pair = pair_info
-        if event.sender != pair["partner_a"]:
+        if event.type == "m.room.create":
+            if event.content.get("m.federate") is not False:
+                return
+            pair_info = self.pair_for_user(event.sender)
+            if pair_info is None:
+                return
+            pair_key, pair = pair_info
+            if event.sender != pair["partner_a"]:
+                return
+            table = pair["table"]
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.db.execute(
+                    f"SELECT room_id, creation_reserved_at FROM {table} WHERE id = 1"
+                ).fetchone()
+                reserved_at = row[1] if row else None
+                if (
+                    row
+                    and row[0] is None
+                    and reserved_at is not None
+                    and now_ms() - reserved_at <= ROOM_RESERVATION_TTL_MS
+                ):
+                    self.db.execute(
+                        f"UPDATE {table} SET room_id = ?, creation_reserved_at = NULL WHERE id = 1",
+                        (event.room_id,),
+                    )
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
             return
 
-        table = pair["table"]
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            row = self.db.execute(
-                f"SELECT room_id, creation_reserved_at FROM {table} WHERE id = 1"
-            ).fetchone()
-            reserved_at = row[1] if row else None
-            if (
-                row
-                and row[0] is None
-                and reserved_at is not None
-                and now_ms() - reserved_at <= ROOM_RESERVATION_TTL_MS
-            ):
-                self.db.execute(
-                    f"UPDATE {table} SET room_id = ?, creation_reserved_at = NULL WHERE id = 1",
-                    (event.room_id,),
-                )
-            self.db.execute("COMMIT")
-        except Exception:
-            self.db.execute("ROLLBACK")
-            raise
+        if event.type != "m.room.encrypted":
+            return
+        pair_info = self.pair_for_room(event.room_id)
+        event_id = getattr(event, "event_id", None)
+        event_timestamp = getattr(event, "origin_server_ts", None)
+        if (
+            pair_info is None
+            or pair_info[0] != self.primary_pair_key
+            or event.sender not in {pair_info[1]["partner_a"], pair_info[1]["partner_b"]}
+            or not isinstance(event_id, str)
+            or not EVENT_ID_PATTERN.fullmatch(event_id)
+        ):
+            return
+        if not isinstance(event_timestamp, int) or isinstance(event_timestamp, bool):
+            event_timestamp = now_ms()
+        self.db.execute(
+            "INSERT OR IGNORE INTO nymph_seen_room_events "
+            "(event_id, room_id, sender, event_type, origin_server_ts) VALUES (?, ?, ?, ?, ?)",
+            (event_id, event.room_id, event.sender, event.type, event_timestamp),
+        )
+        policy = self.db.execute(
+            "SELECT seconds FROM nymph_retention_policy WHERE room_id = ?",
+            (event.room_id,),
+        ).fetchone()
+        if policy and policy[0] is not None:
+            self.db.execute(
+                "INSERT OR IGNORE INTO nymph_message_expiry "
+                "(event_id, room_id, sender, expires_at, state) VALUES (?, ?, ?, ?, 'scheduled')",
+                (
+                    event_id,
+                    event.room_id,
+                    event.sender,
+                    event_timestamp + policy[0] * 1000,
+                ),
+            )
 
     async def user_may_create_room(self, user_id: str, room_config: dict[str, Any]) -> str | Codes:
         pair_info = self.pair_for_user(user_id)
@@ -647,7 +1344,7 @@ class NymphPolicy:
     async def create_device_replacement(self, request: Any, payload: dict[str, Any]) -> dict[str, Any]:
         requester = await self.api.get_user_by_req(request)
         user_id = requester.user.to_string()
-        if user_id not in self.dev_users:
+        if user_id not in self.partner_users:
             raise SynapseError(403, "Device replacement is available only for development partner accounts.", Codes.FORBIDDEN)
 
         device_id = payload.get("device_id")
@@ -710,7 +1407,7 @@ class NymphPolicy:
         requester = await self.api.get_user_by_req(request)
         user_id = requester.user.to_string()
         active_device_id = getattr(requester, "device_id", None)
-        if user_id not in self.dev_users or not active_device_id:
+        if user_id not in self.partner_users or not active_device_id:
             raise SynapseError(403, "Recovery verification requires an authenticated development partner device.", Codes.FORBIDDEN)
 
         device_id = payload.get("device_id")
@@ -769,7 +1466,7 @@ class NymphPolicy:
         requester = await self.api.get_user_by_req(request)
         user_id = requester.user.to_string()
         device_id = getattr(requester, "device_id", None)
-        if user_id not in self.dev_users or not device_id:
+        if user_id not in self.partner_users or not device_id:
             raise SynapseError(403, "Only an authenticated development partner device can be activated.", Codes.FORBIDDEN)
 
         self.db.execute("BEGIN IMMEDIATE")
@@ -806,7 +1503,7 @@ class NymphPolicy:
         requester = await self.api.get_user_by_req(request)
         user_id = requester.user.to_string()
         device_id = getattr(requester, "device_id", None)
-        if user_id not in self.dev_users or not device_id:
+        if user_id not in self.partner_users or not device_id:
             raise SynapseError(403, "Only an authenticated development partner device can cancel replacement.", Codes.FORBIDDEN)
 
         self.db.execute("BEGIN IMMEDIATE")

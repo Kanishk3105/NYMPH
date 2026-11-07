@@ -11,9 +11,10 @@
     "android:debug": "npm run android:sync && cd android && gradlew.bat assembleDebug",
     "android:release": "node scripts/validate-production-env.mjs && npm run build && npx cap sync android && cd android && gradlew.bat assembleRelease",
     "preview": "vite preview --host 0.0.0.0",
-    "test": "node --experimental-strip-types --test src/sticker-library.test.ts src/matrix/MessagingClient.test.ts src/matrix/encrypted-attachment.test.ts src/matrix/homeserver.test.ts src/matrix/partner-identity.test.ts src/matrix/state-storage.test.ts src/matrix/recovery-export.test.ts src/matrix/recovery-device-cleanup.test.ts backend/secure-backup.test.mjs tests/e2e/matrix-runtime-config.test.mjs",
+    "test": "node --experimental-strip-types --test src/sticker-library.test.ts src/notifications/mood-notifications.test.ts src/matrix/MessagingClient.test.ts src/matrix/encrypted-attachment.test.ts src/matrix/media-thumbnail.test.ts src/matrix/homeserver.test.ts src/matrix/partner-identity.test.ts src/matrix/state-storage.test.ts src/matrix/recovery-export.test.ts src/matrix/recovery-export-session.test.ts src/matrix/recovery-device-cleanup.test.ts backend/secure-backup.test.mjs tests/e2e/matrix-runtime-config.test.mjs scripts/validate-production-env.test.mjs",
     "test:matrix:live": "playwright test --config=playwright.matrix.config.ts",
     "test:matrix:dev-live": "playwright test --config=playwright.matrix.config.ts",
+    "test:ui": "playwright test --config=playwright.ui.config.ts",
     "validate:matrix-e2e-config": "node --test tests/e2e/matrix-runtime-config.test.mjs"
   },
   "dependencies": {
@@ -22,6 +23,7 @@
     "@capacitor/android": "^8.6.0",
     "@capacitor/app": "^8.1.2",
     "@capacitor/core": "^8.6.0",
+    "@capacitor/local-notifications": "^8.3.1",
     "@capacitor/splash-screen": "^8.0.2",
     "@capacitor/status-bar": "^8.0.4",
     "@vitejs/plugin-react": "^4.3.4",

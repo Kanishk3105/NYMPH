@@ -1,41 +1,34 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { build, preview } from 'vite';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const viteCli = fileURLToPath(new URL('../node_modules/vite/bin/vite.js', import.meta.url));
-const build = spawnSync(process.execPath, [
-  viteCli,
-  'build',
-  '--mode',
-  'development',
-  '--config',
-  'vite.matrix-e2e.config.ts',
-], {
-  cwd: root,
-  stdio: 'inherit',
+const configFile = fileURLToPath(new URL('../vite.matrix-e2e.config.ts', import.meta.url));
+process.chdir(root);
+
+await build({ configFile, mode: 'development' });
+
+const server = await preview({
+  configFile,
+  mode: 'development',
+  preview: {
+    host: '127.0.0.1',
+    port: 5174,
+    strictPort: true,
+  },
 });
+server.printUrls();
 
-if (build.status !== 0) process.exit(build.status ?? 1);
-
-const server = spawn(process.execPath, [
-  viteCli,
-  'preview',
-  '--config',
-  'vite.matrix-e2e.config.ts',
-  '--host',
-  '127.0.0.1',
-  '--port',
-  '5174',
-  '--strictPort',
-], {
-  cwd: root,
-  stdio: 'inherit',
-});
-
+let stopping = false;
 function stopServer() {
-  if (!server.killed) server.kill();
+  if (stopping) return;
+  stopping = true;
+  server.httpServer.close((error) => {
+    if (error) {
+      console.error('Could not stop the isolated Matrix harness server cleanly.', error);
+      process.exitCode = 1;
+    }
+  });
 }
 
-process.on('SIGINT', stopServer);
-process.on('SIGTERM', stopServer);
-server.on('exit', (code) => process.exit(code ?? 0));
+process.once('SIGINT', stopServer);
+process.once('SIGTERM', stopServer);

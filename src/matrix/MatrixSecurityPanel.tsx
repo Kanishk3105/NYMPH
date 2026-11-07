@@ -458,7 +458,7 @@ export function MatrixSecurityPanel({
           {verification.error && <p className="form-error">{verification.error}</p>}
           {verification.phase === 'Requested' && !verification.initiatedByMe && <button className="secondary full-button" onClick={() => void client?.acceptVerification(verification.id).catch((error: unknown) => onNotify(error instanceof Error ? error.message : 'Could not accept verification.'))}>Accept verification request</button>}
           {verification.phase === 'Ready' && <>
-            <button className="secondary full-button" disabled={busy} onClick={() => void startSas()}>Compare emoji / numbers</button>
+            {verification.localInitiator && <button className="secondary full-button" disabled={busy} onClick={() => void startSas()}>Compare emoji / numbers</button>}
             <button className="secondary full-button" disabled={busy} onClick={() => void makeVerificationQr()}>Show Matrix verification QR</button>
             <button className="secondary full-button" disabled={busy} onClick={() => void startQrScanner()}>Scan partner’s Matrix QR</button>
           </>}

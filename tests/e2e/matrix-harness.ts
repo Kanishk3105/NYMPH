@@ -98,7 +98,13 @@ type HarnessState = {
   redactedEventIds: string[];
   connect(connection: HarnessSession, storageKey?: number[]): Promise<void>;
   disconnect(): void;
-  passwordLogin(userId: string, password: string, deviceName: string, deviceId?: string): Promise<HarnessSession>;
+  passwordLogin(
+    userId: string,
+    password: string,
+    deviceName: string,
+    deviceId?: string,
+    allowRateLimitRetries?: boolean,
+  ): Promise<HarnessSession>;
   roomStatus(connection: HarnessSession): Promise<{ room_id: string }>;
   createInvitation(connection: HarnessSession): Promise<unknown>;
   encodeInvitationQr(invite: unknown): Promise<string>;
@@ -242,19 +248,22 @@ const state: HarnessState = {
     this.client = null;
     activeConnection = null;
   },
-  async passwordLogin(userId, password, deviceName, deviceId) {
+  async passwordLogin(userId, password, deviceName, deviceId, allowRateLimitRetries = true) {
     const pair = partnerPairs.find(([partnerA, partnerB]) => userId === partnerA || userId === partnerB);
     if (!pair) throw new Error('The requested login is not a configured NYMPH partner account.');
     const [partnerA, partnerB] = pair;
     const { createClient } = await import('matrix-js-sdk');
     const loginClient = createClient({ baseUrl: apiBase });
     try {
-      const session = await loginWithRateLimitRetry(() => loginClient.login('m.login.password', {
-          identifier: { type: 'm.id.user', user: userId },
-          password,
-          initial_device_display_name: deviceName,
-          device_id: deviceId ?? crypto.randomUUID(),
-        }));
+      const login = () => loginClient.login('m.login.password', {
+      identifier: { type: 'm.id.user', user: userId },
+      password,
+      initial_device_display_name: deviceName,
+      device_id: deviceId ?? crypto.randomUUID(),
+    });
+      const session = allowRateLimitRetries
+        ? await loginWithRateLimitRetry(login)
+        : await login();
       return {
         homeserver: apiBase,
         userId: session.user_id,

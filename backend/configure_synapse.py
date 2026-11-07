@@ -1,11 +1,23 @@
 import os
 import pathlib
+import re
 import tempfile
 
 import yaml
 
 
 CONFIG_PATH = pathlib.Path("/data/homeserver.yaml")
+DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+RESERVED_SUFFIXES = (
+    ".localhost",
+    ".local",
+    ".test",
+    ".example",
+    ".invalid",
+    ".example.com",
+    ".example.org",
+    ".example.net",
+)
 
 
 def read_secret(path_variable: str) -> str:
@@ -15,26 +27,36 @@ def read_secret(path_variable: str) -> str:
     value = pathlib.Path(path).read_text(encoding="utf-8").strip()
     if not value:
         raise RuntimeError(f"{path_variable} points to an empty secret")
+    if len(value) < 32:
+        raise RuntimeError(f"{path_variable} must contain at least 32 characters")
     return value
 
 
-def main() -> None:
-    if not CONFIG_PATH.is_file():
-        raise RuntimeError("Synapse config is missing. Run the init-profile config generation first.")
+def validate_server_name(server_name: str) -> None:
+    labels = server_name.split(".")
+    if (
+        server_name != server_name.lower()
+        or len(labels) < 2
+        or any(not DNS_LABEL.fullmatch(label) for label in labels)
+        or any(server_name == suffix.lstrip(".") or server_name.endswith(suffix) for suffix in RESERVED_SUFFIXES)
+    ):
+        raise RuntimeError("MATRIX_SERVER_NAME must be a lowercase production DNS hostname, not a reserved or development name.")
 
-    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    server_name = os.environ["SYNAPSE_SERVER_NAME"]
+
+def apply_production_policy(config: dict, server_name: str) -> dict:
+    validate_server_name(server_name)
     if config.get("server_name") != server_name:
         raise RuntimeError("MATRIX_SERVER_NAME must match the server name in the generated config.")
 
     config["report_stats"] = False
+    config["public_baseurl"] = f"https://{server_name}/"
     config["enable_registration"] = False
     config["allow_guest_access"] = False
     config["block_non_admin_invites"] = True
     config["allow_public_rooms"] = False
     config["allow_public_rooms_over_federation"] = False
     config["require_auth_for_profile_requests"] = True
-    config["federation_domain_whitelist"] = []
+    config["federation_domain_whitelist"] = [server_name]
 
     listeners = config.get("listeners")
     if not isinstance(listeners, list) or not listeners:
@@ -51,6 +73,16 @@ def main() -> None:
         for resource in listener.get("resources", [])
     ):
         raise RuntimeError("Synapse HTTP listener has no client API after federation was disabled.")
+    return config
+
+
+def main() -> None:
+    if not CONFIG_PATH.is_file():
+        raise RuntimeError("Synapse config is missing. Run the init-profile config generation first.")
+
+    config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    server_name = os.environ["SYNAPSE_SERVER_NAME"]
+    config = apply_production_policy(config, server_name)
 
     config["database"] = {
         "name": "psycopg2",

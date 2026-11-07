@@ -22,12 +22,32 @@ import type {
 import { MsgType, RelationType } from 'matrix-js-sdk/lib/@types/event.js';
 import type { ReactionEventContent, RoomMessageEventContent } from 'matrix-js-sdk/lib/@types/events.js';
 import type { EncryptedFile } from 'matrix-js-sdk/lib/@types/media.js';
+import { MatrixEventEvent } from 'matrix-js-sdk/lib/models/event.js';
 import { RoomMemberEvent } from 'matrix-js-sdk/lib/models/room-member.js';
 import { revokeRecoveryVerifier, writeRecoveryMarkerAfterCleanup } from './recovery-device-cleanup.ts';
 import { decryptAttachment, encryptAttachment, isEncryptedAttachment } from './encrypted-attachment.ts';
 
 export type NymphMode = 'romantic' | 'flirty' | 'spicy' | 'kinky';
 export type NymphEventKind = 'text' | 'mood' | 'sticker' | 'media' | 'reaction';
+export type StickerSync = {
+  operation: 'pack-upsert';
+  packId: string;
+  packName: string;
+  adult: boolean;
+  description: string;
+  categories: string[];
+  coverStickerId?: string;
+  stickerId?: string;
+  stickerName?: string;
+  stickerType?: string;
+} | {
+  operation: 'pack-delete';
+  packId: string;
+} | {
+  operation: 'favorite' | 'recent';
+  stickerId: string;
+  active?: boolean;
+};
 
 export interface MatrixConnection {
   homeserver: string;
@@ -50,8 +70,16 @@ export interface NymphEnvelope {
   replyToEventId?: string;
   reactionTo?: string;
   attachment?: EncryptedFile;
+  thumbnailAttachment?: EncryptedFile;
   mediaType?: string;
   mediaName?: string;
+  durationMs?: number;
+  waveform?: number[];
+  viewOnceSeconds?: number;
+  viewOncePendingExpiresAt?: number;
+  viewOnceReceipt?: { messageId: string; expiresAt: number };
+  retentionPolicy?: { seconds: number | null };
+  stickerSync?: StickerSync;
 }
 
 export interface ReceivedNymphEvent extends NymphEnvelope {
@@ -72,6 +100,7 @@ export interface MatrixVerification {
   userId: string;
   deviceId?: string;
   initiatedByMe: boolean;
+  localInitiator: boolean;
   phase: string;
   sas?: {
     emoji?: [string, string][];
@@ -103,8 +132,36 @@ export interface MatrixMessagingClient {
   readonly userId: string;
   readonly deviceId: string;
   send(envelope: NymphEnvelope): Promise<string>;
-  sendAttachment(file: File, envelope: NymphEnvelope): Promise<{ eventId: string; attachment: EncryptedFile }>;
-  downloadAttachment(file: EncryptedFile, mediaType: string): Promise<Blob>;
+  sendAttachment(
+    file: File,
+    envelope: NymphEnvelope,
+    options?: {
+      thumbnail?: File;
+      signal?: AbortSignal;
+      onProgress?: (progress: number) => void;
+      pendingExpirySeconds?: number;
+    },
+  ): Promise<{
+    eventId: string;
+    attachment: EncryptedFile;
+    thumbnailAttachment?: EncryptedFile;
+    viewOncePendingExpiresAt?: number;
+  }>;
+  downloadAttachment(
+    file: EncryptedFile,
+    mediaType: string,
+    options?: { signal?: AbortSignal; onProgress?: (progress: number) => void },
+  ): Promise<Blob>;
+  openEphemeralMedia(file: EncryptedFile): Promise<number>;
+  getRetentionPolicy(): Promise<{ seconds: number | null; eventTimestamp: number | null; eventId: string | null }>;
+  reconcileExpiredMessages(eventIds: string[]): Promise<string[]>;
+  synchronizeRetentionPolicy(seconds: number | null, eventId: string): Promise<{
+    seconds: number | null;
+    eventTimestamp: number;
+    eventId: string;
+    applied: boolean;
+  }>;
+  registerMessageRelation(childEventId: string, parentEventId: string): Promise<void>;
   markRead(eventId: string): Promise<void>;
   setTyping(isTyping: boolean): Promise<void>;
   getSecurityState(): Promise<MatrixSecurityState>;
@@ -134,11 +191,39 @@ type TypingListener = (typing: boolean) => void;
 type VerificationListener = (verification: MatrixVerification | null) => void;
 type SecurityListener = (state: MatrixSecurityState) => void;
 type ReadListener = (eventId: string) => void;
+type RedactionListener = (eventId: string) => void;
 const ENVELOPE_PREFIX = 'nymph.v1:';
 const RECOVERY_VERIFICATION_EVENT = 'org.nymph.security.recovery_verification';
 
+function normalizeMediaType(mediaType: string | undefined): string {
+  if (!mediaType) return 'application/octet-stream';
+  const normalized = mediaType.split(';', 1)[0]?.trim().toLowerCase();
+  return normalized || 'application/octet-stream';
+}
+
 function isMode(value: unknown): value is NymphMode {
   return value === 'romantic' || value === 'flirty' || value === 'spicy' || value === 'kinky';
+}
+
+function isStickerSync(value: unknown): value is StickerSync {
+  if (!value || typeof value !== 'object') return false;
+  const sync = value as Record<string, unknown>;
+  if (sync.operation === 'pack-delete') return typeof sync.packId === 'string';
+  if (sync.operation === 'favorite' || sync.operation === 'recent') {
+    return typeof sync.stickerId === 'string' &&
+      (sync.operation === 'recent' || sync.active === undefined || typeof sync.active === 'boolean');
+  }
+  return sync.operation === 'pack-upsert' &&
+    typeof sync.packId === 'string' &&
+    typeof sync.packName === 'string' &&
+    typeof sync.adult === 'boolean' &&
+    typeof sync.description === 'string' &&
+    Array.isArray(sync.categories) &&
+    sync.categories.every((category) => typeof category === 'string') &&
+    (sync.coverStickerId === undefined || typeof sync.coverStickerId === 'string') &&
+    (sync.stickerId === undefined || typeof sync.stickerId === 'string') &&
+    (sync.stickerName === undefined || typeof sync.stickerName === 'string') &&
+    (sync.stickerType === undefined || typeof sync.stickerType === 'string');
 }
 
 export function encodeEnvelope(envelope: NymphEnvelope): string {
@@ -169,7 +254,39 @@ export function decodeEnvelopeBody(
       (payload.attachment !== undefined &&
         (!isEncryptedAttachment(payload.attachment) ||
           typeof payload.mediaType !== 'string' ||
-          typeof payload.mediaName !== 'string'))
+          typeof payload.mediaName !== 'string')) ||
+      (payload.durationMs !== undefined &&
+        (typeof payload.durationMs !== 'number' || !Number.isFinite(payload.durationMs) || payload.durationMs < 0)) ||
+      (payload.viewOnceSeconds !== undefined &&
+        (payload.kind !== 'media' ||
+          !payload.attachment ||
+          typeof payload.viewOnceSeconds !== 'number' ||
+          !Number.isInteger(payload.viewOnceSeconds) ||
+          payload.viewOnceSeconds < 1 ||
+          payload.viewOnceSeconds > 86_400)) ||
+      (payload.viewOncePendingExpiresAt !== undefined &&
+        (typeof payload.viewOncePendingExpiresAt !== 'number' ||
+          !Number.isFinite(payload.viewOncePendingExpiresAt))) ||
+      (payload.viewOnceReceipt !== undefined &&
+        (payload.kind !== 'text' ||
+          !payload.viewOnceReceipt ||
+          typeof payload.viewOnceReceipt.messageId !== 'string' ||
+          typeof payload.viewOnceReceipt.expiresAt !== 'number' ||
+          !Number.isFinite(payload.viewOnceReceipt.expiresAt))) ||
+      (payload.retentionPolicy !== undefined &&
+        (!payload.retentionPolicy ||
+          (payload.retentionPolicy.seconds !== null &&
+            (typeof payload.retentionPolicy.seconds !== 'number' ||
+              !Number.isInteger(payload.retentionPolicy.seconds) ||
+              payload.retentionPolicy.seconds < 1 ||
+              payload.retentionPolicy.seconds > 31_536_000)))) ||
+      (payload.waveform !== undefined &&
+        (!Array.isArray(payload.waveform) ||
+          payload.waveform.length > 64 ||
+          payload.waveform.some((sample) => typeof sample !== 'number' || !Number.isFinite(sample) || sample < 0 || sample > 1))) ||
+      (payload.stickerSync !== undefined && !isStickerSync(payload.stickerSync)) ||
+      (payload.thumbnailAttachment !== undefined &&
+        (!isEncryptedAttachment(payload.thumbnailAttachment) || !isEncryptedAttachment(payload.attachment)))
     ) return undefined;
 
     return {
@@ -220,9 +337,9 @@ function waitForInitialSync(
   initialSyncLimit = 50,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timeout = window.setTimeout(() => reject(new Error('Timed out waiting for the homeserver sync.')), 30_000);
+    const timeout = window.setTimeout(() => reject(new Error('Timed out waiting for the homeserver sync.')), 90_000);
     const onSync = (state: string) => {
-      if (state === 'PREPARED') {
+      if (state === 'PREPARED' || state === 'SYNCING') {
         window.clearTimeout(timeout);
         client.removeListener(syncEvent, onSync);
         resolve();
@@ -276,6 +393,7 @@ export async function connectMatrix(
   onSecurityChange: SecurityListener = () => undefined,
   onTyping: TypingListener = () => undefined,
   onRead: ReadListener = () => undefined,
+  onRedaction: RedactionListener = () => undefined,
 ): Promise<MatrixMessagingClient> {
   const sdk = await import('matrix-js-sdk');
   const homeserver = new URL(credentials.homeserver);
@@ -334,6 +452,7 @@ export async function connectMatrix(
   const verifiers = new Map<string, Verifier>();
   const sasCallbacks = new Map<string, ShowSasCallbacks>();
   const verificationKeys = new WeakMap<VerificationRequest, string>();
+  const locallyInitiatedVerifications = new WeakSet<VerificationRequest>();
   let previousPartnerDeviceIds: Set<string> | undefined;
   const publishVerification = (request: VerificationRequest, extra: Partial<MatrixVerification> = {}) => {
     const id = request.transactionId ?? verificationKeys.get(request) ?? crypto.randomUUID();
@@ -344,11 +463,13 @@ export async function connectMatrix(
       userId: request.otherUserId,
       deviceId: request.otherDeviceId,
       initiatedByMe: request.initiatedByMe,
+      localInitiator: locallyInitiatedVerifications.has(request),
       phase: VerificationPhase[request.phase],
       ...extra,
     });
   };
   const attachVerifier = (id: string, verifier: Verifier) => {
+    if (verifiers.has(id)) return;
     verifiers.set(id, verifier);
     verifier.on(VerifierEvent.ShowSas, (sas) => {
       sasCallbacks.set(id, sas);
@@ -417,13 +538,13 @@ export async function connectMatrix(
     const publishedSigningKeys = await cryptoApi.getUserCrossSigningKeys(credentials.userId);
     const publishedSigningKeyIds = {
       master_key: publishedSigningKeys?.[CrossSigningKey.Master]
-        ? Object.keys(publishedSigningKeys[CrossSigningKey.Master].keys)[0]
+        ? Object.values(publishedSigningKeys[CrossSigningKey.Master].keys)[0]
         : undefined,
       self_signing_key: publishedSigningKeys?.[CrossSigningKey.SelfSigning]
-        ? Object.keys(publishedSigningKeys[CrossSigningKey.SelfSigning].keys)[0]
+        ? Object.values(publishedSigningKeys[CrossSigningKey.SelfSigning].keys)[0]
         : undefined,
       user_signing_key: publishedSigningKeys?.[CrossSigningKey.UserSigning]
-        ? Object.keys(publishedSigningKeys[CrossSigningKey.UserSigning].keys)[0]
+        ? Object.values(publishedSigningKeys[CrossSigningKey.UserSigning].keys)[0]
         : undefined,
     };
     const verifiedSigningIds = recoveryVerification?.cross_signing_key_ids;
@@ -459,7 +580,12 @@ export async function connectMatrix(
 
   const onVerificationRequest = (request: VerificationRequest) => {
     publishVerification(request);
-    request.on(VerificationRequestEvent.Change, () => publishVerification(request));
+    request.on(VerificationRequestEvent.Change, () => {
+      publishVerification(request);
+      const id = verificationKeys.get(request);
+      const verifier = request.verifier;
+      if (id && verifier) attachVerifier(id, verifier);
+    });
   };
   const onUserTrustChanged = (userId: string) => {
     if (userId === credentials.partnerUserId) refreshSecuritySafely();
@@ -497,13 +623,142 @@ export async function connectMatrix(
     await assertPairMembership(client, credentials);
     await waitForRoomEncryption(() => cryptoApi.isEncryptionEnabledInRoom(credentials.roomId));
 
+    const policyRequest = async <T>(path: string, body?: unknown): Promise<T> => {
+      const response = await fetch(new URL(path, homeserver), {
+        method: 'POST',
+        credentials: 'omit',
+        headers: {
+          Authorization: `Bearer ${credentials.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body ?? {}),
+        cache: 'no-store',
+        redirect: 'error',
+      });
+      if (!response.ok) throw new Error(`The server-side retention request failed (HTTP ${response.status}).`);
+      return response.json() as Promise<T>;
+    };
+    const synchronizeRetentionPolicy = async (seconds: number | null, eventId: string) => {
+      if (
+        (seconds !== null &&
+          (!Number.isInteger(seconds) || seconds < 1 || seconds > 31_536_000)) ||
+        typeof eventId !== 'string' ||
+        !/^\$[A-Za-z0-9._=:-]{1,255}$/.test(eventId)
+      ) {
+        throw new Error('The encrypted retention policy is invalid.');
+      }
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          const result = await policyRequest<{
+            seconds: number | null;
+            event_timestamp: number;
+            event_id: string;
+            applied: boolean;
+          }>('/_synapse/client/nymph/retention/set', { seconds, event_id: eventId });
+          if (
+            (result.seconds !== null &&
+              (!Number.isInteger(result.seconds) || result.seconds < 1 || result.seconds > 31_536_000)) ||
+            !Number.isSafeInteger(result.event_timestamp) ||
+            typeof result.event_id !== 'string' ||
+            typeof result.applied !== 'boolean'
+          ) throw new Error('The server returned an invalid retention policy.');
+          return {
+            seconds: result.seconds,
+            eventTimestamp: result.event_timestamp,
+            eventId: result.event_id,
+            applied: result.applied,
+          };
+        } catch (error) {
+          lastError = error;
+          if (!(error instanceof Error) || !error.message.includes('HTTP 404') || attempt === 4) break;
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 150));
+        }
+      }
+      throw lastError instanceof Error ? lastError : new Error('Server-side message retention could not be synchronized.');
+    };
+    const registerMessageRelation = async (childEventId: string, parentEventId: string) => {
+      if (
+        !/^\$[A-Za-z0-9._=:-]{1,255}$/.test(childEventId) ||
+        !/^\$[A-Za-z0-9._=:-]{1,255}$/.test(parentEventId)
+      ) throw new Error('The message relation is invalid.');
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          await policyRequest('/_synapse/client/nymph/retention/relation', {
+            child_event_id: childEventId,
+            parent_event_id: parentEventId,
+          });
+          return;
+        } catch (error) {
+          lastError = error;
+          if (!(error instanceof Error) || !error.message.includes('HTTP 404') || attempt === 4) break;
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 150));
+        }
+      }
+      throw lastError instanceof Error ? lastError : new Error('The message relation could not be synchronized.');
+    };
+    const reconcileExpiredMessages = async (eventIds: string[]) => {
+      if (!Array.isArray(eventIds) || eventIds.some((eventId) =>
+        typeof eventId !== 'string' || !/^\$[A-Za-z0-9._=:-]{1,255}$/.test(eventId)
+      )) {
+        throw new Error('The message-expiry reconciliation request is invalid.');
+      }
+      const uniqueEventIds = [...new Set(eventIds)];
+      const expiredEventIds = new Set<string>();
+      for (let offset = 0; offset < uniqueEventIds.length; offset += 100) {
+        const batch = uniqueEventIds.slice(offset, offset + 100);
+        const result = await policyRequest<{ expired_event_ids: string[] }>(
+          '/_synapse/client/nymph/retention/reconcile',
+          { event_ids: batch },
+        );
+        if (
+          !result ||
+          typeof result !== 'object' ||
+          !Array.isArray(result.expired_event_ids) ||
+          result.expired_event_ids.some((eventId) =>
+            typeof eventId !== 'string' || !batch.includes(eventId)
+          )
+        ) {
+          throw new Error('The server returned an invalid expired-message reconciliation result.');
+        }
+        for (const eventId of result.expired_event_ids) expiredEventIds.add(eventId);
+      }
+      return [...expiredEventIds];
+    };
+    const handleDecodedMessage = (message: ReceivedNymphEvent) => {
+      if (message.retentionPolicy) {
+        void synchronizeRetentionPolicy(message.retentionPolicy.seconds, message.eventId)
+          .then((policy) => onMessage({
+            ...message,
+            retentionPolicy: { seconds: policy.seconds },
+          }))
+          .catch((error: unknown) => {
+            onStatus(error instanceof Error ? error.message : 'Server-side message retention could not be synchronized.');
+            onMessage(message);
+          });
+        return;
+      }
+      const parentEventId = message.replyToEventId ?? message.reactionTo;
+      if (parentEventId) {
+        void registerMessageRelation(message.eventId, parentEventId).catch((error: unknown) => {
+          onStatus(error instanceof Error ? error.message : 'The reply or reaction expiry could not be synchronized.');
+        });
+      }
+      onMessage(message);
+    };
     const receive = (event: MatrixEvent, eventRoom: Room | undefined, toStartOfTimeline?: boolean, removed?: boolean) => {
       if (removed || toStartOfTimeline || eventRoom?.roomId !== credentials.roomId) return;
       const sender = event.getSender();
       if (sender !== credentials.partnerUserId && sender !== credentials.userId) return;
+      if (event.getType() === sdk.EventType.RoomRedaction) {
+        const redactedEventId = event.event.redacts;
+        if (typeof redactedEventId === 'string') onRedaction(redactedEventId);
+        return;
+      }
       if (event.getType() !== sdk.EventType.RoomMessage && event.getType() !== sdk.EventType.Reaction) return;
       const message = decodeEnvelope(event);
-      if (message) onMessage(message);
+      if (message) handleDecodedMessage(message);
     };
     const onTypingEvent = (_event: MatrixEvent, member: { userId: string; typing: boolean }) => {
       if (member.userId === credentials.partnerUserId) onTyping(member.typing);
@@ -521,16 +776,40 @@ export async function connectMatrix(
         ) onRead(eventId);
       }
     };
+    const onDecryptedEvent = (event: MatrixEvent, error?: Error) => {
+      if (error) return;
+      const eventRoomId = event.getRoomId();
+      if (!eventRoomId) return;
+      const eventRoom = client.getRoom(eventRoomId);
+      if (!eventRoom) return;
+      receive(event, eventRoom, false, false);
+    };
     client.on(sdk.RoomEvent.Timeline, receive);
+    client.on(MatrixEventEvent.Decrypted, onDecryptedEvent);
     client.on(RoomMemberEvent.Typing, onTypingEvent);
     client.on(sdk.RoomEvent.Receipt, onReceiptEvent);
 
     for (const event of room.getLiveTimeline().getEvents()) {
       const sender = event.getSender();
       if (sender !== credentials.partnerUserId && sender !== credentials.userId) continue;
+      if (event.getType() === sdk.EventType.RoomRedaction) {
+        const redactedEventId = event.event.redacts;
+        if (typeof redactedEventId === 'string') onRedaction(redactedEventId);
+        continue;
+      }
       if (event.getType() !== sdk.EventType.RoomMessage && event.getType() !== sdk.EventType.Reaction) continue;
       const message = decodeEnvelope(event);
-      if (message) onMessage(message);
+      if (message) handleDecodedMessage(message);
+    }
+    const initialRoomEventIds = room.getLiveTimeline().getEvents()
+      .filter((event) =>
+        (event.getSender() === credentials.partnerUserId || event.getSender() === credentials.userId) &&
+        (event.getType() === sdk.EventType.RoomMessage || event.getType() === sdk.EventType.Reaction)
+      )
+      .map((event) => event.getId())
+      .filter((eventId): eventId is string => typeof eventId === 'string');
+    for (const eventId of await reconcileExpiredMessages(initialRoomEventIds)) {
+      onRedaction(eventId);
     }
     await refreshSecurity();
 
@@ -547,6 +826,27 @@ export async function connectMatrix(
     return {
       userId: credentials.userId,
       deviceId: client.getDeviceId() ?? '',
+      async getRetentionPolicy() {
+        const result = await policyRequest<{
+          seconds: number | null;
+          event_timestamp: number | null;
+          event_id: string | null;
+        }>('/_synapse/client/nymph/retention/status');
+        if (
+          (result.seconds !== null &&
+            (!Number.isInteger(result.seconds) || result.seconds < 1 || result.seconds > 31_536_000)) ||
+          (result.event_timestamp !== null && !Number.isSafeInteger(result.event_timestamp)) ||
+          (result.event_id !== null && typeof result.event_id !== 'string')
+        ) throw new Error('The server returned an invalid current retention policy.');
+        return {
+          seconds: result.seconds,
+          eventTimestamp: result.event_timestamp,
+          eventId: result.event_id,
+        };
+      },
+      synchronizeRetentionPolicy,
+      reconcileExpiredMessages,
+      registerMessageRelation,
       async send(envelope) {
         await assertPairMembership(client, credentials);
         await requireVerifiedPartner();
@@ -561,6 +861,7 @@ export async function connectMatrix(
             'org.nymph.mode': envelope.mode,
           };
           const result = await client.sendEvent(credentials.roomId, sdk.EventType.Reaction, reactionContent);
+          await registerMessageRelation(result.event_id, envelope.reactionTo);
           return result.event_id;
         }
         const content: RoomMessageEventContent = {
@@ -573,49 +874,261 @@ export async function connectMatrix(
           };
         }
         const result = await client.sendMessage(credentials.roomId, content);
+        if (envelope.replyToEventId) {
+          await registerMessageRelation(result.event_id, envelope.replyToEventId);
+        }
+        if (envelope.retentionPolicy) {
+          await synchronizeRetentionPolicy(envelope.retentionPolicy.seconds, result.event_id);
+        }
         return result.event_id;
       },
-      async sendAttachment(file, envelope) {
+      async sendAttachment(file, envelope, options = {}) {
         if (!['media', 'sticker'].includes(envelope.kind) || file.size <= 0) {
           throw new Error('Choose a non-empty photo, video, or voice recording to send.');
         }
-        if (typeof envelope.mediaType !== 'string' || typeof envelope.mediaName !== 'string') {
+        const normalizedMimeType = normalizeMediaType(envelope.mediaType || file.type);
+        if (
+          typeof envelope.mediaType !== 'string' ||
+          (!normalizedMimeType.startsWith('image/') &&
+            !normalizedMimeType.startsWith('video/') &&
+            !normalizedMimeType.startsWith('audio/')) ||
+          typeof envelope.mediaName !== 'string'
+        ) {
           throw new Error('Encrypted media is missing its content type or display name.');
         }
         if (file.size > 40 * 1024 * 1024) {
           throw new Error('Encrypted media is limited to 40 MB on this device.');
         }
+        if (options.thumbnail && options.thumbnail.size > 2 * 1024 * 1024) {
+          throw new Error('The encrypted media preview exceeds the 2 MB limit.');
+        }
         await assertPairMembership(client, credentials);
         await requireVerifiedPartner();
-        const { ciphertext, file: encryptedMetadata } = await encryptAttachment(await file.arrayBuffer());
-        const upload = await client.uploadContent(
-          new Blob([ciphertext], { type: 'application/octet-stream' }),
-          { type: 'application/octet-stream', includeFilename: false },
-        );
-        const content: RoomMessageEventContent = {
-          msgtype: MsgType.Text,
-          body: encodeEnvelope({
-            ...envelope,
-            kind: 'media',
-            attachment: { ...encryptedMetadata, url: upload.content_uri },
-            mediaType: file.type || 'application/octet-stream',
-            mediaName: file.name,
-          }),
+        const signal = options.signal;
+        if (
+          options.pendingExpirySeconds !== undefined &&
+          (!Number.isInteger(options.pendingExpirySeconds) ||
+            options.pendingExpirySeconds < 1 ||
+            options.pendingExpirySeconds > 2_592_000)
+        ) {
+          throw new Error('Unopened-media expiry must be between 1 second and 30 days.');
+        }
+        const assertNotAborted = () => {
+          if (signal?.aborted) throw new DOMException('Media transfer cancelled.', 'AbortError');
         };
-        const result = await client.sendMessage(credentials.roomId, content);
-        return {
-          eventId: result.event_id,
-          attachment: { ...encryptedMetadata, url: upload.content_uri },
-        };
+        const uploadController = new AbortController();
+        const abortUpload = () => uploadController.abort();
+        if (signal?.aborted) abortUpload();
+        else signal?.addEventListener('abort', abortUpload, { once: true });
+        try {
+          assertNotAborted();
+          const thumbnailEncrypted = options.thumbnail
+            ? await encryptAttachment(await options.thumbnail.arrayBuffer())
+            : undefined;
+          assertNotAborted();
+          const mediaEncrypted = await encryptAttachment(await file.arrayBuffer());
+          assertNotAborted();
+          const thumbnailSize = thumbnailEncrypted?.ciphertext.byteLength ?? 0;
+          const totalSize = thumbnailSize + mediaEncrypted.ciphertext.byteLength;
+          let uploaded = 0;
+          const uploadEncrypted = async (ciphertext: ArrayBuffer, offset: number) => client.uploadContent(
+            new Blob([ciphertext], { type: 'application/octet-stream' }),
+            {
+              type: 'application/octet-stream',
+              includeFilename: false,
+              abortController: uploadController,
+              progressHandler: ({ loaded }) => {
+                options.onProgress?.(
+                  totalSize
+                    ? Math.min(99, Math.round(((offset + Math.min(loaded, ciphertext.byteLength)) / totalSize) * 100))
+                    : 0,
+                );
+              },
+            },
+          );
+          let thumbnailAttachment: EncryptedFile | undefined;
+          if (thumbnailEncrypted) {
+            const thumbnailUpload = await uploadEncrypted(thumbnailEncrypted.ciphertext, 0);
+            thumbnailAttachment = { ...thumbnailEncrypted.file, url: thumbnailUpload.content_uri };
+            uploaded = thumbnailEncrypted.ciphertext.byteLength;
+          }
+          assertNotAborted();
+          const mediaUpload = await uploadEncrypted(mediaEncrypted.ciphertext, uploaded);
+          assertNotAborted();
+          const normalizedMediaType = normalizeMediaType(file.type || envelope.mediaType);
+          let attachment: EncryptedFile = { ...mediaEncrypted.file, url: mediaUpload.content_uri };
+          let viewOncePendingExpiresAt: number | undefined;
+          if (envelope.viewOnceSeconds !== undefined) {
+            if (envelope.kind !== 'media' || !Number.isInteger(envelope.viewOnceSeconds) ||
+              envelope.viewOnceSeconds < 1 || envelope.viewOnceSeconds > 86_400 || thumbnailEncrypted) {
+              throw new Error('View-once media requires a valid viewing timer and no thumbnail.');
+            }
+            const mxcReference = mediaUpload.content_uri.match(/^mxc:\/\/([^/]+)\/([A-Za-z0-9._=-]{1,255})$/);
+            const matrixServerName = credentials.userId.slice(credentials.userId.indexOf(':') + 1);
+            if (
+              !mxcReference ||
+              (mxcReference[1] !== matrixServerName && mxcReference[1] !== homeserver.host)
+            ) {
+              throw new Error('The homeserver returned an invalid expiring-media upload reference.');
+            }
+            const mediaId = mxcReference[2];
+            const accessToken = client.getAccessToken();
+            if (!accessToken) throw new Error('The Matrix session is no longer authorized to register expiring media.');
+            const registration = await fetch(new URL('/_synapse/client/nymph/media/register', homeserver), {
+              method: 'POST',
+              credentials: 'omit',
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                media_id: mediaId,
+                room_id: credentials.roomId,
+                duration_seconds: envelope.viewOnceSeconds,
+                ...(options.pendingExpirySeconds === undefined
+                  ? {}
+                  : { pending_ttl_seconds: options.pendingExpirySeconds }),
+              }),
+              signal,
+              redirect: 'error',
+            });
+            if (!registration.ok) {
+              throw new Error(`The server could not register expiring media (HTTP ${registration.status}).`);
+            }
+            const registrationResult: unknown = await registration.json();
+            if (
+              !registrationResult || typeof registrationResult !== 'object' ||
+              typeof (registrationResult as { pending_expires_at?: unknown }).pending_expires_at !== 'number' ||
+              !Number.isFinite((registrationResult as { pending_expires_at: number }).pending_expires_at)
+            ) {
+              throw new Error('The server returned an invalid pending media-expiration time.');
+            }
+            viewOncePendingExpiresAt = (registrationResult as { pending_expires_at: number }).pending_expires_at;
+            attachment = {
+              ...attachment,
+              url: new URL(`/_synapse/client/nymph/media/content/${mediaId}`, homeserver).href,
+            };
+          }
+          const content: RoomMessageEventContent = {
+            msgtype: MsgType.Text,
+            body: encodeEnvelope({
+              ...envelope,
+              ...(viewOncePendingExpiresAt === undefined ? {} : { viewOncePendingExpiresAt }),
+              attachment,
+              thumbnailAttachment,
+              mediaType: normalizedMediaType,
+              mediaName: file.name,
+            }),
+          };
+          const result = await client.sendMessage(credentials.roomId, content);
+          options.onProgress?.(100);
+          return {
+            eventId: result.event_id,
+            attachment,
+            ...(thumbnailAttachment ? { thumbnailAttachment } : {}),
+            ...(viewOncePendingExpiresAt === undefined ? {} : { viewOncePendingExpiresAt }),
+          };
+        } finally {
+          signal?.removeEventListener('abort', abortUpload);
+        }
       },
-      async downloadAttachment(file, mediaType) {
+      async downloadAttachment(file, mediaType, options = {}) {
         if (!isEncryptedAttachment(file)) throw new Error('The encrypted media reference is invalid.');
-        const downloadUrl = client.mxcUrlToHttp(file.url);
+        const normalizedMediaType = normalizeMediaType(mediaType);
+        await assertPairMembership(client, credentials);
+        await requireVerifiedPartner();
+        let downloadUrl: string | null;
+        if (file.url.startsWith('mxc://')) {
+          downloadUrl = client.mxcUrlToHttp(file.url, undefined, undefined, undefined, false, false, true);
+        } else {
+          const ephemeralUrl = new URL(file.url);
+          if (
+            ephemeralUrl.origin !== homeserver.origin ||
+            !/^\/_synapse\/client\/nymph\/media\/content\/[A-Za-z0-9._=-]{1,255}$/.test(ephemeralUrl.pathname)
+          ) {
+            throw new Error('The expiring media reference is not from this homeserver.');
+          }
+          downloadUrl = ephemeralUrl.href;
+        }
         if (!downloadUrl) throw new Error('The homeserver returned an invalid encrypted media URL.');
-        const response = await fetch(downloadUrl, { credentials: 'omit' });
+        const accessToken = client.getAccessToken();
+        if (!accessToken) throw new Error('The Matrix session is no longer authorized to download media.');
+        const response = await fetch(downloadUrl, {
+          credentials: 'omit',
+          headers: { Authorization: `Bearer ${accessToken}` },
+          signal: options.signal,
+          redirect: 'error',
+        });
         if (!response.ok) throw new Error(`Encrypted media download failed with HTTP ${response.status}.`);
-        const plaintext = await decryptAttachment(await response.arrayBuffer(), file);
-        return new Blob([plaintext], { type: mediaType || 'application/octet-stream' });
+        const total = Number(response.headers.get('Content-Length')) || 0;
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error('The encrypted media response could not be streamed.');
+        const chunks: Uint8Array[] = [];
+        let loaded = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            chunks.push(value);
+            loaded += value.byteLength;
+            options.onProgress?.(total ? Math.min(99, Math.round((loaded / total) * 100)) : 0);
+          }
+        }
+        const ciphertext = new Uint8Array(loaded);
+        let offset = 0;
+        for (const chunk of chunks) {
+          ciphertext.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        try {
+          const plaintext = await decryptAttachment(ciphertext, file);
+          try {
+            const blob = new Blob([plaintext], { type: normalizedMediaType });
+            options.onProgress?.(100);
+            return blob;
+          } finally {
+            new Uint8Array(plaintext).fill(0);
+          }
+        } finally {
+          ciphertext.fill(0);
+        }
+      },
+      async openEphemeralMedia(file) {
+        if (!isEncryptedAttachment(file) || file.url.startsWith('mxc://')) {
+          throw new Error('The expiring media reference is invalid.');
+        }
+        await assertPairMembership(client, credentials);
+        await requireVerifiedPartner();
+        const mediaUrl = new URL(file.url);
+        if (mediaUrl.origin !== homeserver.origin) {
+          throw new Error('The expiring media reference is not from this homeserver.');
+        }
+        const match = mediaUrl.pathname.match(/^\/_synapse\/client\/nymph\/media\/content\/([A-Za-z0-9._=-]{1,255})$/);
+        if (!match) throw new Error('The expiring media reference is invalid.');
+        const accessToken = client.getAccessToken();
+        if (!accessToken) throw new Error('The Matrix session is no longer authorized to open media.');
+        const response = await fetch(new URL('/_synapse/client/nymph/media/open', homeserver), {
+          method: 'POST',
+          credentials: 'omit',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ media_id: match[1] }),
+          redirect: 'error',
+        });
+        if (!response.ok) {
+          throw new Error(`This expiring media could not be opened (HTTP ${response.status}).`);
+        }
+        const result: unknown = await response.json();
+        if (
+          !result || typeof result !== 'object' ||
+          typeof (result as { expires_at?: unknown }).expires_at !== 'number' ||
+          !Number.isFinite((result as { expires_at: number }).expires_at)
+        ) {
+          throw new Error('The server returned an invalid media-expiration status.');
+        }
+        return (result as { expires_at: number }).expires_at;
       },
       async markRead(eventId) {
         const event = client.getRoom(credentials.roomId)?.findEventById(eventId);
@@ -691,7 +1204,7 @@ export async function connectMatrix(
         const publishedKeys = await cryptoApi.getUserCrossSigningKeys(credentials.userId);
         const publishedKeyIds = crossSigningTypes.map((type) => {
           const key = publishedKeys?.[type];
-          return key ? Object.keys(key.keys)[0] : undefined;
+          return key ? Object.values(key.keys)[0] : undefined;
         });
         if (publishedKeyIds.some((id) => !id)) {
           throw new Error(`The published cross-signing identity is incomplete for ${credentials.userId}.`);
@@ -812,6 +1325,8 @@ export async function connectMatrix(
           if (!(await client.secretStorage.checkKey(recoveryKeyBytes, keyInfo[1]))) {
             throw new Error(`The recovery key does not match ${credentials.userId}'s default Secret Storage key.`);
           }
+          secretStorageKeys.get(keyId)?.fill(0);
+          secretStorageKeys.set(keyId, new Uint8Array(recoveryKeyBytes));
 
           const signingTypes = [
             CrossSigningKey.Master,
@@ -820,33 +1335,36 @@ export async function connectMatrix(
           ];
           const publishedKeys = await cryptoApi.getUserCrossSigningKeys(credentials.userId);
           const masterKeyId = publishedKeys?.[CrossSigningKey.Master]
-            ? Object.keys(publishedKeys[CrossSigningKey.Master].keys)[0]
+            ? Object.values(publishedKeys[CrossSigningKey.Master].keys)[0]
             : undefined;
           const selfSigningKeyId = publishedKeys?.[CrossSigningKey.SelfSigning]
-            ? Object.keys(publishedKeys[CrossSigningKey.SelfSigning].keys)[0]
+            ? Object.values(publishedKeys[CrossSigningKey.SelfSigning].keys)[0]
             : undefined;
           const userSigningKeyId = publishedKeys?.[CrossSigningKey.UserSigning]
-            ? Object.keys(publishedKeys[CrossSigningKey.UserSigning].keys)[0]
+            ? Object.values(publishedKeys[CrossSigningKey.UserSigning].keys)[0]
             : undefined;
           if (!masterKeyId || !selfSigningKeyId || !userSigningKeyId) {
             throw new Error(`The published cross-signing identity is incomplete for ${credentials.userId}.`);
           }
           const publishedKeyIds = [masterKeyId, selfSigningKeyId, userSigningKeyId];
-          const currentKeyIds = await Promise.all(
-            signingTypes.map((type) => cryptoApi.getCrossSigningKeyId(type)),
-          );
           const storedSecrets = await Promise.all([
             client.secretStorage.get('m.cross_signing.master'),
             client.secretStorage.get('m.cross_signing.self_signing'),
             client.secretStorage.get('m.cross_signing.user_signing'),
           ]);
+          const publishedKeysComplete = publishedKeyIds.every(Boolean);
+          const storedSecretsPresent = storedSecrets.every(Boolean);
+          const crossSigningReady = await cryptoApi.isCrossSigningReady();
           if (
-            currentKeyIds.some((id, index) => !id || id !== publishedKeyIds[index]) ||
-            storedSecrets.some((secret) => !secret) ||
-            !(await cryptoApi.isCrossSigningReady())
+            !publishedKeysComplete ||
+            !storedSecretsPresent ||
+            !crossSigningReady
           ) {
             throw new Error(
-              `Secret Storage and the published cross-signing identity are not ready for ${credentials.userId}.`,
+              `Secret Storage and cross-signing are not ready for ${credentials.userId} ` +
+                `(publishedKeysComplete=${publishedKeysComplete}; ` +
+                `storedSecretsPresent=${storedSecretsPresent}; ` +
+                `crossSigningReady=${crossSigningReady}).`,
             );
           }
 
@@ -937,14 +1455,6 @@ export async function connectMatrix(
 
             const verificationCrypto = verificationClient.getCrypto();
             if (!verificationCrypto) throw new Error('The separate recovery client could not initialize Matrix encryption.');
-            const backupInfo = await verificationCrypto.getKeyBackupInfo();
-            if (backupInfo) {
-              await verificationCrypto.loadSessionBackupPrivateKeyFromSecretStorage();
-              const backupCheck = await verificationCrypto.checkKeyBackupAndEnable();
-              if (!backupCheck?.trustInfo.trusted || !backupCheck.trustInfo.matchesDecryptionKey) {
-                throw new Error('The separate recovery client could not verify the existing room-key backup.');
-              }
-            }
             const verificationKeyId = await verificationClient.secretStorage.getDefaultKeyId();
             const verificationKeyInfo = verificationKeyId
               ? await verificationClient.secretStorage.getKey(verificationKeyId)
@@ -966,15 +1476,18 @@ export async function connectMatrix(
             if (restoredSecrets.some((secret) => !secret)) {
               throw new Error('The separate recovery client could not decrypt all cross-signing secrets.');
             }
-            await verificationClient.downloadKeysForUsers([credentials.userId]);
+            const hasSeparatePublishedKeys = await verificationCrypto.userHasCrossSigningKeys(
+              credentials.userId,
+              true,
+            );
             const separatePublishedKeys = await verificationCrypto.getUserCrossSigningKeys(credentials.userId);
             const separatePublishedIds = signingTypes.map((type) => {
               const key = separatePublishedKeys?.[type];
-              return key ? Object.keys(key.keys)[0] : undefined;
+              return key ? Object.values(key.keys)[0] : undefined;
             });
             if (
               separatePublishedIds.some((id, index) => !id || id !== publishedKeyIds[index]) ||
-              !(await verificationCrypto.userHasCrossSigningKeys(credentials.userId, true))
+              !hasSeparatePublishedKeys
             ) {
               throw new Error('The separate recovery client did not find the existing published cross-signing identity.');
             }
@@ -987,11 +1500,34 @@ export async function connectMatrix(
             const restoredKeyIds = await Promise.all(
               signingTypes.map((type) => verificationCrypto.getCrossSigningKeyId(type)),
             );
+            const crossSigningReady = await verificationCrypto.isCrossSigningReady();
+            const keyIdsAvailable = restoredKeyIds.every(Boolean);
+            const keyIdsMatchPublished = restoredKeyIds.every(
+              (id, index) => id === publishedKeyIds[index],
+            );
             if (
-              !(await verificationCrypto.isCrossSigningReady()) ||
-              restoredKeyIds.some((id, index) => !id || id !== publishedKeyIds[index])
+              !crossSigningReady ||
+              !keyIdsAvailable ||
+              !keyIdsMatchPublished
             ) {
-              throw new Error('The separate recovery client did not restore the existing cross-signing identity.');
+              throw new Error(
+                'The separate recovery client did not restore the existing cross-signing identity ' +
+                  `(ready=${crossSigningReady}; keyIdsAvailable=${keyIdsAvailable}; ` +
+                  `keyIdsMatchPublished=${keyIdsMatchPublished}).`,
+              );
+            }
+
+            const backupInfo = await verificationCrypto.getKeyBackupInfo();
+            if (backupInfo) {
+              await verificationCrypto.loadSessionBackupPrivateKeyFromSecretStorage();
+              const backupCheck = await verificationCrypto.checkKeyBackupAndEnable();
+              if (!backupCheck?.trustInfo.trusted || !backupCheck.trustInfo.matchesDecryptionKey) {
+                throw new Error(
+                  'The separate recovery client could not verify the existing room-key backup ' +
+                    `(trusted=${backupCheck?.trustInfo.trusted ?? false}; ` +
+                    `matchesDecryptionKey=${backupCheck?.trustInfo.matchesDecryptionKey ?? false}).`,
+                );
+              }
             }
           } catch (error) {
             verificationFailure = error;
@@ -1198,6 +1734,7 @@ export async function connectMatrix(
         const status = await cryptoApi.getDeviceVerificationStatus(credentials.partnerUserId, deviceId);
         if (status?.isVerified()) throw new Error('That partner device is already verified.');
         const request = await cryptoApi.requestDeviceVerification(credentials.partnerUserId, deviceId);
+        locallyInitiatedVerifications.add(request);
         onVerificationRequest(request);
       },
       async acceptVerification(id) {
@@ -1209,7 +1746,15 @@ export async function connectMatrix(
       async startSasVerification(id) {
         const request = verificationRequests.get(id);
         if (!request) throw new Error('That verification request is no longer available.');
-        const verifier = await request.startVerification('m.sas.v1');
+        if (!locallyInitiatedVerifications.has(request)) {
+          const verifier = request.verifier;
+          if (!verifier) {
+            throw new Error('The partner who initiated this verification must start SAS first.');
+          }
+          attachVerifier(id, verifier);
+          return;
+        }
+        const verifier = request.verifier ?? await request.startVerification('m.sas.v1');
         attachVerifier(id, verifier);
       },
       async startQrVerification(id) {
@@ -1268,6 +1813,7 @@ export async function connectMatrix(
       },
       close() {
         client.removeListener(sdk.RoomEvent.Timeline, receive);
+        client.removeListener(MatrixEventEvent.Decrypted, onDecryptedEvent);
         client.removeListener(RoomMemberEvent.Typing, onTypingEvent);
         client.removeListener(sdk.RoomEvent.Receipt, onReceiptEvent);
         client.removeListener(CryptoEvent.VerificationRequestReceived, onVerificationRequest);

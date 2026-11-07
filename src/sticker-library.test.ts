@@ -3,10 +3,42 @@ import test from 'node:test';
 import {
   MAX_STICKER_BYTES,
   MAX_STICKER_LIBRARY_BYTES,
+  getStickerSyncMode,
   getStickerImportError,
   getStickerPackNameError,
   normalizeStickerPackName,
 } from './sticker-library.ts';
+import type { StickerSync } from './matrix/MessagingClient.ts';
+
+test('keeps adult sticker metadata sync events in the adult mode context', () => {
+  const packs = [{
+    id: 'adult-pack',
+    adult: true,
+    stickers: [{ id: 'adult-sticker' }],
+  }];
+  const syncs: StickerSync[] = [
+    { operation: 'pack-upsert', packId: 'adult-pack', packName: 'Private', adult: true, description: '', categories: [] },
+    { operation: 'pack-delete', packId: 'adult-pack' },
+    { operation: 'favorite', stickerId: 'adult-sticker', active: true },
+    { operation: 'recent', stickerId: 'adult-sticker' },
+  ];
+
+  for (const sync of syncs) {
+    assert.equal(getStickerSyncMode(sync, packs, 'romantic', []), 'kinky');
+  }
+  assert.equal(getStickerSyncMode(
+    { operation: 'favorite', stickerId: '😈', active: true },
+    [],
+    'romantic',
+    ['😈'],
+  ), 'kinky');
+  assert.equal(getStickerSyncMode(
+    { operation: 'recent', stickerId: 'everyday-sticker' },
+    [{ id: 'everyday-pack', adult: false, stickers: [{ id: 'everyday-sticker' }] }],
+    'romantic',
+    [],
+  ), 'romantic');
+});
 
 test('normalizes and limits imported sticker pack names', () => {
   assert.equal(normalizeStickerPackName('  My   little pack  '), 'My little pack');

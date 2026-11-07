@@ -1,5 +1,20 @@
 apply plugin: 'com.android.application'
 
+def releaseSigningValues = [
+    System.getenv('NYMPH_RELEASE_STORE_FILE'),
+    System.getenv('NYMPH_RELEASE_STORE_PASSWORD'),
+    System.getenv('NYMPH_RELEASE_KEY_ALIAS'),
+    System.getenv('NYMPH_RELEASE_KEY_PASSWORD')
+]
+def hasAnyReleaseSigningValue = releaseSigningValues.any { it }
+def hasReleaseSigning = releaseSigningValues.every { it }
+if (hasAnyReleaseSigningValue && !hasReleaseSigning) {
+    throw new GradleException('Provide all NYMPH_RELEASE_* signing variables or leave all unset.')
+}
+if (hasReleaseSigning && !file(System.getenv('NYMPH_RELEASE_STORE_FILE')).isFile()) {
+    throw new GradleException('NYMPH_RELEASE_STORE_FILE must identify an existing keystore file.')
+}
+
 android {
     namespace = "com.nymph.privateroom"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -16,10 +31,35 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    if (hasReleaseSigning) {
+        signingConfigs {
+            release {
+               storeFile file(System.getenv('NYMPH_RELEASE_STORE_FILE'))
+               storePassword System.getenv('NYMPH_RELEASE_STORE_PASSWORD')
+               keyAlias System.getenv('NYMPH_RELEASE_KEY_ALIAS')
+               keyPassword System.getenv('NYMPH_RELEASE_KEY_PASSWORD')
+            }
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (hasReleaseSigning) {
+               signingConfig signingConfigs.release
+            }
+        }
+    }
+}
+
+def apkOutputSuffix = System.getenv('NYMPH_APK_OUTPUT_SUFFIX')
+if (apkOutputSuffix) {
+    if (!(apkOutputSuffix ==~ /[A-Za-z0-9._-]+/)) {
+        throw new GradleException('NYMPH_APK_OUTPUT_SUFFIX may contain only letters, numbers, dots, underscores, and hyphens.')
+    }
+    android.applicationVariants.all { variant ->
+        variant.outputs.all {
+            outputFileName = "app-${variant.name}-${apkOutputSuffix}.apk"
         }
     }
 }

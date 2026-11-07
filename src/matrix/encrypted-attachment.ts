@@ -34,9 +34,11 @@ function fromBase64(value: string): Uint8Array<ArrayBuffer> {
 export function isEncryptedAttachment(value: unknown): value is EncryptedFile {
   if (!value || typeof value !== 'object') return false;
   const file = value as Partial<EncryptedFile>;
+  const isMxcUrl = typeof file.url === 'string' && file.url.startsWith('mxc://');
+  const isNymphEphemeralUrl = typeof file.url === 'string' &&
+    /^https?:\/\/[^/]+\/_synapse\/client\/nymph\/media\/content\/[A-Za-z0-9._=-]{1,255}$/.test(file.url);
   return file.v === 'v2' &&
-    typeof file.url === 'string' &&
-    file.url.startsWith('mxc://') &&
+    (isMxcUrl || isNymphEphemeralUrl) &&
     file.key?.alg === AES_CTR_ALGORITHM &&
     file.key.kty === 'oct' &&
     file.key.ext === true &&
