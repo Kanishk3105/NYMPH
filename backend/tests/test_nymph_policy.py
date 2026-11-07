@@ -296,11 +296,11 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_isolated_policy_uses_only_dev_ids_and_its_own_policy_schema(self) -> None:
         isolated_path = Path(self.temp_dir.name) / "isolated-policy.sqlite3"
         isolated_config = {
-            "server_name": "nymph-dev.localhost",
+            "server_name": "localhost",
             "legacy_pair_enabled": False,
             "dev_partner_a_user_id": "@partner1-dev:nymph-dev.localhost",
             "dev_partner_b_user_id": "@partner2-dev:nymph-dev.localhost",
-            "homeserver_url": "http://127.0.0.1:18008",
+            "homeserver_url": "http://127.0.0.1:8008",
             "app_origins": "http://localhost:5173",
             "state_path": str(isolated_path),
         }

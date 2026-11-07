@@ -1,7 +1,9 @@
 import os
 import pathlib
 import re
+import sys
 import tempfile
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -76,6 +78,45 @@ def apply_production_policy(config: dict, server_name: str) -> dict:
     return config
 
 
+def production_module_config(server_name: str) -> dict:
+    partner_a = os.environ.get("NYMPH_PARTNER_A_USER_ID", "")
+    partner_b = os.environ.get("NYMPH_PARTNER_B_USER_ID", "")
+    app_origins = os.environ.get("NYMPH_APP_ORIGINS", "")
+    if not partner_a or not partner_b or partner_a == partner_b:
+        raise RuntimeError("NYMPH_PARTNER_A_USER_ID and NYMPH_PARTNER_B_USER_ID must be distinct Matrix user IDs.")
+    if not all(
+        user_id.startswith("@")
+        and user_id.count(":") == 1
+        and user_id.rsplit(":", 1)[1] == server_name
+        for user_id in (partner_a, partner_b)
+    ):
+        raise RuntimeError("Both NYMPH participant IDs must belong to MATRIX_SERVER_NAME.")
+    origins = [origin.strip() for origin in app_origins.split(",") if origin.strip()]
+    if not origins:
+        raise RuntimeError("NYMPH_APP_ORIGINS must contain at least one HTTPS application origin.")
+    for origin in origins:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+        ):
+            raise RuntimeError("NYMPH_APP_ORIGINS entries must be HTTPS origins without paths or credentials.")
+    return {
+        "policy_mode": "production",
+        "partner_a_user_id": partner_a,
+        "partner_b_user_id": partner_b,
+        "server_name": server_name,
+        "homeserver_url": f"https://{server_name}",
+        "app_origins": ",".join(origins),
+        "state_path": "/data/nymph-policy.sqlite3",
+    }
+
+
 def main() -> None:
     if not CONFIG_PATH.is_file():
         raise RuntimeError("Synapse config is missing. Run the init-profile config generation first.")
@@ -83,6 +124,16 @@ def main() -> None:
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     server_name = os.environ["SYNAPSE_SERVER_NAME"]
     config = apply_production_policy(config, server_name)
+    if config.get("modules"):
+        raise RuntimeError("Unexpected Synapse modules are present; review them before production startup.")
+    module_config = production_module_config(server_name)
+    sys.path.insert(0, "/modules")
+    from nymph_policy import NymphPolicy
+
+    NymphPolicy.parse_config(module_config)
+    config["modules"] = [{"module": "nymph_policy.NymphPolicy", "config": module_config}]
+    config["log_config"] = "/data/nymph-log-config.yaml"
+    write_logging_config(pathlib.Path(config["log_config"]))
 
     config["database"] = {
         "name": "psycopg2",
@@ -112,6 +163,44 @@ def main() -> None:
     os.chmod(temporary_path, 0o600)
     os.chown(temporary_path, 991, 991)
     os.replace(temporary_path, CONFIG_PATH)
+
+
+def write_logging_config(path: pathlib.Path) -> None:
+    logging_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "nymph_json": {
+                "()": "nymph_safe_logging.SafeJsonFormatter",
+            }
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "level": "INFO",
+                "formatter": "nymph_json",
+                "stream": "ext://sys.stdout",
+            }
+        },
+        "root": {"level": "INFO", "handlers": ["console"]},
+        "loggers": {
+            "synapse.access.http.server": {"level": "WARNING"},
+            "synapse.storage.SQL": {"level": "WARNING"},
+        },
+    }
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=".nymph-log.",
+        suffix=".yaml",
+        delete=False,
+    ) as temporary:
+        yaml.safe_dump(logging_config, temporary, default_flow_style=False, sort_keys=False)
+        temporary_path = pathlib.Path(temporary.name)
+    os.chmod(temporary_path, 0o600)
+    os.chown(temporary_path, 991, 991)
+    os.replace(temporary_path, path)
 
 
 if __name__ == "__main__":

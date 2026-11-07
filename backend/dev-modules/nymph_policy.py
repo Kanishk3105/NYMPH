@@ -251,7 +251,11 @@ class NymphPolicy:
         legacy_enabled = config.get("legacy_pair_enabled", mode == "development")
         if not isinstance(legacy_enabled, bool):
             raise ValueError("legacy_pair_enabled must be a boolean.")
-        legacy_ids = (config.get("partner_a_user_id"), config.get("partner_b_user_id"))
+        legacy_ids = (
+            (config.get("partner_a_user_id"), config.get("partner_b_user_id"))
+            if mode == "development"
+            else (None, None)
+        )
         configured_ids = (config[partner_keys[0]], config[partner_keys[1]])
         if mode == "development":
             if legacy_enabled and legacy_ids != ("@partner1:localhost", "@partner2:localhost"):
@@ -260,7 +264,7 @@ class NymphPolicy:
                 raise ValueError("Archived account IDs cannot be configured in isolated development policy.")
             if configured_ids != (f"@partner1-dev:{server_name}", f"@partner2-dev:{server_name}"):
                 raise ValueError("Development partner IDs must match their dedicated server name.")
-        elif legacy_enabled or any(legacy_ids) or any(
+        elif legacy_enabled or any(
             config.get(key) for key in ("dev_partner_a_user_id", "dev_partner_b_user_id")
         ):
             raise ValueError("Production policy cannot include archived or development partner identities.")
