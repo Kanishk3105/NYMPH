@@ -1,7 +1,7 @@
 {$DEV_LAN_ADDRESS}:8443 {
 	tls internal
 
-	@blocked path /_synapse/admin/* /_matrix/client/v3/createRoom /_matrix/client/r0/createRoom
+	@blocked path /_synapse/admin/*
 	respond @blocked 404
 
 	handle /_matrix/* {

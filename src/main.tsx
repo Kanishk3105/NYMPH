@@ -5,6 +5,7 @@ import { App as CapacitorApp } from '@capacitor/app';
 import { BiometricAuth } from '@aparajita/capacitor-biometric-auth';
 import { StatusBar, Style } from '@capacitor/status-bar';
 import type { EncryptedFile } from 'matrix-js-sdk/lib/@types/media';
+import { Preset, Visibility } from 'matrix-js-sdk/lib/@types/partials';
 import type { MatrixConnection, MatrixMessagingClient, MatrixSecurityState, MatrixVerification, NymphEnvelope, ReceivedNymphEvent, StickerSync } from './matrix/MessagingClient';
 import { getDefaultHomeserver } from './matrix/homeserver';
 import { PARTNER_DEVICE_IDS, PARTNER_IDENTITIES } from './matrix/partner-identity';
@@ -1101,15 +1102,45 @@ function App() {
         });
         if (!statusResponse.ok) throw new Error(`Could not load the private-room configuration (${statusResponse.status}).`);
         const status = await statusResponse.json() as { room_id?: unknown };
-        if (typeof status.room_id !== 'string' || !status.room_id.startsWith('!')) {
-          throw new Error('The local homeserver has no configured NYMPH room.');
+        let roomId = typeof status.room_id === 'string' && status.room_id.startsWith('!')
+          ? status.room_id
+          : undefined;
+        if (!roomId) {
+          const created = await loginClient.createRoom({
+            visibility: Visibility.Private,
+            preset: Preset.PrivateChat,
+            invite: [PARTNER_IDENTITIES.partnerB],
+            is_direct: true,
+            creation_content: { 'm.federate': false },
+            initial_state: [
+              {
+                type: 'm.room.encryption',
+                state_key: '',
+                content: { algorithm: 'm.megolm.v1.aes-sha2' },
+              },
+              {
+                type: 'm.room.join_rules',
+                state_key: '',
+                content: { join_rule: 'invite' },
+              },
+              {
+                type: 'm.room.history_visibility',
+                state_key: '',
+                content: { history_visibility: 'joined' },
+              },
+            ],
+          });
+          if (typeof created.room_id !== 'string' || !created.room_id.startsWith('!')) {
+            throw new Error('The homeserver returned an invalid private room ID.');
+          }
+          roomId = created.room_id;
         }
         const connection: MatrixConnection = {
           homeserver: homeserver.origin,
           userId: session.user_id,
           partnerUserId: PARTNER_IDENTITIES.partnerB,
           accessToken,
-          roomId: status.room_id,
+          roomId,
           deviceId: session.device_id,
         };
         setMatrixPassword('');

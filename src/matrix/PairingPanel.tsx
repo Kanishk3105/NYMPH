@@ -79,7 +79,8 @@ function isPairingInvite(value: unknown): value is PairingInvite {
       url.protocol === 'https:' ||
       androidUsbReverseDevelopment ||
       browserDevelopment
-    ) && invite.token.length >= 40 && invite.partner_user_id === PARTNER_IDENTITIES.partnerB &&
+    ) && invite.expires_at > Date.now() &&
+      invite.token.length >= 40 && invite.partner_user_id === PARTNER_IDENTITIES.partnerB &&
       invite.room_id.startsWith('!');
   } catch {
     return false;
@@ -230,13 +231,16 @@ export function PairingPanel({
         credentials.accessToken,
       );
       const invitation = { ...serverInvitation, homeserver: credentials.homeserver };
-      if (!isPairingInvite(invitation)) throw new Error('The server returned an invalid pairing invitation.');
+      if (!isPairingInvite(invitation)) {
+        throw new Error('The server returned an invalid or expired pairing invitation.');
+      }
       const dataUrl = await QRCode.toDataURL(JSON.stringify(invitation), {
         errorCorrectionLevel: 'Q',
         margin: 2,
         width: 280,
         color: { dark: '#2a1019', light: '#fff8fa' },
       });
+      if (disposedRef.current) return;
       setQrDataUrl(dataUrl);
       setExpiresAt(invitation.expires_at);
       setPairingStatus('Waiting for Partner 2 to scan this one-time invitation.');
@@ -288,6 +292,7 @@ export function PairingPanel({
         width: 280,
         color: { dark: '#2a1019', light: '#fff8fa' },
       });
+      if (disposedRef.current) return;
       setQrDataUrl(dataUrl);
       setExpiresAt(invite.expires_at);
       setPairingStatus('Scan this one-time code on the replacement device. It expires shortly.');

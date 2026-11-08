@@ -10,7 +10,7 @@
 	@admin_api path /_synapse/admin /_synapse/admin/*
 	respond @admin_api 404
 
-	@restricted path /_matrix/client/*/admin* /_matrix/client/*/createRoom
+	@restricted path /_matrix/client/*/admin*
 	respond @restricted 404
 
 	reverse_proxy synapse:8008

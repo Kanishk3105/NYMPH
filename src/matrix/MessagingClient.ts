@@ -371,7 +371,7 @@ async function assertPairMembership(client: MatrixClient, credentials: MatrixCon
   const joinedIds = Object.keys((await client.getJoinedRoomMembers(credentials.roomId)).joined);
   const room = client.getRoom(credentials.roomId);
   const partnerMembership = room?.getMember(credentials.partnerUserId)?.membership;
-  const creatorCanStartBeforePairing = credentials.userId === '@partner1:localhost' &&
+  const creatorCanStartBeforePairing =
     joinedIds.length === 1 &&
     joinedIds[0] === credentials.userId &&
     partnerMembership === 'invite';

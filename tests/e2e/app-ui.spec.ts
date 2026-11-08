@@ -68,7 +68,7 @@ test('voice recording controls, preview, playback, seeking and speed work with s
 
   await page.getByRole('button', { name: 'Record voice message' }).click();
   await expect(page.locator('.voice-recording')).toBeVisible();
-  await page.waitForTimeout(700);
+  await page.waitForTimeout(1200);
   await page.locator('.voice-recording').getByRole('button', { name: 'Finish' }).click();
   const preview = page.locator('.viewer');
   await expect(preview.locator('audio.voice-preview')).toBeVisible();

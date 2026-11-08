@@ -198,6 +198,7 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
         api = FakeApi()
         api._hs = SimpleNamespace(get_media_repository=lambda: object())
         config = valid_production_policy_config(self.state_path)
+        self.policy.db.close()
         policy = NymphPolicy(config, api)
         self.addCleanup(policy.db.close)
 
@@ -296,7 +297,7 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
     async def test_isolated_policy_uses_only_dev_ids_and_its_own_policy_schema(self) -> None:
         isolated_path = Path(self.temp_dir.name) / "isolated-policy.sqlite3"
         isolated_config = {
-            "server_name": "localhost",
+            "server_name": "nymph-dev.localhost",
             "legacy_pair_enabled": False,
             "dev_partner_a_user_id": "@partner1-dev:nymph-dev.localhost",
             "dev_partner_b_user_id": "@partner2-dev:nymph-dev.localhost",
@@ -625,7 +626,7 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.api.user_id = DEV_PARTNER_A
         self.policy = NymphPolicy(
             {
-                "server_name": "nymph-dev.localhost",
+                "server_name": "localhost",
                 "legacy_pair_enabled": False,
                 "dev_partner_a_user_id": DEV_PARTNER_A,
                 "dev_partner_b_user_id": DEV_PARTNER_B,

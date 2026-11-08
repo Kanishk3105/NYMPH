@@ -1,0 +1,14 @@
+services:
+  synapse:
+    volumes:
+      - ./tests:/tests:ro
+      - production_smoke_state:/smoke-state
+
+secrets:
+  postgres_password:
+    file: ${NYMPH_DISPOSABLE_SECRETS_DIR:?Set NYMPH_DISPOSABLE_SECRETS_DIR to a disposable secret directory}/postgres_password
+  registration_shared_secret:
+    file: ${NYMPH_DISPOSABLE_SECRETS_DIR:?Set NYMPH_DISPOSABLE_SECRETS_DIR to a disposable secret directory}/registration_shared_secret
+
+volumes:
+  production_smoke_state:
