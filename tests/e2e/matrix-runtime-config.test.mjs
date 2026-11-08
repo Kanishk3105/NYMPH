@@ -17,6 +17,30 @@ test('accepts only the isolated Stage 3H homeserver and partner identities', () 
     serverName: 'nymph-dev.localhost',
     partnerA: '@partner1-dev:nymph-dev.localhost',
     partnerB: '@partner2-dev:nymph-dev.localhost',
+    passwordA: undefined,
+    passwordB: undefined,
+    disposable: false,
+  });
+
+  test('accepts disposable identities only through explicit disposable environment mode', () => {
+    const contents = validConfiguration
+      .replace('@partner1-dev:nymph-dev.localhost', '@qa-a:nymph-dev.localhost')
+      .replace('@partner2-dev:nymph-dev.localhost', '@qa-b:nymph-dev.localhost');
+    assert.deepEqual(parseIsolatedMatrixConfig(contents, {
+      NYMPH_DISPOSABLE_MATRIX: '1',
+      NYMPH_MATRIX_TEST_PARTNER_A: '@qa-a:nymph-dev.localhost',
+      NYMPH_MATRIX_TEST_PARTNER_B: '@qa-b:nymph-dev.localhost',
+      NYMPH_MATRIX_TEST_PASSWORD_A: 'disposable-a',
+      NYMPH_MATRIX_TEST_PASSWORD_B: 'disposable-b',
+    }), {
+      homeserverUrl: 'http://127.0.0.1:18008',
+      serverName: 'nymph-dev.localhost',
+      partnerA: '@qa-a:nymph-dev.localhost',
+      partnerB: '@qa-b:nymph-dev.localhost',
+      passwordA: 'disposable-a',
+      passwordB: 'disposable-b',
+      disposable: true,
+    });
   });
 });
 

@@ -47,6 +47,7 @@ services:
       DEV_HOMESERVER_URL: ${DEV_HOMESERVER_URL:?Set DEV_HOMESERVER_URL in .env.dev.isolated}
       DEV_PARTNER_A_USER_ID: ${DEV_PARTNER_A_USER_ID:?Set DEV_PARTNER_A_USER_ID in .env.dev.isolated}
       DEV_PARTNER_B_USER_ID: ${DEV_PARTNER_B_USER_ID:?Set DEV_PARTNER_B_USER_ID in .env.dev.isolated}
+      NYMPH_DISPOSABLE_MATRIX: ${NYMPH_DISPOSABLE_MATRIX:-0}
       DEV_APP_ORIGINS: ${DEV_APP_ORIGINS:-http://localhost:5173,http://127.0.0.1:5174,https://localhost}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
@@ -85,16 +86,12 @@ services:
 
 networks:
   stage3h1_dev:
-    name: nymph-stage3h1-dev-network
     internal: true
   stage3h1_dev_host_api:
-    name: nymph-stage3h1-dev-api-network
 
 volumes:
   stage3h1_dev_postgres_data:
-    name: nymph-stage3h1-dev-postgres-data
   stage3h1_dev_synapse_data:
-    name: nymph-stage3h1-dev-synapse-data
 
 secrets:
   postgres_password:

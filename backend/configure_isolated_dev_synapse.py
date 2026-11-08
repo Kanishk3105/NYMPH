@@ -22,11 +22,23 @@ def main() -> None:
         raise RuntimeError("The isolated homeserver URL must match the dedicated loopback endpoint.")
     partner_a = os.environ["DEV_PARTNER_A_USER_ID"]
     partner_b = os.environ["DEV_PARTNER_B_USER_ID"]
-    if (partner_a, partner_b) != (
-        f"@partner1-dev:{SERVER_NAME}",
-        f"@partner2-dev:{SERVER_NAME}",
-    ):
+    disposable = os.environ.get("NYMPH_DISPOSABLE_MATRIX") == "1"
+    expected_ids = (
+        (f"@partner1-dev:{SERVER_NAME}", f"@partner2-dev:{SERVER_NAME}")
+        if not disposable
+        else None
+    )
+    if expected_ids is not None and (partner_a, partner_b) != expected_ids:
         raise RuntimeError("The isolated partner IDs must use the dedicated Matrix server name.")
+    if not all(
+        isinstance(user_id, str)
+        and user_id.startswith("@")
+        and user_id.count(":") == 1
+        and user_id.rsplit(":", 1)[1] == SERVER_NAME
+        and len(user_id.rsplit(":", 1)[0]) > 1
+        for user_id in (partner_a, partner_b)
+    ) or partner_a == partner_b:
+        raise RuntimeError("Disposable isolated partner IDs must be distinct local users on the dedicated server.")
 
     postgres_password = pathlib.Path("/run/secrets/postgres_password").read_text(encoding="utf-8").strip()
     registration_secret = pathlib.Path("/run/secrets/registration_shared_secret").read_text(encoding="utf-8").strip()
@@ -65,6 +77,7 @@ def main() -> None:
             "config": {
                 "server_name": SERVER_NAME,
                 "legacy_pair_enabled": False,
+                "disposable_matrix": disposable,
                 "dev_partner_a_user_id": partner_a,
                 "dev_partner_b_user_id": partner_b,
                 "homeserver_url": homeserver_url,

@@ -106,6 +106,7 @@ type HarnessState = {
     allowRateLimitRetries?: boolean,
   ): Promise<HarnessSession>;
   roomStatus(connection: HarnessSession): Promise<{ room_id: string }>;
+  createRoom(connection: HarnessSession): Promise<{ room_id: string }>;
   createInvitation(connection: HarnessSession): Promise<unknown>;
   encodeInvitationQr(invite: unknown): Promise<string>;
   redeemInvitation(invite: unknown, deviceId?: string): Promise<HarnessSession>;
@@ -159,6 +160,7 @@ type HarnessState = {
   logout(session: HarnessSession): Promise<void>;
   whoamiStatus(session: HarnessSession): Promise<number>;
   inviteStatus(session: HarnessSession, roomId: string, userId: string): Promise<number>;
+  encryptionEvidence(eventId: string): Promise<{ eventType: string; hasCiphertext: boolean; algorithm?: string }>;
   crossSigningIdentityIds(): Promise<string[]>;
   getEvents(): ReceivedNymphEvent[];
   getVerifications(): MatrixVerification[];
@@ -202,10 +204,11 @@ const matrixConfig = {
 if (
   matrixConfig.homeserverUrl !== 'http://127.0.0.1:18008' ||
   matrixConfig.serverName !== 'nymph-dev.localhost' ||
-  matrixConfig.partnerA !== '@partner1-dev:nymph-dev.localhost' ||
-  matrixConfig.partnerB !== '@partner2-dev:nymph-dev.localhost'
+  !/^@[A-Za-z0-9._=-]+:nymph-dev\.localhost$/.test(matrixConfig.partnerA) ||
+  !/^@[A-Za-z0-9._=-]+:nymph-dev\.localhost$/.test(matrixConfig.partnerB) ||
+  matrixConfig.partnerA === matrixConfig.partnerB
 ) {
-  throw new Error('Matrix test harness requires the exact isolated Stage 3H development configuration.');
+  throw new Error('Matrix test harness requires the isolated local homeserver and distinct participant identities.');
 }
 const apiBase = matrixConfig.homeserverUrl;
 let activeConnection: HarnessSession | null = null;
@@ -288,6 +291,41 @@ const state: HarnessState = {
     if (typeof body.room_id !== 'string') throw new Error('The local server has no existing NYMPH room.');
     return { room_id: body.room_id };
   },
+  async createRoom(connection) {
+    const response = await fetch(`${apiBase}/_matrix/client/v3/createRoom`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${connection.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        visibility: 'private',
+        preset: 'private_chat',
+        invite: [connection.partnerUserId],
+        creation_content: { 'm.federate': false },
+        initial_state: [
+          { type: 'm.room.encryption', state_key: '', content: { algorithm: 'm.megolm.v1.aes-sha2' } },
+          { type: 'm.room.join_rules', state_key: '', content: { join_rule: 'invite' } },
+          { type: 'm.room.history_visibility', state_key: '', content: { history_visibility: 'joined' } },
+          {
+            type: 'm.room.power_levels',
+            state_key: '',
+            content: {
+              users: { [connection.partnerUserId]: 0 },
+              users_default: 0,
+              events_default: 0,
+              state_default: 100,
+              invite: 100,
+              kick: 100,
+              ban: 100,
+              redact: 100,
+            },
+          },
+        ],
+      }),
+    });
+    if (!response.ok) throw new Error(`Room creation failed (${response.status}).`);
+    const body = await response.json() as { room_id?: unknown };
+    if (typeof body.room_id !== 'string') throw new Error('Room creation returned no room ID.');
+    return { room_id: body.room_id };
+  },
   async createInvitation(connection) {
     const invitation = await postJson<Record<string, unknown>>(
       '/_synapse/client/nymph/pairing/create',
@@ -298,9 +336,9 @@ const state: HarnessState = {
   },
   async encodeInvitationQr(invite) {
     const dataUrl = await QRCode.toDataURL(JSON.stringify(invite), {
-      errorCorrectionLevel: 'Q',
-      margin: 2,
-      width: 320,
+      errorCorrectionLevel: 'H',
+      margin: 4,
+      width: 512,
     });
     const decoded = await new BrowserQRCodeReader().decodeFromImageUrl(dataUrl);
     return decoded.getText();
@@ -724,6 +762,21 @@ const state: HarnessState = {
     );
     await response.arrayBuffer();
     return response.status;
+  },
+  async encryptionEvidence(eventId) {
+    if (!activeConnection || !this.client) throw new Error('Connect a Matrix client before inspecting encryption evidence.');
+    const response = await fetch(
+      `${apiBase}/_matrix/client/v3/rooms/${encodeURIComponent(activeConnection.roomId)}/event/${encodeURIComponent(eventId)}`,
+      { headers: { Authorization: `Bearer ${activeConnection.accessToken}` }, cache: 'no-store' },
+    );
+    if (!response.ok) throw new Error(`The encrypted event could not be inspected (${response.status}).`);
+    const event = await response.json() as { type?: unknown; content?: { algorithm?: unknown; ciphertext?: unknown } };
+    const content = event.content ?? {};
+    return {
+      eventType: typeof event.type === 'string' ? event.type : '',
+      hasCiphertext: typeof content.ciphertext === 'string' && content.ciphertext.length > 0,
+      algorithm: typeof content.algorithm === 'string' ? content.algorithm : undefined,
+    };
   },
   async crossSigningIdentityIds() {
     if (!this.client) throw new Error('Connect a Matrix client before checking cross-signing.');

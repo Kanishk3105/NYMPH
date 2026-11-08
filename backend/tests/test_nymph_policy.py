@@ -200,48 +200,51 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
         config = valid_production_policy_config(self.state_path)
         self.policy.db.close()
         policy = NymphPolicy(config, api)
-        self.addCleanup(policy.db.close)
+        try:
+            self.assertEqual(
+                await policy.user_may_create_room(PROD_PARTNER_A, valid_room_config(PROD_PARTNER_B)),
+                NOT_SPAM,
+            )
+            self.assertEqual(
+                await policy.check_event_for_spam(
+                    SimpleNamespace(
+                        type="m.room.create",
+                        sender=PROD_PARTNER_A,
+                        content={"m.federate": False},
+                        room_id=PROD_ROOM_ID,
+                    )
+                ),
+                NOT_SPAM,
+            )
+            self.assertEqual(
+                await policy.user_may_join_room("@intruder:matrix.nymph.com", PROD_ROOM_ID, False),
+                Codes.FORBIDDEN,
+            )
+            self.assertEqual(
+                await policy.user_may_invite(PROD_PARTNER_A, "@intruder:matrix.nymph.com", PROD_ROOM_ID),
+                Codes.FORBIDDEN,
+            )
+            self.assertEqual(
+                await policy.user_may_join_room(PROD_PARTNER_B, PROD_ROOM_ID, True),
+                NOT_SPAM,
+            )
+            self.assertEqual(policy.worker_health()["healthy"], False)
+            self.assertIn("/_synapse/client/nymph/health", api.web_resources)
+            self.assertTrue(all(call[2]["run_on_all_instances"] is False for call in api.background_calls))
 
-        self.assertEqual(
-            await policy.user_may_create_room(PROD_PARTNER_A, valid_room_config(PROD_PARTNER_B)),
-            NOT_SPAM,
-        )
-        self.assertEqual(
-            await policy.check_event_for_spam(
-                SimpleNamespace(
-                    type="m.room.create",
-                    sender=PROD_PARTNER_A,
-                    content={"m.federate": False},
-                    room_id=PROD_ROOM_ID,
+            restarted_api = FakeApi()
+            restarted_api._hs = SimpleNamespace(get_media_repository=lambda: object())
+            restarted = NymphPolicy(config, restarted_api)
+            try:
+                self.assertEqual(restarted.room_id("primary"), PROD_ROOM_ID)
+                self.assertEqual(
+                    await restarted.user_may_join_room("@intruder:matrix.nymph.com", PROD_ROOM_ID, True),
+                    Codes.FORBIDDEN,
                 )
-            ),
-            NOT_SPAM,
-        )
-        self.assertEqual(
-            await policy.user_may_join_room("@intruder:matrix.nymph.com", PROD_ROOM_ID, False),
-            Codes.FORBIDDEN,
-        )
-        self.assertEqual(
-            await policy.user_may_invite(PROD_PARTNER_A, "@intruder:matrix.nymph.com", PROD_ROOM_ID),
-            Codes.FORBIDDEN,
-        )
-        self.assertEqual(
-            await policy.user_may_join_room(PROD_PARTNER_B, PROD_ROOM_ID, True),
-            NOT_SPAM,
-        )
-        self.assertEqual(policy.worker_health()["healthy"], False)
-        self.assertIn("/_synapse/client/nymph/health", api.web_resources)
-        self.assertTrue(all(call[2]["run_on_all_instances"] is False for call in api.background_calls))
-
-        restarted_api = FakeApi()
-        restarted_api._hs = SimpleNamespace(get_media_repository=lambda: object())
-        restarted = NymphPolicy(config, restarted_api)
-        self.addCleanup(restarted.db.close)
-        self.assertEqual(restarted.room_id("primary"), PROD_ROOM_ID)
-        self.assertEqual(
-            await restarted.user_may_join_room("@intruder:matrix.nymph.com", PROD_ROOM_ID, True),
-            Codes.FORBIDDEN,
-        )
+            finally:
+                restarted.db.close()
+        finally:
+            policy.db.close()
 
     def test_requires_private_non_federatable_encrypted_room(self) -> None:
         self.assertTrue(is_private_encrypted_room(valid_room_config(), PARTNER_A, PARTNER_B))

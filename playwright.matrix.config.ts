@@ -7,7 +7,9 @@ const chromePath = process.env.NYMPH_CHROME_PATH ??
 
 export default defineConfig({
   testDir: './tests/e2e',
-  testMatch: 'matrix-dev-live.spec.ts',
+  testMatch: process.env.NYMPH_DISPOSABLE_MATRIX === '1'
+    ? 'matrix-disposable-live.spec.ts'
+    : 'matrix-dev-live.spec.ts',
   testIgnore: ['matrix-live.spec.ts'],
   fullyParallel: false,
   workers: 1,

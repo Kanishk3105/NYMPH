@@ -12,13 +12,49 @@ const requiredValues = {
   DEV_PARTNER_B_USER_ID: '@partner2-dev:nymph-dev.localhost',
 };
 
-export function parseIsolatedMatrixConfig(contents) {
+function parseValues(contents) {
   const values = new Map();
   for (const line of contents.split(/\r?\n/)) {
     const match = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
     if (match) values.set(match[1], match[2]);
   }
+  return values;
+}
 
+function createConfig(values, partnerA, partnerB, passwords) {
+  if (
+    values.get('MATRIX_SERVER_NAME') !== requiredValues.MATRIX_SERVER_NAME ||
+    values.get('DEV_HOMESERVER_URL') !== requiredValues.DEV_HOMESERVER_URL ||
+    !/^@[A-Za-z0-9._=-]+:nymph-dev\.localhost$/.test(partnerA) ||
+    !/^@[A-Za-z0-9._=-]+:nymph-dev\.localhost$/.test(partnerB) ||
+    partnerA === partnerB
+  ) {
+    throw new Error('Disposable Matrix identities must belong to the isolated local homeserver and be distinct.');
+  }
+  if (passwords && (!passwords[0] || !passwords[1] || passwords[0] === passwords[1])) {
+    throw new Error('Disposable Matrix credentials must contain two distinct non-empty passwords.');
+  }
+  return Object.freeze({
+    homeserverUrl: values.get('DEV_HOMESERVER_URL'),
+    serverName: values.get('MATRIX_SERVER_NAME'),
+    partnerA,
+    partnerB,
+    passwordA: passwords?.[0],
+    passwordB: passwords?.[1],
+    disposable: Boolean(passwords),
+  });
+}
+
+export function parseIsolatedMatrixConfig(contents, environment = process.env) {
+  const values = parseValues(contents);
+  if (environment.NYMPH_DISPOSABLE_MATRIX === '1') {
+    return createConfig(
+      values,
+      environment.NYMPH_MATRIX_TEST_PARTNER_A,
+      environment.NYMPH_MATRIX_TEST_PARTNER_B,
+      [environment.NYMPH_MATRIX_TEST_PASSWORD_A, environment.NYMPH_MATRIX_TEST_PASSWORD_B],
+    );
+  }
   for (const [name, expected] of Object.entries(requiredValues)) {
     if (values.get(name) !== expected) {
       throw new Error(
@@ -27,12 +63,7 @@ export function parseIsolatedMatrixConfig(contents) {
     }
   }
 
-  return Object.freeze({
-    homeserverUrl: values.get('DEV_HOMESERVER_URL'),
-    serverName: values.get('MATRIX_SERVER_NAME'),
-    partnerA: values.get('DEV_PARTNER_A_USER_ID'),
-    partnerB: values.get('DEV_PARTNER_B_USER_ID'),
-  });
+  return createConfig(values, values.get('DEV_PARTNER_A_USER_ID'), values.get('DEV_PARTNER_B_USER_ID'));
 }
 
 export function loadIsolatedMatrixConfig() {

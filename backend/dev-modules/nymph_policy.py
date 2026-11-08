@@ -251,6 +251,9 @@ class NymphPolicy:
         legacy_enabled = config.get("legacy_pair_enabled", mode == "development")
         if not isinstance(legacy_enabled, bool):
             raise ValueError("legacy_pair_enabled must be a boolean.")
+        disposable_matrix = config.get("disposable_matrix", False)
+        if not isinstance(disposable_matrix, bool):
+            raise ValueError("disposable_matrix must be a boolean.")
         legacy_ids = (
             (config.get("partner_a_user_id"), config.get("partner_b_user_id"))
             if mode == "development"
@@ -262,7 +265,10 @@ class NymphPolicy:
                 raise ValueError("The archived development identities cannot be rebound by the policy.")
             if not legacy_enabled and any(legacy_ids):
                 raise ValueError("Archived account IDs cannot be configured in isolated development policy.")
-            if configured_ids != (f"@partner1-dev:{server_name}", f"@partner2-dev:{server_name}"):
+            if not disposable_matrix and configured_ids != (
+                f"@partner1-dev:{server_name}",
+                f"@partner2-dev:{server_name}",
+            ):
                 raise ValueError("Development partner IDs must match their dedicated server name.")
         elif legacy_enabled or any(
             config.get(key) for key in ("dev_partner_a_user_id", "dev_partner_b_user_id")
@@ -279,6 +285,8 @@ class NymphPolicy:
             for user_id in user_ids
         ):
             raise ValueError("NYMPH policy participant IDs must belong to its configured server.")
+        if disposable_matrix and mode != "development":
+            raise ValueError("Disposable Matrix identities are only supported in development policy mode.")
         homeserver = config["homeserver_url"]
         parsed_homeserver = urlsplit(homeserver)
         if mode == "development":
@@ -736,6 +744,17 @@ class NymphPolicy:
                 "seconds = excluded.seconds, event_timestamp = excluded.event_timestamp, event_id = excluded.event_id",
                 (room_id, seconds, event_timestamp, event_id),
             )
+            if seconds is None:
+                self.db.execute(
+                    "DELETE FROM nymph_message_expiry WHERE event_id = ? AND state = 'scheduled'",
+                    (event_id,),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE nymph_message_expiry SET expires_at = ? "
+                    "WHERE event_id = ? AND state = 'scheduled'",
+                    (event_timestamp + seconds * 1000, event_id),
+                )
         effective = self.db.execute(
             "SELECT seconds, event_timestamp, event_id FROM nymph_retention_policy WHERE room_id = ?",
             (room_id,),

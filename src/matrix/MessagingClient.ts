@@ -683,7 +683,7 @@ export async function connectMatrix(
         !/^\$[A-Za-z0-9._=:-]{1,255}$/.test(parentEventId)
       ) throw new Error('The message relation is invalid.');
       let lastError: unknown;
-      for (let attempt = 0; attempt < 5; attempt += 1) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
         try {
           await policyRequest('/_synapse/client/nymph/retention/relation', {
             child_event_id: childEventId,
@@ -692,8 +692,8 @@ export async function connectMatrix(
           return;
         } catch (error) {
           lastError = error;
-          if (!(error instanceof Error) || !error.message.includes('HTTP 404') || attempt === 4) break;
-          await new Promise<void>((resolve) => window.setTimeout(resolve, 150));
+          if (!(error instanceof Error) || !error.message.includes('HTTP 404') || attempt === 19) break;
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
         }
       }
       throw lastError instanceof Error ? lastError : new Error('The message relation could not be synchronized.');
