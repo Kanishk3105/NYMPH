@@ -22,9 +22,10 @@ function parseValues(contents) {
 }
 
 function createConfig(values, partnerA, partnerB, passwords) {
+  const homeserverUrl = values.get('DEV_HOMESERVER_URL');
   if (
     values.get('MATRIX_SERVER_NAME') !== requiredValues.MATRIX_SERVER_NAME ||
-    values.get('DEV_HOMESERVER_URL') !== requiredValues.DEV_HOMESERVER_URL ||
+    !/^http:\/\/127\.0\.0\.1:\d+$/.test(homeserverUrl ?? '') ||
     !/^@[A-Za-z0-9._=-]+:nymph-dev\.localhost$/.test(partnerA) ||
     !/^@[A-Za-z0-9._=-]+:nymph-dev\.localhost$/.test(partnerB) ||
     partnerA === partnerB
@@ -35,7 +36,7 @@ function createConfig(values, partnerA, partnerB, passwords) {
     throw new Error('Disposable Matrix credentials must contain two distinct non-empty passwords.');
   }
   return Object.freeze({
-    homeserverUrl: values.get('DEV_HOMESERVER_URL'),
+    homeserverUrl,
     serverName: values.get('MATRIX_SERVER_NAME'),
     partnerA,
     partnerB,
@@ -48,8 +49,12 @@ function createConfig(values, partnerA, partnerB, passwords) {
 export function parseIsolatedMatrixConfig(contents, environment = process.env) {
   const values = parseValues(contents);
   if (environment.NYMPH_DISPOSABLE_MATRIX === '1') {
+    const disposableValues = new Map(values);
+    if (environment.NYMPH_MATRIX_TEST_HOMESERVER) {
+      disposableValues.set('DEV_HOMESERVER_URL', environment.NYMPH_MATRIX_TEST_HOMESERVER);
+    }
     return createConfig(
-      values,
+      disposableValues,
       environment.NYMPH_MATRIX_TEST_PARTNER_A,
       environment.NYMPH_MATRIX_TEST_PARTNER_B,
       [environment.NYMPH_MATRIX_TEST_PASSWORD_A, environment.NYMPH_MATRIX_TEST_PASSWORD_B],

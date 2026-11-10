@@ -20,7 +20,7 @@ import type {
   Verifier,
 } from 'matrix-js-sdk/lib/crypto-api/verification';
 import { MsgType, RelationType } from 'matrix-js-sdk/lib/@types/event.js';
-import type { ReactionEventContent, RoomMessageEventContent } from 'matrix-js-sdk/lib/@types/events.js';
+import type { RoomMessageEventContent } from 'matrix-js-sdk/lib/@types/events.js';
 import type { EncryptedFile } from 'matrix-js-sdk/lib/@types/media.js';
 import { MatrixEventEvent } from 'matrix-js-sdk/lib/models/event.js';
 import { RoomMemberEvent } from 'matrix-js-sdk/lib/models/room-member.js';
@@ -162,6 +162,13 @@ export interface MatrixMessagingClient {
     applied: boolean;
   }>;
   registerMessageRelation(childEventId: string, parentEventId: string): Promise<void>;
+  inspectRelationEvent(eventId: string): {
+    eventType: string;
+    relationType?: string;
+    parentEventId?: string;
+    reactionKey?: string;
+    body?: string;
+  } | undefined;
   markRead(eventId: string): Promise<void>;
   setTyping(isTyping: boolean): Promise<void>;
   getSecurityState(): Promise<MatrixSecurityState>;
@@ -635,7 +642,10 @@ export async function connectMatrix(
         cache: 'no-store',
         redirect: 'error',
       });
-      if (!response.ok) throw new Error(`The server-side retention request failed (HTTP ${response.status}).`);
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`The server-side retention request failed (HTTP ${response.status}): ${detail}`);
+      }
       return response.json() as Promise<T>;
     };
     const synchronizeRetentionPolicy = async (seconds: number | null, eventId: string) => {
@@ -683,7 +693,7 @@ export async function connectMatrix(
         !/^\$[A-Za-z0-9._=:-]{1,255}$/.test(parentEventId)
       ) throw new Error('The message relation is invalid.');
       let lastError: unknown;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
           await policyRequest('/_synapse/client/nymph/retention/relation', {
             child_event_id: childEventId,
@@ -692,8 +702,8 @@ export async function connectMatrix(
           return;
         } catch (error) {
           lastError = error;
-          if (!(error instanceof Error) || !error.message.includes('HTTP 404') || attempt === 19) break;
-          await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+          if (!(error instanceof Error) || !error.message.includes('HTTP 404') || attempt === 4) break;
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 150));
         }
       }
       throw lastError instanceof Error ? lastError : new Error('The message relation could not be synchronized.');
@@ -852,15 +862,17 @@ export async function connectMatrix(
         await requireVerifiedPartner();
         if (envelope.kind === 'reaction') {
           if (!envelope.reactionTo) throw new Error('A reaction must reference a room event.');
-          const reactionContent: ReactionEventContent & { 'org.nymph.mode': NymphMode } = {
-            'm.relates_to': {
-              event_id: envelope.reactionTo,
-              key: envelope.text,
-              rel_type: RelationType.Annotation,
-            },
-            'org.nymph.mode': envelope.mode,
+          const annotation: NonNullable<RoomMessageEventContent['m.relates_to']> & { key: string } = {
+            event_id: envelope.reactionTo,
+            key: envelope.text,
+            rel_type: RelationType.Annotation,
           };
-          const result = await client.sendEvent(credentials.roomId, sdk.EventType.Reaction, reactionContent);
+          const reactionContent: RoomMessageEventContent = {
+            msgtype: MsgType.Text,
+            body: encodeEnvelope(envelope),
+            'm.relates_to': annotation,
+          };
+          const result = await client.sendMessage(credentials.roomId, reactionContent);
           await registerMessageRelation(result.event_id, envelope.reactionTo);
           return result.event_id;
         }
@@ -1133,6 +1145,32 @@ export async function connectMatrix(
       async markRead(eventId) {
         const event = client.getRoom(credentials.roomId)?.findEventById(eventId);
         if (event) await client.sendReadReceipt(event);
+      },
+      inspectRelationEvent(eventId) {
+        const event = client.getRoom(credentials.roomId)?.findEventById(eventId);
+        if (!event) return undefined;
+        const content = event.getContent() as {
+          body?: unknown;
+          'm.relates_to'?: {
+            rel_type?: unknown;
+            event_id?: unknown;
+            key?: unknown;
+            'm.in_reply_to'?: { event_id?: unknown };
+          };
+        };
+        const relation = content['m.relates_to'];
+        const replyParent = relation?.['m.in_reply_to']?.event_id;
+        return {
+          eventType: event.getType(),
+          relationType: typeof relation?.rel_type === 'string'
+            ? relation.rel_type
+            : relation?.['m.in_reply_to'] ? 'm.in_reply_to' : undefined,
+          parentEventId: typeof replyParent === 'string'
+            ? replyParent
+            : typeof relation?.event_id === 'string' ? relation.event_id : undefined,
+          reactionKey: typeof relation?.key === 'string' ? relation.key : undefined,
+          body: typeof content.body === 'string' ? content.body : undefined,
+        };
       },
       async setTyping(isTyping) {
         await client.sendTyping(credentials.roomId, isTyping, isTyping ? 10_000 : 0);

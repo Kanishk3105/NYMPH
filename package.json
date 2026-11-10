@@ -15,6 +15,7 @@
     "test:matrix:live": "playwright test --config=playwright.matrix.config.ts",
     "test:matrix:dev-live": "playwright test --config=playwright.matrix.config.ts",
     "test:matrix:disposable": "playwright test --config=playwright.matrix.disposable.config.ts",
+    "test:matrix:disposable:fresh": "node scripts/run-disposable-matrix.mjs",
     "test:ui": "playwright test --config=playwright.ui.config.ts",
     "validate:matrix-e2e-config": "node --test tests/e2e/matrix-runtime-config.test.mjs"
   },

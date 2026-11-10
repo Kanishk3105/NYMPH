@@ -161,6 +161,7 @@ type HarnessState = {
   whoamiStatus(session: HarnessSession): Promise<number>;
   inviteStatus(session: HarnessSession, roomId: string, userId: string): Promise<number>;
   encryptionEvidence(eventId: string): Promise<{ eventType: string; hasCiphertext: boolean; algorithm?: string }>;
+  relationEvidence(eventId: string): Promise<{ eventType: string; relationType?: string; parentEventId?: string; reactionKey?: string; body?: string }>;
   crossSigningIdentityIds(): Promise<string[]>;
   getEvents(): ReceivedNymphEvent[];
   getVerifications(): MatrixVerification[];
@@ -202,7 +203,7 @@ const matrixConfig = {
   partnerB: import.meta.env.VITE_MATRIX_PARTNER_B_USER_ID,
 };
 if (
-  matrixConfig.homeserverUrl !== 'http://127.0.0.1:18008' ||
+  !/^http:\/\/127\.0\.0\.1:\d+$/.test(matrixConfig.homeserverUrl) ||
   matrixConfig.serverName !== 'nymph-dev.localhost' ||
   !/^@[A-Za-z0-9._=-]+:nymph-dev\.localhost$/.test(matrixConfig.partnerA) ||
   !/^@[A-Za-z0-9._=-]+:nymph-dev\.localhost$/.test(matrixConfig.partnerB) ||
@@ -324,7 +325,36 @@ const state: HarnessState = {
     if (!response.ok) throw new Error(`Room creation failed (${response.status}).`);
     const body = await response.json() as { room_id?: unknown };
     if (typeof body.room_id !== 'string') throw new Error('Room creation returned no room ID.');
-    return { room_id: body.room_id };
+    const inviteResponse = await fetch(
+      `${apiBase}/_matrix/client/v3/rooms/${encodeURIComponent(body.room_id)}/invite`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${connection.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ user_id: connection.partnerUserId }),
+      },
+    );
+    if (!inviteResponse.ok) {
+      const detail = (await inviteResponse.text()).slice(0, 240);
+      throw new Error(`The disposable partner invite failed (${inviteResponse.status}): ${detail}`);
+    }
+    const roomPath = encodeURIComponent(body.room_id);
+    let lastMembershipStatus = 0;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const membershipResponse = await fetch(
+        `${apiBase}/_matrix/client/v3/rooms/${roomPath}/state/m.room.member/${encodeURIComponent(connection.partnerUserId)}`,
+        { headers: { Authorization: 'Bearer ' + connection.accessToken }, cache: 'no-store' },
+      );
+      lastMembershipStatus = membershipResponse.status;
+      if (membershipResponse.ok) {
+        const membership = await membershipResponse.json() as { membership?: unknown };
+        if (membership.membership === 'invite' || membership.membership === 'join') return { room_id: body.room_id };
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+    }
+    throw new Error(`The disposable partner invitation was not persisted before QR redemption (HTTP ${lastMembershipStatus}).`);
   },
   async createInvitation(connection) {
     const invitation = await postJson<Record<string, unknown>>(
@@ -336,7 +366,7 @@ const state: HarnessState = {
   },
   async encodeInvitationQr(invite) {
     const dataUrl = await QRCode.toDataURL(JSON.stringify(invite), {
-      errorCorrectionLevel: 'H',
+      errorCorrectionLevel: 'M',
       margin: 4,
       width: 512,
     });
@@ -777,6 +807,12 @@ const state: HarnessState = {
       hasCiphertext: typeof content.ciphertext === 'string' && content.ciphertext.length > 0,
       algorithm: typeof content.algorithm === 'string' ? content.algorithm : undefined,
     };
+  },
+  async relationEvidence(eventId) {
+    if (!activeConnection || !this.client) throw new Error('Connect a Matrix client before inspecting relation evidence.');
+    const evidence = this.client.inspectRelationEvent(eventId);
+    if (!evidence) throw new Error('The relation event was not available in the authenticated client timeline.');
+    return evidence;
   },
   async crossSigningIdentityIds() {
     if (!this.client) throw new Error('Connect a Matrix client before checking cross-signing.');

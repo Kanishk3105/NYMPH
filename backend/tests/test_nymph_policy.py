@@ -200,6 +200,7 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
         config = valid_production_policy_config(self.state_path)
         self.policy.db.close()
         policy = NymphPolicy(config, api)
+
         try:
             self.assertEqual(
                 await policy.user_may_create_room(PROD_PARTNER_A, valid_room_config(PROD_PARTNER_B)),
@@ -245,6 +246,19 @@ class NymphPolicyTests(unittest.IsolatedAsyncioTestCase):
                 restarted.db.close()
         finally:
             policy.db.close()
+
+    async def test_reserved_disposable_room_accepts_exact_invite_before_room_callback_finishes(self) -> None:
+        await self.reserve_dev_room()
+        invite = SimpleNamespace(
+            type="m.room.member",
+            sender=DEV_PARTNER_A,
+            state_key=DEV_PARTNER_B,
+            content={"membership": "invite"},
+            room_id=DEV_ROOM_ID,
+        )
+        self.assertEqual(await self.policy.check_event_for_spam(invite), NOT_SPAM)
+        self.assertEqual(await self.policy.user_may_join_room(DEV_PARTNER_B, DEV_ROOM_ID, False), NOT_SPAM)
+        self.assertEqual(await self.policy.user_may_join_room("@intruder:localhost", DEV_ROOM_ID, False), Codes.FORBIDDEN)
 
     def test_requires_private_non_federatable_encrypted_room(self) -> None:
         self.assertTrue(is_private_encrypted_room(valid_room_config(), PARTNER_A, PARTNER_B))

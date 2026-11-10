@@ -18,11 +18,14 @@ def main() -> None:
         raise RuntimeError("The isolated deployment must use the dedicated nymph-dev.localhost identity.")
 
     homeserver_url = os.environ["DEV_HOMESERVER_URL"]
-    if homeserver_url != "http://127.0.0.1:18008":
-        raise RuntimeError("The isolated homeserver URL must match the dedicated loopback endpoint.")
+    disposable = os.environ.get("NYMPH_DISPOSABLE_MATRIX") == "1"
+    if (
+        (not disposable and homeserver_url != "http://127.0.0.1:18008")
+        or (disposable and not homeserver_url.startswith("http://127.0.0.1:"))
+    ):
+        raise RuntimeError("The isolated homeserver URL must use the dedicated loopback endpoint.")
     partner_a = os.environ["DEV_PARTNER_A_USER_ID"]
     partner_b = os.environ["DEV_PARTNER_B_USER_ID"]
-    disposable = os.environ.get("NYMPH_DISPOSABLE_MATRIX") == "1"
     expected_ids = (
         (f"@partner1-dev:{SERVER_NAME}", f"@partner2-dev:{SERVER_NAME}")
         if not disposable

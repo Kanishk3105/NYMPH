@@ -1,5 +1,6 @@
 import { test, expect, chromium, type BrowserContext, type Page } from '@playwright/test';
 import { randomUUID, scryptSync } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { loadIsolatedMatrixConfig } from './matrix-runtime-config.mjs';
 
@@ -48,8 +49,26 @@ async function openProfile(name: string): Promise<{ context: BrowserContext; pag
   return { context, page };
 }
 
+async function waitForHomeserver(): Promise<void> {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      const response = await fetch(`${config.homeserverUrl}/_matrix/client/versions`);
+      if (response.ok) return;
+    } catch {
+      // The disposable Synapse container may still be starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error('The disposable Synapse homeserver did not recover after restart.');
+}
+
+function restartDisposableSynapse(): void {
+  const project = process.env.NYMPH_DISPOSABLE_COMPOSE_PROJECT ?? 'nymph-final-disposable';
+  execFileSync('docker', ['restart', `${project}-synapse-1`], { stdio: 'pipe' });
+}
+
 test('disposable accounts pair, verify, exchange encrypted history, and reject invalid access', async () => {
-  test.setTimeout(1_200_000);
+  test.setTimeout(1_800_000);
   let contextA: BrowserContext | undefined;
   let contextB: BrowserContext | undefined;
   let pageA: Page | undefined;
@@ -108,7 +127,26 @@ test('disposable accounts pair, verify, exchange encrypted history, and reject i
       { timeout: 120_000 },
     ).then((handle) => handle.jsonValue()) as { id: string };
     await call(pageA, 'startSasVerification', outgoing.id);
-    await pageA.waitForTimeout(1000);
+    await pageA.waitForFunction(
+      (verificationId) => {
+        const verification = (window as Window & {
+          nymphMatrixHarness?: { getVerifications(): Array<{ id: string; sas?: { emoji?: unknown } }> };
+        }).nymphMatrixHarness?.getVerifications().find((item) => item.id === verificationId);
+        return Array.isArray(verification?.sas?.emoji);
+      },
+      outgoing.id,
+      { timeout: 120_000 },
+    );
+    await pageB.waitForFunction(
+      (verificationId) => {
+        const verification = (window as Window & {
+          nymphMatrixHarness?: { getVerifications(): Array<{ id: string; sas?: { emoji?: unknown } }> };
+        }).nymphMatrixHarness?.getVerifications().find((item) => item.id === verificationId);
+        return Array.isArray(verification?.sas?.emoji);
+      },
+      incoming.id,
+      { timeout: 120_000 },
+    );
     const sasA = await call(pageA, 'getVerifications');
     const sasB = await call(pageB, 'getVerifications');
     expect(JSON.stringify(sasA)).toContain('emoji');
@@ -134,7 +172,80 @@ test('disposable accounts pair, verify, exchange encrypted history, and reject i
     await waitForEvent(pageA, reply);
     const reaction = await call<string>(pageA, 'send', { version: 1, id: randomUUID(), mode: 'romantic', kind: 'reaction', text: '❤️', sentAt: Date.now(), reactionTo: reply });
     await waitForEvent(pageB, reaction);
+    expect(await call<Array<{ eventId: string; replyToEventId?: string }>>(pageA, 'getEvents')).toContainEqual(
+      expect.objectContaining({ eventId: reply, replyToEventId: first }),
+    );
+    expect(await call<Array<{ eventId: string; reactionTo?: string }>>(pageB, 'getEvents')).toContainEqual(
+      expect.objectContaining({ eventId: reaction, reactionTo: reply }),
+    );
+    expect(await call(pageB, 'encryptionEvidence', reaction)).toMatchObject({
+      eventType: 'm.room.encrypted',
+      hasCiphertext: true,
+      algorithm: 'm.megolm.v1.aes-sha2',
+    });
+    expect(await call(pageB, 'relationEvidence', reply)).toMatchObject({
+      eventType: 'm.room.message',
+      relationType: 'm.in_reply_to',
+      parentEventId: first,
+    });
+    expect(await call(pageB, 'relationEvidence', reaction)).toMatchObject({
+      eventType: 'm.room.message',
+      relationType: 'm.annotation',
+      parentEventId: reply,
+      reactionKey: '❤️',
+    });
+    expect((await call<Array<{ kind: string; eventId: string }>>(pageB, 'getEvents'))
+      .filter((event) => event.eventId === reaction))
+      .toHaveLength(1);
     expect(await call<string[]>(pageA, 'getReadEventIds')).toContain(first);
+
+    await call(pageA, 'disconnect');
+    await call(pageB, 'disconnect');
+    await contextA.close();
+    await contextB.close();
+    ({ context: contextA, page: pageA } = await openProfile('partner-a'));
+    ({ context: contextB, page: pageB } = await openProfile('partner-b'));
+    await call(pageA, 'connect', connectionA, storageKey(passwordA, config.partnerA));
+    await call(pageB, 'connect', sessionB, storageKey(passwordB, config.partnerB));
+    await waitForEvent(pageA, reply);
+    await waitForEvent(pageB, reaction);
+    expect(await call<Array<{ eventId: string; replyToEventId?: string }>>(pageA, 'getEvents')).toContainEqual(
+      expect.objectContaining({ eventId: reply, replyToEventId: first }),
+    );
+
+    await call(pageB, 'disconnect');
+    const offline = await call<string>(pageA, 'send', {
+      version: 1,
+      id: randomUUID(),
+      mode: 'romantic',
+      kind: 'text',
+      text: 'delivered after partner reconnect',
+      sentAt: Date.now(),
+    });
+    await call(pageB, 'connect', sessionB, storageKey(passwordB, config.partnerB));
+    await waitForEvent(pageB, offline);
+    expect(await call(pageB, 'encryptionEvidence', offline)).toMatchObject({
+      eventType: 'm.room.encrypted',
+      hasCiphertext: true,
+      algorithm: 'm.megolm.v1.aes-sha2',
+    });
+
+    await call(pageA, 'disconnect');
+    await call(pageB, 'disconnect');
+    restartDisposableSynapse();
+    await waitForHomeserver();
+    await call(pageA, 'connect', connectionA, storageKey(passwordA, config.partnerA));
+    await call(pageB, 'connect', sessionB, storageKey(passwordB, config.partnerB));
+    await waitForEvent(pageA, first);
+    await waitForEvent(pageA, reply);
+    await waitForEvent(pageB, reaction);
+    await waitForEvent(pageB, offline);
+    expect(await call<Array<{ eventId: string; replyToEventId?: string }>>(pageA, 'getEvents')).toContainEqual(
+      expect.objectContaining({ eventId: reply, replyToEventId: first }),
+    );
+    expect(await call<Array<{ eventId: string; reactionTo?: string }>>(pageB, 'getEvents')).toContainEqual(
+      expect.objectContaining({ eventId: reaction, reactionTo: reply }),
+    );
   } finally {
     await pageA && call(pageA, 'disconnect').catch(() => undefined);
     await pageB && call(pageB, 'disconnect').catch(() => undefined);

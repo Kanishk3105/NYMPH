@@ -407,6 +407,10 @@ class NymphPolicy:
             "(child_event_id TEXT PRIMARY KEY, parent_event_id TEXT NOT NULL, room_id TEXT NOT NULL)"
         )
         self.db.execute(
+            "CREATE TABLE IF NOT EXISTS nymph_room_invites "
+            "(room_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (room_id, user_id))"
+        )
+        self.db.execute(
             "CREATE TABLE IF NOT EXISTS nymph_active_device "
             "(user_id TEXT PRIMARY KEY, device_id TEXT, first_login_allowed INTEGER NOT NULL DEFAULT 1)"
         )
@@ -809,6 +813,14 @@ class NymphPolicy:
             (parent_event_id,),
         ).fetchone()
         if not child or not parent or child[0] != room_id or parent[0] != room_id:
+            logger.warning(
+                "NYMPH relation lookup failed: child=%s parent=%s expected_room=%s child_row=%s parent_row=%s",
+                child_event_id,
+                parent_event_id,
+                room_id,
+                child,
+                parent,
+            )
             raise SynapseError(404, "The related events are not available in the private room.", Codes.NOT_FOUND)
         self.db.execute(
             "INSERT INTO nymph_message_relations (child_event_id, parent_event_id, room_id) "
@@ -1194,6 +1206,32 @@ class NymphPolicy:
             return NOT_SPAM
 
         pair_info = self.pair_for_room(room_id)
+        if pair_info is None and event_type == "m.room.member":
+            target = event.state_key
+            membership = content.get("membership")
+            candidate = self.pair_for_user(sender)
+            if (
+                candidate is not None
+                and sender == candidate[1]["partner_a"]
+                and target == candidate[1]["partner_b"]
+                and membership == "invite"
+            ):
+                pair_key, pair = candidate
+                table = pair["table"]
+                reservation = self.db.execute(
+                    f"SELECT room_id, creation_reserved_at FROM {table} WHERE id = 1"
+                ).fetchone()
+                if (
+                    reservation
+                    and reservation[0] is None
+                    and reservation[1] is not None
+                    and now_ms() - reservation[1] <= ROOM_RESERVATION_TTL_MS
+                ):
+                    self.db.execute(
+                        f"UPDATE {table} SET room_id = ?, creation_reserved_at = NULL WHERE id = 1",
+                        (room_id,),
+                    )
+                    pair_info = (pair_key, pair)
         if pair_info is None:
             return Codes.FORBIDDEN
         _pair_key, pair = pair_info
@@ -1206,6 +1244,11 @@ class NymphPolicy:
                 return Codes.FORBIDDEN
             if membership in {"join", "leave"} and sender != target:
                 return Codes.FORBIDDEN
+            if membership == "invite":
+                self.db.execute(
+                    "INSERT OR IGNORE INTO nymph_room_invites (room_id, user_id) VALUES (?, ?)",
+                    (room_id, target),
+                )
         elif event_type == "m.room.join_rules":
             if content.get("join_rule") != "invite":
                 return Codes.FORBIDDEN
@@ -1244,7 +1287,11 @@ class NymphPolicy:
         pair = pair_info[1]
         if user_id not in {pair["partner_a"], pair["partner_b"]}:
             return Codes.FORBIDDEN
-        if user_id == pair["partner_b"] and not is_invited:
+        invitation = self.db.execute(
+            "SELECT 1 FROM nymph_room_invites WHERE room_id = ? AND user_id = ?",
+            (room_id, user_id),
+        ).fetchone()
+        if user_id == pair["partner_b"] and not is_invited and invitation is None:
             return Codes.FORBIDDEN
         return NOT_SPAM
 
@@ -1257,7 +1304,13 @@ class NymphPolicy:
             return Codes.FORBIDDEN
         configured_room_id = self.room_id(pair_key)
         if configured_room_id is not None:
-            return NOT_SPAM if room_id == configured_room_id else Codes.FORBIDDEN
+            if room_id != configured_room_id:
+                return Codes.FORBIDDEN
+            self.db.execute(
+                "INSERT OR IGNORE INTO nymph_room_invites (room_id, user_id) VALUES (?, ?)",
+                (room_id, invitee),
+            )
+            return NOT_SPAM
 
         table = pair["table"]
         reservation = self.db.execute(
@@ -1265,6 +1318,10 @@ class NymphPolicy:
         ).fetchone()
         reserved_at = reservation[0] if reservation else None
         if reserved_at is not None and now_ms() - reserved_at < ROOM_RESERVATION_TTL_MS:
+            self.db.execute(
+                "INSERT OR IGNORE INTO nymph_room_invites (room_id, user_id) VALUES (?, ?)",
+                (room_id, invitee),
+            )
             return NOT_SPAM
         return Codes.FORBIDDEN
 
